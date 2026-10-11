@@ -1,0 +1,20 @@
+# Build output
+/target
+**/*.rs.bk
+
+# Local release artifacts
+/dist
+*.tar.gz
+*.sha256
+
+# Runtime data, logs and secrets never belong in this repo
+*.log
+*.jsonl
+.env
+.env.*
+/state
+/history
+config.local.toml
+overrides.toml
+
+.DS_Store

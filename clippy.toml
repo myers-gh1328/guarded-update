@@ -1,0 +1,14 @@
+# Every byte guarded-update prints or logs must pass through the redaction
+# layer in `src/output.rs` (ADR-0001 D10, D16). Only that module may write
+# to stdout or stderr directly.
+disallowed-macros = [
+  { path = "std::println", reason = "write through output::Output" },
+  { path = "std::print", reason = "write through output::Output" },
+  { path = "std::eprintln", reason = "write through output::Output" },
+  { path = "std::eprint", reason = "write through output::Output" },
+  { path = "std::dbg", reason = "write through output::Output" },
+]
+disallowed-methods = [
+  { path = "std::io::stdout", reason = "write through output::Output" },
+  { path = "std::io::stderr", reason = "write through output::Output" },
+]

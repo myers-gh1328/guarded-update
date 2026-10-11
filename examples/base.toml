@@ -1,0 +1,59 @@
+# Example guarded-update config. Copy to ~/.config/guarded-update/base.toml
+# (or overrides.toml) and `chmod 600` it. Every value here is an example.
+schema_version = 1
+
+# false = report only: nothing is ever installed (the kill switch).
+enabled = true
+
+[defaults]
+# auto | alert | ignore. Anything not listed under [items] uses this.
+policy = "alert"
+
+[paths]
+# state_dir = "/path/to/state"          # default ~/.local/state/guarded-update
+# log_file = "/path/to/guarded-update.jsonl"  # default <state_dir>/logs/
+
+[secrets]
+# Files whose values must never appear in logs, reports or model prompts.
+# Referenced by path only; never paste a secret into this file.
+files = []
+# Optional: raises the GitHub API rate limit for release lookups.
+# github_token_file = "/path/to/github-token"
+
+[timeouts]
+command_secs = 600
+http_secs = 30
+
+[providers.homebrew]
+enabled = true
+greedy_casks = false   # include self-updating and `latest` casks
+refresh = true         # run `brew update` first
+
+[providers.hermes]
+enabled = false
+command = "hermes"
+github_repo = "NousResearch/hermes-agent"
+
+[providers.macos]
+enabled = false        # alert only; never installs
+
+# Versions pinned elsewhere (alert only):
+# [providers.pinned.example-package]
+# current = "1.2.3"
+# source = "pypi:example-package"   # or "github:owner/repo"
+# pinned_in = "where the pin lives"
+
+[items.jq]
+policy = "auto"
+
+# Safety checks before an auto install; each can only hold an update.
+[screening]
+wait_days = 2
+hold_major = true
+hold_words = true
+words = ["breaking", "removed", "migration"]
+
+# Optional: a local model reads release notes last; it can only hold.
+# [screening.ai]
+# url = "http://127.0.0.1:11434/v1"
+# model = "qwen3:8b"
