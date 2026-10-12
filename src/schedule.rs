@@ -143,6 +143,26 @@ pub fn needs_copy(exe: &Path) -> bool {
     exe.components().any(|c| c.as_os_str() == "target")
 }
 
+/// Homebrew keeps each version in its own `Cellar` folder and removes it
+/// on upgrade, so the job runs Homebrew's `bin` link instead, which always
+/// points at the installed version.
+pub fn brew_link(exe: &Path) -> Option<PathBuf> {
+    let parts: Vec<_> = exe.components().collect();
+    let n = parts.len();
+    let name = |i: usize| parts[i].as_os_str();
+    (n >= 5
+        && name(n - 5) == "Cellar"
+        && name(n - 4) == "guarded-update"
+        && name(n - 2) == "bin"
+        && name(n - 1) == "guarded-update")
+        .then(|| {
+            parts[..n - 5]
+                .iter()
+                .collect::<PathBuf>()
+                .join("bin/guarded-update")
+        })
+}
+
 /// Copies the running binary to `~/.local/bin/guarded-update`.
 pub fn copy_binary(exe: &Path, home: &Path) -> Result<PathBuf, String> {
     let dir = home.join(".local/bin");
@@ -297,6 +317,35 @@ mod tests {
         assert!(
             path_env(Path::new("/h"))
                 .contains("/opt/homebrew/bin:/opt/homebrew/sbin:/h/.local/bin:")
+        );
+    }
+
+    #[test]
+    fn a_homebrew_install_uses_the_link_that_follows_upgrades() {
+        assert_eq!(
+            brew_link(Path::new(
+                "/opt/homebrew/Cellar/guarded-update/0.1.0/bin/guarded-update"
+            )),
+            Some(PathBuf::from("/opt/homebrew/bin/guarded-update"))
+        );
+        assert_eq!(
+            brew_link(Path::new(
+                "/home/linuxbrew/.linuxbrew/Cellar/guarded-update/0.2.0_1/bin/guarded-update"
+            )),
+            Some(PathBuf::from(
+                "/home/linuxbrew/.linuxbrew/bin/guarded-update"
+            ))
+        );
+        assert_eq!(
+            brew_link(Path::new("/opt/homebrew/bin/guarded-update")),
+            None
+        );
+        assert_eq!(brew_link(Path::new("/x/.local/bin/guarded-update")), None);
+        assert_eq!(
+            brew_link(Path::new(
+                "/opt/homebrew/Cellar/other/1.0/bin/guarded-update"
+            )),
+            None
         );
     }
 
