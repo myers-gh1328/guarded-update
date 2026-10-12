@@ -4,6 +4,8 @@ All notable changes are listed here. Versions follow semantic versioning.
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-10-11
+
 ### Added
 
 - Install with `brew install myers-gh1328/tap/guarded-update`. Setup
