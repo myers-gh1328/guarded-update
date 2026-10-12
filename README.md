@@ -115,7 +115,9 @@ one key picks it) and installs a per-user launchd job for it, replacing
 any earlier one; "Don't run it automatically" removes it. A Mac that is
 asleep at that time runs it when it wakes. If setup was started from a
 build folder (`target/`), it first copies itself to
-`~/.local/bin/guarded-update` and the job runs that copy. Scheduling is
+`~/.local/bin/guarded-update` and the job runs that copy. Installed with
+Homebrew, the job runs Homebrew's `bin` link, so upgrades do not break
+it. Scheduling is
 macOS only in this version.
 
 To add a link the scan cannot see, or a custom check, put a `[services]`
@@ -228,7 +230,8 @@ Pis. It does not:
 
 - apply macOS updates (it reports them only);
 - run anything as root or with sudo (such items are reported as manual);
-- update itself (v1);
+- replace its own binary (installed from the Homebrew tap, it is updated
+  like any other formula, after the same checks);
 - update models, back up data, or touch business or multi-tenant systems.
 
 ## Platforms
@@ -239,7 +242,18 @@ configuration only.
 
 ## Install
 
-Download the archive for your target from the GitHub release, check it, and
+With Homebrew on an Apple Silicon Mac:
+
+```bash
+brew install myers-gh1328/tap/guarded-update
+guarded-update setup
+```
+
+The nightly job then runs Homebrew's link, `$(brew --prefix)/bin/guarded-update`,
+so later versions arrive through the nightly run itself, after the same
+safety checks as every other package.
+
+Or download the archive for your target from the GitHub release, check it, and
 put the binary on your `PATH`:
 
 ```bash

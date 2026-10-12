@@ -33,8 +33,12 @@ Tags: [discovery] verified on a real host; [research] from outside sources;
 2. **Config:** two layers. An optional base file rendered by configuration
    management, plus a local overrides file that only the setup wizard writes.
    `explain` shows which layer each setting came from.
-3. **Self-update:** not in v1. Configuration management or a manual install
-   moves guarded-update to new releases. Planned for v2.
+3. **Self-update:** through Homebrew only. Installed from the project's
+   tap (`myers-gh1328/tap`), guarded-update is an ordinary Homebrew
+   formula, so the nightly run updates it like any other tool, after the
+   same safety checks; the schedule runs Homebrew's `bin` link, which
+   follows each upgrade. A copy installed any other way is never replaced
+   by the tool. (Amended: v1 originally had no self-update.)
 
 ### Run shape
 
@@ -223,7 +227,7 @@ Tags: [discovery] verified on a real host; [research] from outside sources;
 | Secret leakage | One redaction layer; secrets referenced by path; no secrets in child environments; config at 0600 |
 | An update that keeps failing | Hold and pin after the first failure; one copy at a time; the time window |
 | Privilege escalation | Runs as the normal user; never uses sudo; root-only items reported, never attempted |
-| The tool or Hermes breaks | Alert path that skips Hermes; Hermes updated last; no self-update in v1 |
+| The tool or Hermes breaks | Alert path that skips Hermes; Hermes updated last; it updates itself only as a Homebrew formula, after the same checks |
 
 ## Spikes during implementation
 
@@ -244,4 +248,3 @@ Tags: [discovery] verified on a real host; [research] from outside sources;
 
 - Slack buttons (deferred past v1).
 - Model sampling defaults (tuning test in progress).
-- Self-update (planned for v2).

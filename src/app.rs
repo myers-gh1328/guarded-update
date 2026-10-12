@@ -1195,7 +1195,9 @@ fn install_schedule(
                 ));
                 copy
             } else {
-                current
+                schedule::brew_link(&current)
+                    .filter(|link| link.exists())
+                    .unwrap_or(current)
             };
             let absolute = |p: &Path| std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf());
             Some(schedule::Job {

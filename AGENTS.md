@@ -25,7 +25,9 @@ Planning lives outside this repo; it holds code, CI, and public docs only.
   `softwareupdate --list`) and HTTPS GETs. Never `hermes update --check`
   (it fetches from git).
 - Never use sudo or design a root path; root-only items are reported only.
-- No self-update in v1.
+- It updates itself only as a Homebrew formula from `myers-gh1328/tap`,
+  through the same safety checks as any package; never by replacing its
+  own binary.
 
 ## Build and verify
 

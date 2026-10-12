@@ -6,6 +6,10 @@ All notable changes are listed here. Versions follow semantic versioning.
 
 ### Added
 
+- Install with `brew install myers-gh1328/tap/guarded-update`. Setup
+  then schedules Homebrew's `bin` link instead of the versioned Cellar
+  path, so the nightly run keeps working after upgrades and updates
+  guarded-update itself like any other formula.
 - The project lives at `myers-gh1328/guarded-update`; the nightly job is
   now `io.github.myers-gh1328.guarded-update`, and setup removes a job
   saved under the old `io.github.aegir-tech` name.
