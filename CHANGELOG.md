@@ -4,6 +4,11 @@ All notable changes are listed here. Versions follow semantic versioning.
 
 ## [Unreleased]
 
+### Changed
+
+- CI and release workflows use the Node.js 24 versions of the GitHub
+  actions (`checkout@v7`, `upload-artifact@v7`, `download-artifact@v8`).
+
 ## [0.1.0] - 2026-10-11
 
 ### Added
