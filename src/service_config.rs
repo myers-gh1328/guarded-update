@@ -45,8 +45,8 @@ const SECRET_KEYS: &[&str] = &[
     "auth_key",
 ];
 
-/// Keys that name where a secret is kept, not the secret.
-const LOCATION_SUFFIXES: &[&str] = &["_file", "_path", "_dir"];
+/// Keys that name where a secret is kept, or a count, not the secret.
+const LOCATION_SUFFIXES: &[&str] = &["_file", "_path", "_dir", "tokens"];
 
 /// One config file of a service, or why it is not shown.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -270,6 +270,7 @@ scrape_configs:
     authorization:
       credentials: abc
     bearer_token_file: /h/token
+    max_tokens: 4096
     params:
       community: [\"not-public\"]
     relabel_configs:
@@ -297,6 +298,7 @@ tls:
         for kept in [
             "username: admin",
             "bearer_token_file: /h/token",
+            "max_tokens: 4096",
             "regex: \"(a|b).*\"",
             "https://[REDACTED]@example.com/api",
             "    authorization:",
