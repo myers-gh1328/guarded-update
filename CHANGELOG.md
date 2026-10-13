@@ -4,6 +4,14 @@ All notable changes are listed here. Versions follow semantic versioning.
 
 ## [Unreleased]
 
+### Added
+
+- The AI check sees each affected service's config files (named in its
+  launchd arguments, with secret values removed), so a change that the
+  configuration does not use no longer holds the update. A quote from
+  the configuration counts as evidence, and the history lists which
+  files were shown.
+
 ### Changed
 
 - CI and release workflows use the Node.js 24 versions of the GitHub
