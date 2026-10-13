@@ -19,6 +19,7 @@ mod redact;
 mod scan;
 mod schedule;
 mod screen;
+mod service_config;
 mod setup;
 mod state;
 mod timefmt;

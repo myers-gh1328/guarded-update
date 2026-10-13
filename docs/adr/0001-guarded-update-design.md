@@ -163,6 +163,19 @@ Tags: [discovery] verified on a real host; [research] from outside sources;
   read-only tools (the same data behind four tools: read service, read or
   search allow-listed config, list dependents, package info) with a per-item
   call cap and no shell or network. A screening experiment picks the default.
+  Amendment (2026-10-13, owner): collected context; the model gets no
+  tools. For each service that uses the package, the run reads the
+  plist's arguments (read-only `plutil`), takes the config files they
+  name (`-flag=/path`, `--flag /path` or a bare path with a config
+  extension; file names that suggest secrets are skipped), masks the
+  values of secret-named keys, private key blocks and URL passwords, and
+  shows them with every part of the notes, at most 12,000 characters per
+  file and 24,000 in all. A file that is too long or unreadable is named
+  with the reason and the check goes on from the notes; it never holds by
+  itself. The model is told to hold only if the change affects something
+  the shown configuration uses or relies on by default. A quote from the
+  configuration counts as evidence; the history records which files were
+  shown, never their text.
 - **D11 Model call shape [research]:** fixed-format JSON through
   `response_format` (verdict, reason, evidence), enforced after any thinking
   block; a malformed answer means hold. The prompt includes a short service

@@ -1236,6 +1236,29 @@ fn install_schedule(
     Ok(lines.join("\n"))
 }
 
+/// The config files the scanned `services` name in their arguments,
+/// read from the plists as they are now (read-only `plutil`).
+fn service_configs(
+    services: &[String],
+    map: Option<&ServiceMap>,
+    runner: &dyn Runner,
+) -> Vec<crate::service_config::ServiceConfig> {
+    use scan::Source;
+    let source = scan::HostSource {
+        runner,
+        home: PathBuf::new(),
+    };
+    let args: Vec<(String, Vec<String>)> = services
+        .iter()
+        .filter_map(|label| map?.services.iter().find(|s| &s.label == label))
+        .filter_map(|s| {
+            let args = source.arguments(&s.plist).ok()?;
+            Some((s.label.clone(), args))
+        })
+        .collect();
+    crate::service_config::gather(&args, &crate::service_config::read_file)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_pass(
     loaded: &Loaded,
@@ -1294,12 +1317,13 @@ fn run_pass(
             let Some(url) = ai.url.as_deref() else {
                 return Vec::new();
             };
+            let configs = service_configs(services, map, runner);
             crate::ai::review(u, notes, crate::ai::PART_CHARS, &mut |text, part, parts| {
                 // The one path to the model goes through the redaction layer.
                 let body = out.redact_value(crate::ai::request(
-                    &ai.model, u, text, services, part, parts,
+                    &ai.model, u, text, services, &configs, part, parts,
                 ));
-                let record = crate::ai::Record::new(u, text, part, parts);
+                let record = crate::ai::Record::new(u, text, part, parts).with_config(&configs);
                 crate::ai::ask(http, ai, url, &body, record)
             })
         },

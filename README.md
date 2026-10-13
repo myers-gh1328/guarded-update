@@ -189,8 +189,16 @@ model = "qwen3:8b"
 timeout_secs = 180
 ```
 
-The model sees the package name, versions, release notes and the
-services that use the package, after the redaction layer. Online AI
+The model sees the package name, versions, release notes, the services
+that use the package and their config files, after the redaction layer.
+A config file is one a service names in its launchd arguments (such as
+`-config=/opt/homebrew/etc/app/config.yml`); values of keys such as
+`password`, `token` or `community`, private keys and passwords in URLs
+are removed first, and files named like secrets (`.env`, `*key*`,
+`*secret*`) are never read. With the configuration in view, the model
+holds only for changes that touch what the service uses. Files over
+12,000 characters are not shown, and the history file lists which files
+were shown but not what they contain. Online AI
 services and agents that can run tools (such as Hermes) are not offered,
 because release notes are untrusted text.
 
