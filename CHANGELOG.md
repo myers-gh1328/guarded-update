@@ -4,6 +4,8 @@ All notable changes are listed here. Versions follow semantic versioning.
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-10-13
+
 ### Added
 
 - The AI check sees each affected service's config files (named in its
