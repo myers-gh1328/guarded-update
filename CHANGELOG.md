@@ -4,6 +4,8 @@ All notable changes are listed here. Versions follow semantic versioning.
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-10-15
+
 ### Changed
 
 - AI screening now reviews major upgrades and breaking-change warnings
