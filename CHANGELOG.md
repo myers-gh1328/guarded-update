@@ -4,6 +4,21 @@ All notable changes are listed here. Versions follow semantic versioning.
 
 ## [Unreleased]
 
+### Changed
+
+- AI screening now reviews major upgrades and breaking-change warnings
+  to decide whether they affect this computer, instead of blocking them
+  before the model can review them. Without AI, the existing major-version
+  and keyword checks still apply. Waiting periods and operational
+  restrictions, such as root-required restarts, remain enforced.
+- Reviews include the host OS and architecture and identify missing
+  configuration or usage information. No mapped services does not mean
+  a command-line tool is unused.
+- With AI enabled, updates are held when release notes are missing or
+  incomplete, including a missing target release or empty release body.
+  Failed reviews and verdicts without an explanation also hold the update.
+  Review decisions are recorded in run history.
+
 ## [0.1.1] - 2026-10-13
 
 ### Added

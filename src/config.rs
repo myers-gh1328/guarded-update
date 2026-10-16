@@ -113,9 +113,9 @@ pub struct Schedule {
 pub struct Screening {
     /// Days to wait after a version first appears; 0 turns this off.
     pub wait_days: u32,
-    /// Hold 2.x -> 3.0 (and 0.21 -> 0.22) changes.
+    /// Hold 2.x -> 3.0 (and 0.21 -> 0.22) without a successful AI review.
     pub hold_major: bool,
-    /// Hold when the release notes contain one of `words`.
+    /// Without AI, hold when the release notes contain one of `words`.
     pub hold_words: bool,
     pub words: Vec<String>,
     pub ai: Ai,

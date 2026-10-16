@@ -8,7 +8,7 @@ One nightly pass per host:
 1. Detect available updates (Homebrew formulas and casks, Hermes Agent stable
    releases, versions pinned in git, macOS).
 2. Screen the release notes of every skipped version against this host's real
-   setup: fixed user rules first, then a model verdict in fixed-format JSON.
+   setup: operational limits and wait first, then host-specific review in JSON.
 3. Update one dependency group at a time inside a time window.
 4. Restart and health-check every affected service; on failure restart, then
    roll back or hold, then pin, and alert immediately.
@@ -146,8 +146,9 @@ administrator password or a root restart is ever attempted.
 
 ## Safety checks
 
-Before an `auto` update is applied, three checks run. Each can only hold
-an update, and the dry run says which one held it and why:
+Before an `auto` update is applied, the wait always applies. Without AI,
+version and keyword rules provide conservative screening. The dry run
+says which check held an update and why:
 
 1. **Wait after a release** (`wait_days`, default 2): counted from the
    first run that saw that version.
@@ -157,8 +158,8 @@ an update, and the dry run says which one held it and why:
    from the package's GitHub releases between the installed and the new
    version. Every release in the range is read, however many there are;
    if some cannot be read, the update is held. Rebuilds have no new
-   notes. When no notes are found the check passes and the dry run says
-   so.
+   notes. With AI off, when no notes are found the keyword check passes
+   and the dry run says so; a major-jump hold still applies.
 
 ```toml
 [screening]
@@ -171,9 +172,19 @@ words = ["breaking", "removed", "migration"]
 ### Optional AI check
 
 A model server on this computer or the local network can read the
-release notes as a last check. It runs only when every rule passed and
-notes were found, it can only hold an update, and any failure (no answer,
-a timeout, an answer that is not the expected JSON) holds the update too.
+release notes for actual impact on this host, including major jumps and
+warning words. With AI configured, an explained `ok` verdict can allow
+these changes when they do not apply to this host. Applicable risks and
+uncertain breaking changes hold. Operational restrictions (root restarts,
+disabled/report-only items, prior failures and non-auto policies) and wait
+periods cannot be overridden by the model.
+
+Missing, incomplete or oversized notes hold when AI is configured. The
+target release must have notes, and every published stable release in the
+range must have a nonempty body. This cannot detect releases upstream
+never published on GitHub. Any model failure (no answer, timeout, invalid
+JSON or missing explanation) also holds; there is no silent fallback to
+approval when review cannot happen.
 Setup finds Ollama and LM Studio on their usual ports, or takes any
 OpenAI-compatible endpoint (a model router, vLLM, llama.cpp, or another
 computer) and, if it needs one, an API key. A pasted key is saved to
@@ -189,14 +200,17 @@ model = "qwen3:8b"
 timeout_secs = 180
 ```
 
-The model sees the package name, versions, release notes, the services
-that use the package and their config files, after the redaction layer.
+The model sees the host OS and architecture (OS version is unknown),
+package name, versions, release notes, mapped services and their config
+files, after the redaction layer. No mapped services does not mean an
+unused CLI. Unknown usage, missing config and absent keys are not evidence
+that a changed feature is unused; implicit defaults matter too.
 A config file is one a service names in its launchd arguments (such as
 `-config=/opt/homebrew/etc/app/config.yml`); values of keys such as
 `password`, `token` or `community`, private keys and passwords in URLs
 are removed first, and files named like secrets (`.env`, `*key*`,
-`*secret*`) are never read. With the configuration in view, the model
-holds only for changes that touch what the service uses. Files over
+`*secret*`) are never read. Services without supplied configuration are
+explicitly identified as unknown. Files over
 12,000 characters are not shown, and the history file lists which files
 were shown but not what they contain. Online AI
 services and agents that can run tools (such as Hermes) are not offered,

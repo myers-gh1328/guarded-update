@@ -146,6 +146,18 @@ Tags: [discovery] verified on a real host; [research] from outside sources;
   a reason or a quoted line is shortened. Notes are never cut: longer
   notes are read in parts of 12,000 characters, any part that is not ok
   holds, and notes needing more than 8 parts hold without asking.
+
+  Amendment (2026-10-15, owner): AI now adjudicates host applicability of
+  major jumps and warning words rather than running only after those
+  flags pass. An explained `ok` may allow a breaking change that does not
+  apply to this host; applicable or uncertain breaking changes hold.
+  Operational restrictions (root, disabled/report-only, persisted failures,
+  non-auto policy) and wait periods remain outside model authority.
+  Without AI the conservative major/keyword rules remain unchanged. With
+  AI, missing/incomplete/oversized notes or a failed/unexplained review
+  hold. The target release needs notes and every published stable release
+  in the range needs a nonempty body; unpublished GitHub releases cannot
+  be detected. An absent review never clears an existing major flag.
 - **D9 Release-note sources [discovery]:** GitHub releases first, then a
   repository CHANGELOG, found from `brew info` source and homepage URLs. Notes
   for every skipped version are joined. Config can name a notes URL per item.
@@ -176,6 +188,12 @@ Tags: [discovery] verified on a real host; [research] from outside sources;
   the shown configuration uses or relies on by default. A quote from the
   configuration counts as evidence; the history records which files were
   shown, never their text.
+  Amendment (2026-10-15): include host OS and architecture explicitly;
+  OS version is unknown. No mapped services does not prove an unused CLI,
+  and missing/partial/redacted configuration or absent keys do not prove
+  feature nonuse. Each service without supplied configuration is marked
+  unknown. The model must consider defaults and explain host applicability;
+  an uncertain potentially applicable breaking change holds.
 - **D11 Model call shape [research]:** fixed-format JSON through
   `response_format` (verdict, reason, evidence), enforced after any thinking
   block; a malformed answer means hold. The prompt includes a short service
