@@ -1,7 +1,5 @@
-//! Safety checks that run before an `auto` update is installed, without
-//! any AI (ADR-0001 D8): wait some days after a version first appears,
-//! hold big version jumps, and hold when the release notes use warning
-//! words. Each check can only hold an update, never release one.
+//! Safety checks before an `auto` update: mandatory wait, then AI review
+//! of host applicability, or conservative version/keyword rules without AI.
 
 use std::cmp::Ordering;
 
@@ -115,6 +113,35 @@ pub fn collect_releases(
     Ok((all, false))
 }
 
+/// AI may clear version/keyword flags only when the target has notes and
+/// no published stable release in the range has an empty body. This cannot
+/// establish whether upstream omitted releases from GitHub altogether.
+pub fn notes_complete(releases: &Value, installed: &str, available: &str) -> bool {
+    let installed = strip_revision(installed);
+    let available = strip_revision(available);
+    let mut target = false;
+    for r in releases.as_array().into_iter().flatten() {
+        if r["draft"] == true || r["prerelease"] == true {
+            continue;
+        }
+        let Some(v) = r["tag_name"].as_str().and_then(tag_version) else {
+            continue;
+        };
+        if version::compare(v, installed) == Some(Ordering::Greater)
+            && matches!(
+                version::compare(v, available),
+                Some(Ordering::Less | Ordering::Equal)
+            )
+        {
+            if r["body"].as_str().is_none_or(|s| s.trim().is_empty()) {
+                return false;
+            }
+            target |= version::compare(v, available) == Some(Ordering::Equal);
+        }
+    }
+    target
+}
+
 /// Joined notes of every stable release newer than `installed` and up
 /// to `available`, newest first. `None` when no release matches.
 pub fn notes_between(releases: &Value, installed: &str, available: &str) -> Option<String> {
@@ -152,8 +179,8 @@ pub fn notes_between(releases: &Value, installed: &str, available: &str) -> Opti
 
 /// Why the checks hold this update; empty when they allow it. `notes` is
 /// asked for only when the other checks pass, to spare the GitHub API.
-/// `ai` reads the notes last, when they were found and nothing else held
-/// the update; it returns a reason to hold.
+/// With AI configured, complete notes go to the model even for major jumps
+/// and warning words. Without a review, the major-jump fallback still holds.
 pub fn holds(
     update: &Update,
     rules: &Screening,
@@ -170,31 +197,41 @@ pub fn holds(
             update.available
         ));
     }
-    if rules.hold_major
+    let major = rules.hold_major
         && update.change == Change::Version
-        && big_jump(&update.installed, &update.available)
-    {
-        reasons.push(format!(
+        && big_jump(&update.installed, &update.available);
+    let major_reason = || {
+        format!(
             "big version jump {} -> {}",
             update.installed, update.available
-        ));
+        )
+    };
+    if major && rules.ai.url.is_none() {
+        reasons.push(major_reason());
     }
     // A rebuild ships the same upstream release, so there are no new notes.
     let reads_notes = rules.hold_words || rules.ai.url.is_some();
     if reasons.is_empty() && reads_notes && update.change == Change::Version {
         match notes() {
             Notes::Found(text) => {
-                if rules.hold_words
+                if rules.ai.url.is_some() {
+                    reasons.extend(ai(&text));
+                } else if rules.hold_words
                     && let Some((word, line)) = warning(&text, &rules.words)
                 {
                     reasons.push(format!("release notes say \"{word}\": {line}"));
-                } else if rules.ai.url.is_some() {
-                    reasons.extend(ai(&text));
                 }
             }
             // The rules cannot vouch for notes nobody read.
             Notes::Incomplete(why) => reasons.push(why),
-            Notes::Missing(_) => {}
+            Notes::Missing(why) => {
+                if major {
+                    reasons.push(major_reason());
+                }
+                if rules.ai.url.is_some() {
+                    reasons.push(format!("AI review unavailable: {why}"));
+                }
+            }
         }
     }
     reasons
@@ -333,6 +370,21 @@ mod tests {
     }
 
     #[test]
+    fn ai_notes_need_the_target_release_and_nonempty_bodies() {
+        let releases = json!([
+            {"tag_name":"v2.0", "body":"Breaking change"},
+            {"tag_name":"v1.5", "body":"Fixes"}
+        ]);
+        assert!(notes_complete(&releases, "1.0", "2.0_1"));
+        assert!(!notes_complete(&releases, "1.0", "2.1"));
+        let mut blank = releases.clone();
+        blank[1]["body"] = json!("  ");
+        assert!(!notes_complete(&blank, "1.0", "2.0"));
+        blank[1]["body"] = Value::Null;
+        assert!(!notes_complete(&blank, "1.0", "2.0"));
+    }
+
+    #[test]
     fn notes_cover_every_release_in_the_range() {
         let releases = json!([
             {"tag_name": "v1.3.0", "body": "three", "draft": false, "prerelease": false},
@@ -363,7 +415,7 @@ mod tests {
     }
 
     #[test]
-    fn the_ai_reads_notes_only_after_every_rule_passed() {
+    fn the_ai_adjudicates_warning_words_and_major_jumps() {
         let mut with_ai = Screening::default();
         with_ai.ai.url = Some("http://h/v1".into());
         let now = 10 * DAY_SECS;
@@ -393,8 +445,8 @@ mod tests {
         );
         assert_eq!(
             r,
-            ["release notes say \"removed\": Removed a flag"],
-            "a rule hold needs no AI"
+            ["AI check: risky"],
+            "warning words need host-specific review"
         );
         let mut none = || Notes::Missing("none".into());
         let r = holds(
@@ -405,7 +457,7 @@ mod tests {
             &mut none,
             &mut ai,
         );
-        assert!(r.is_empty(), "no notes: nothing for the AI to read");
+        assert_eq!(r, ["AI review unavailable: none"]);
         // Words off, AI on: the AI still reads the notes.
         with_ai.hold_words = false;
         let r = holds(
@@ -417,7 +469,47 @@ mod tests {
             &mut ai,
         );
         assert_eq!(r, ["AI check: risky"]);
-        assert_eq!(asked, ["Faster startup", "Removed a flag"]);
+        assert_eq!(
+            asked,
+            ["Faster startup", "Removed a flag", "Removed a flag"]
+        );
+        let mut reviewed = false;
+        let r = holds(
+            &update("1.0", "2.0", Change::Version),
+            &with_ai,
+            0,
+            now,
+            &mut worded,
+            &mut |_| {
+                reviewed = true;
+                None
+            },
+        );
+        assert!(
+            reviewed && r.is_empty(),
+            "AI can approve a major breaking change"
+        );
+        let r = holds(
+            &update("1.0", "2.0", Change::Version),
+            &with_ai,
+            0,
+            now,
+            &mut none,
+            &mut |_| panic!("no notes"),
+        );
+        assert_eq!(
+            r,
+            ["big version jump 1.0 -> 2.0", "AI review unavailable: none"]
+        );
+        let r = holds(
+            &update("1.0", "2.0", Change::Version),
+            &with_ai,
+            now,
+            now,
+            &mut || panic!("wait first"),
+            &mut |_| panic!("wait first"),
+        );
+        assert!(r[0].starts_with("waiting"));
     }
 
     fn rules() -> Screening {

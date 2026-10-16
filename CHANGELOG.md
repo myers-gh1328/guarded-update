@@ -4,6 +4,18 @@ All notable changes are listed here. Versions follow semantic versioning.
 
 ## [Unreleased]
 
+### Changed
+
+- Optional AI screening now evaluates major jumps and breaking-change
+  warnings for actual host applicability. Conservative major/keyword
+  holds remain when AI is off; operational limits and waits stay mandatory.
+- Model context includes host OS/architecture and explicitly unknown
+  service configuration or CLI usage. Missing context is not proof that
+  a changed feature is unused.
+- With AI enabled, missing or incomplete release notes hold, including
+  a missing target release or empty published release bodies. Failed,
+  empty or unexplained reviews also hold; decisions remain in history.
+
 ## [0.1.1] - 2026-10-13
 
 ### Added

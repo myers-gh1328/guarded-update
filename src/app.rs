@@ -241,7 +241,12 @@ pub fn apply_rules(
             let services = group.services.clone();
             let mut records = Vec::new();
             let mut ask = |text: &str| {
-                let asked = ai(update, text, &services);
+                let mut asked = ai(update, text, &services);
+                if asked.is_empty() {
+                    let mut failed = crate::ai::Record::new(update, text, 0, 0);
+                    failed.error = Some("no review records were returned".into());
+                    asked.push(failed);
+                }
                 let reason = asked.iter().find_map(crate::ai::Record::hold_reason);
                 records.extend(asked);
                 reason
@@ -330,11 +335,13 @@ fn fetch_notes(update: &Update, cfg: &Config, runner: &dyn Runner, http: &dyn Ht
             update.installed
         ));
     }
-    match screen::notes_between(
-        &Value::Array(releases),
-        &update.installed,
-        &update.available,
-    ) {
+    let releases = Value::Array(releases);
+    if cfg.screening.ai.url.is_some()
+        && !screen::notes_complete(&releases, &update.installed, &update.available)
+    {
+        return Notes::Incomplete("AI review needs release notes for the target version and nonempty notes for every published release in the range".into());
+    }
+    match screen::notes_between(&releases, &update.installed, &update.available) {
         Some(text) => Notes::Found(text),
         None => Notes::Missing(format!("no release notes on {repo} for these versions")),
     }
@@ -2395,12 +2402,17 @@ mod tests {
             "base.toml",
             "schema_version = 1\n[defaults]\npolicy = \"auto\"\n[screening.ai]\nurl = \"http://127.0.0.1:9/v1\"\n",
         );
-        let det = detection();
+        let mut det = detection();
+        det.updates
+            .iter_mut()
+            .find(|u| u.name == "ansible")
+            .unwrap()
+            .available = "15.0.0".into();
         let loaded = sb.loaded();
         let mut state = State::default();
         record_first_seen(&mut state, &det, 0);
         let mut plan = plan(&det, &loaded, &state, None);
-        let mut notes = |_: &Update| Notes::Found("Faster startup".into());
+        let mut notes = |_: &Update| Notes::Found("Breaking: removed support for Windows".into());
         let long = format!("drops Python 3.9 {}", "and more ".repeat(40));
         let mut ai = |u: &Update, notes: &str, _: &[String]| {
             let mut r = crate::ai::Record::new(u, notes, 1, 1);
@@ -2474,6 +2486,23 @@ mod tests {
             "rebuilds are not sent to the AI"
         );
         assert!(ngtcp.checks.is_empty());
+        let mut empty = super::plan(&det, &loaded, &state, None);
+        apply_rules(
+            &mut empty,
+            &det,
+            &loaded.config.screening,
+            &state,
+            30 * 24 * 3600,
+            &mut notes,
+            &mut |_, _, _| Vec::new(),
+        );
+        let held = empty
+            .groups
+            .iter()
+            .find(|g| g.members == ["ansible"])
+            .unwrap();
+        assert_eq!(held.decision, Decision::Hold);
+        assert!(held.reason.contains("no review records"));
     }
 
     #[test]
