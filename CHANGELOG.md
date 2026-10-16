@@ -6,15 +6,18 @@ All notable changes are listed here. Versions follow semantic versioning.
 
 ### Changed
 
-- Optional AI screening now evaluates major jumps and breaking-change
-  warnings for actual host applicability. Conservative major/keyword
-  holds remain when AI is off; operational limits and waits stay mandatory.
-- Model context includes host OS/architecture and explicitly unknown
-  service configuration or CLI usage. Missing context is not proof that
-  a changed feature is unused.
-- With AI enabled, missing or incomplete release notes hold, including
-  a missing target release or empty published release bodies. Failed,
-  empty or unexplained reviews also hold; decisions remain in history.
+- AI screening now reviews major upgrades and breaking-change warnings
+  to decide whether they affect this computer, instead of blocking them
+  before the model can review them. Without AI, the existing major-version
+  and keyword checks still apply. Waiting periods and operational
+  restrictions, such as root-required restarts, remain enforced.
+- Reviews include the host OS and architecture and identify missing
+  configuration or usage information. No mapped services does not mean
+  a command-line tool is unused.
+- With AI enabled, updates are held when release notes are missing or
+  incomplete, including a missing target release or empty release body.
+  Failed reviews and verdicts without an explanation also hold the update.
+  Review decisions are recorded in run history.
 
 ## [0.1.1] - 2026-10-13
 
