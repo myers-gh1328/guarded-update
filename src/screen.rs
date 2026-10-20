@@ -159,7 +159,7 @@ pub fn notes_between(releases: &Value, installed: &str, available: &str) -> Opti
             (newer && in_range).then(|| {
                 (
                     v.to_string(),
-                    format!("{tag}\n{}", r["body"].as_str().unwrap_or("")),
+                    format!("{tag}\n{}", declutter(r["body"].as_str().unwrap_or(""))),
                 )
             })
         })
@@ -175,6 +175,107 @@ pub fn notes_between(releases: &Value, installed: &str, available: &str) -> Opti
             .collect::<Vec<_>>()
             .join("\n\n"),
     )
+}
+
+/// Release notes without what only a browser needs: link addresses,
+/// bare URLs, commit hashes and author tags. Every other word stays, so
+/// the model reads the changes, not the links.
+pub fn declutter(body: &str) -> String {
+    body.lines()
+        .map(|line| {
+            let line = drop_hashes(&drop_urls(&unlink(line)));
+            drop_author(line.trim_end()).to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// `[text](url)` -> `text`, and `![alt](url)` -> `alt`.
+fn unlink(line: &str) -> String {
+    let mut out = String::new();
+    let mut rest = line;
+    while let Some(mid) = rest.find("](http") {
+        let Some(open) = rest[..mid].rfind('[') else {
+            break;
+        };
+        let Some(close) = rest[mid..].find(')') else {
+            break;
+        };
+        let start = if rest[..open].ends_with('!') {
+            open - 1
+        } else {
+            open
+        };
+        out.push_str(&rest[..start]);
+        out.push_str(&rest[open + 1..mid]);
+        rest = &rest[mid + close + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Removes `start..end` and one space before it.
+fn cut(line: &mut String, start: usize, end: usize) {
+    let start = if line[..start].ends_with(' ') {
+        start - 1
+    } else {
+        start
+    };
+    line.replace_range(start..end, "");
+}
+
+/// Bare `http(s)://...` up to whitespace, and the `<>` left around it.
+fn drop_urls(line: &str) -> String {
+    let mut line = line.to_string();
+    while let Some(start) = line.find("https://").or_else(|| line.find("http://")) {
+        let len = line[start..]
+            .find(|c: char| c.is_whitespace() || c == '>' || c == ')')
+            .unwrap_or(line.len() - start);
+        line.replace_range(start..start + len, "");
+        let (open, close) = (start.saturating_sub(1), start + 1);
+        let wrapped = |a: &str, b: &str| line[..start].ends_with(a) && line[start..].starts_with(b);
+        if wrapped("<", ">") || wrapped("(", ")") {
+            cut(&mut line, open, close);
+        } else {
+            cut(&mut line, start, start);
+        }
+    }
+    line
+}
+
+/// `` (`e6835fd3`) `` commit hashes left after the links are gone.
+fn drop_hashes(line: &str) -> String {
+    let mut line = line.to_string();
+    let mut from = 0;
+    while let Some(at) = line[from..].find("(`").map(|i| i + from) {
+        let inner_end = line[at + 2..].find("`)").map(|i| i + at + 2);
+        let hash = inner_end
+            .map(|e| &line[at + 2..e])
+            .filter(|h| (7..=40).contains(&h.len()) && h.chars().all(|c| c.is_ascii_hexdigit()));
+        match (hash.is_some(), inner_end) {
+            (true, Some(e)) => cut(&mut line, at, e + 2),
+            _ => from = at + 2,
+        }
+    }
+    line
+}
+
+/// A trailing `— @a, @b` or `by @a in` (GitHub's generated notes).
+fn drop_author(line: &str) -> &str {
+    for sep in [" — @", " – @", " - @", " by @"] {
+        if let Some(at) = line.rfind(sep) {
+            let tail = &line[at + sep.len() - 1..];
+            let only_names = tail
+                .split([',', ' '])
+                .filter(|w| !w.is_empty())
+                .all(|w| (w.starts_with('@') && w.len() > 1) || w == "in");
+            let by = sep != " by @" || tail.ends_with(" in");
+            if only_names && by {
+                return line[..at].trim_end();
+            }
+        }
+    }
+    line
 }
 
 /// Why the checks hold this update; empty when they allow it. `notes` is
@@ -400,6 +501,42 @@ mod tests {
             assert!(!notes.contains(left_out), "{notes}");
         }
         assert_eq!(notes_between(&releases, "1.3.0", "1.3.0"), None);
+    }
+
+    #[test]
+    fn notes_lose_link_addresses_hashes_and_author_tags_but_no_words() {
+        let body = "\
+## Breaking
+- Cli): add model list ([`e6835fd3`](https://github.com/o/r/commit/e6835fd3cb3b)) — @elisam0
+- Remove `--old` flag, see [migration guide](https://example.com/migrate) — @a, @b
+* Fix login by @alice in https://github.com/o/r/pull/12
+![diagram](https://example.com/d.png)
+Read more at <https://example.com/notes> or https://example.com/x.
+Written by @carol and friends
+**Full Changelog**: https://github.com/o/r/compare/v1...v2";
+        assert_eq!(
+            declutter(body),
+            "\
+## Breaking
+- Cli): add model list
+- Remove `--old` flag, see migration guide
+* Fix login
+diagram
+Read more at or
+Written by @carol and friends
+**Full Changelog**:"
+        );
+    }
+
+    #[test]
+    fn notes_in_range_are_decluttered() {
+        let releases = json!([
+            {"tag_name": "v1.2.0", "body": "two [x](https://e.com/y)", "draft": false, "prerelease": false}
+        ]);
+        assert_eq!(
+            notes_between(&releases, "1.1.0", "1.2.0").unwrap(),
+            "v1.2.0\ntwo x"
+        );
     }
 
     fn rule_holds(

@@ -145,7 +145,10 @@ Tags: [discovery] verified on a real host; [research] from outside sources;
   also logged (`ai_checked`) without the notes and raw answer. Nothing in
   a reason or a quoted line is shortened. Notes are never cut: longer
   notes are read in parts of 12,000 characters, any part that is not ok
-  holds, and notes needing more than 8 parts hold without asking.
+  holds, and notes needing more than 16 parts hold without asking. Link
+  addresses, bare URLs, commit hashes and author tags are removed first
+  (2026-10-19: per-commit notes such as Hermes' were half links and
+  held every time); every other word is kept.
 
   Amendment (2026-10-15, owner): AI now adjudicates host applicability of
   major jumps and warning words rather than running only after those

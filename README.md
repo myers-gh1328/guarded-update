@@ -216,8 +216,10 @@ were shown but not what they contain. Online AI
 services and agents that can run tools (such as Hermes) are not offered,
 because release notes are untrusted text.
 
-Long release notes are read in parts, never cut; more than about 96,000
-characters holds the update instead. Every answer, approvals included, is
+Link addresses, bare URLs, commit hashes and author tags are removed
+from release notes first; every other word stays. Long notes are then
+read in parts, never cut; more than about 192,000 characters holds the
+update instead. Every answer, approvals included, is
 saved in full in the run's history file: the verdict, reason, evidence
 (and whether it is really a quote from the notes), the model that
 answered, its raw answer and the notes it read.
