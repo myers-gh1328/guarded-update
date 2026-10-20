@@ -4,6 +4,17 @@ All notable changes are listed here. Versions follow semantic versioning.
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-10-19
+
+### Changed
+
+- Release notes lose link addresses, bare URLs, commit hashes and
+  author tags before the checks read them; every other word stays.
+  Per-commit notes shrink by about half.
+- Notes up to about 192,000 characters (16 parts) are read, up from
+  96,000, so long release ranges such as Hermes 0.21 -> 0.22 are
+  checked instead of always held.
+
 ## [0.1.2] - 2026-10-15
 
 ### Changed

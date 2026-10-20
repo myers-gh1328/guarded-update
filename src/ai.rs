@@ -18,7 +18,7 @@ pub use crate::service_config::ServiceConfig;
 /// are read in parts, so nothing is cut.
 pub const PART_CHARS: usize = 12_000;
 /// Notes needing more parts than this are not read; the update is held.
-pub const MAX_PARTS: usize = 8;
+pub const MAX_PARTS: usize = 16;
 
 const SYSTEM: &str = "You check software release notes before an automatic update on one \
 home computer. Evaluate actual host applicability, including every breaking change, removed \
