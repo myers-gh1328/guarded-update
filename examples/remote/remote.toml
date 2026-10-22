@@ -1,0 +1,10 @@
+# Fictional example only. Replace the origin and device registration identity.
+# This file must be owned by the service account and have mode 0600.
+schema_version = 1
+server_url = "https://updates.example.invalid"
+device_id = "example-pi"
+private_key_file = "/etc/guarded-update/device-private.pem"
+approval_public_key_file = "/etc/guarded-update/controller-public.pem"
+state_dir = "/var/lib/guarded-update"
+# New read-only APT proposal hourly; each timer activation polls for decisions.
+report_every_secs = 3600

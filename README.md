@@ -303,8 +303,10 @@ cargo clippy --all-targets -- -D warnings
 cargo test --all
 ```
 
-CI (`.github/workflows/ci.yml`) runs the same three checks natively on both
-targets for every pull request and push to `main`. Docs-only changes skip it.
+CI (`.github/workflows/ci.yml`) runs these checks for default, `apt-agent`,
+and `apt-remote` builds natively on both targets. A separate job cross-builds
+`apt-remote` for ARMv7 without publishing it. Native ARMv7 runtime testing is
+still required. These checks run for every pull request and push to `main`. Docs-only changes skip it.
 
 There is no coverage tooling yet and no numeric coverage gate. Tests use
 fake command runners and HTTP clients, so they need no network and change
@@ -349,3 +351,101 @@ See [SECURITY.md](SECURITY.md) to report a vulnerability.
 
 Single-maintainer project. Issues are welcome; pull requests are not accepted
 yet. Best effort, no warranty.
+
+## Minimal APT proposal build (unreleased)
+
+Build with `cargo build --release --no-default-features --features apt-agent`.
+This selects a separate entry point excluding Homebrew, macOS and AI modules.
+On Linux, `guarded-update propose` outputs a read-only simulated APT upgrade
+transaction as JSON. It uses existing indexes without refreshing repositories.
+Missing prerequisites produce errors; nothing is installed automatically.
+
+This local-only build supports no polling or installation. It reports freshness and
+restart impact as unknown and does not enumerate every held/deferred candidate.
+ARMv7 release artifacts and Linux runtime verification remain pending. See
+[ADR-0002](docs/adr/0002-linux-approval-agent.md).
+
+Verify both entry points:
+
+```sh
+cargo test --all
+cargo test --no-default-features --features apt-agent
+cargo clippy --all-targets --no-default-features --features apt-agent -- -D warnings
+```
+
+
+## Remote APT proposal agent (unreleased)
+
+Build `cargo build --release --locked --no-default-features --features apt-remote`
+for the target OS and architecture. This adds signed reporting and approval
+polling to the minimal APT agent. It excludes the Homebrew, macOS and AI
+modules; `apt-agent` also excludes the remote protocol itself. No extra Rust
+dependencies or runtime are bundled. The target needs existing APT/dpkg tools,
+`/usr/bin/curl`, `/usr/bin/openssl` with P-256 support, trusted HTTPS CA
+certificates, and an accurate clock. Missing prerequisites fail the operation;
+the agent does not install them or refresh APT indexes.
+
+`guarded-update sync --config /etc/guarded-update/remote.toml` makes one
+report/poll pass. It is read-only on the endpoint apart from its own state.
+Approvals record operator intent only: installation, service restarts and
+reboots are unavailable even after a valid signed approval is received.
+Device requests use a device-specific P-256 private key. Controller approvals
+use a separate signing key whose public half is provisioned to the device.
+HTTPS remains mandatory; signed requests do not replace transport security.
+
+### Provisioning checklist
+
+These are manual installation instructions, not actions performed by building
+or running `propose`. Use a verified binary built for the device architecture.
+ARMv7 release publishing and on-device verification are still pending.
+
+1. Create a dedicated unprivileged `guarded-update` service account without a
+   login shell. Install the remote binary at `/usr/local/bin/guarded-update`;
+   the service account must not be able to modify it. Create a configuration
+   directory at `/etc/guarded-update`, readable only by the service account
+   and administrator.
+2. Generate a unique device key on that device in a private directory, using
+   `umask 077` before these example commands. No keys are shipped in this repo:
+
+   ```sh
+   openssl ecparam -name prime256v1 -genkey -noout -out device-private.pem
+   openssl ec -in device-private.pem -pubout -out device-public.pem
+   ```
+
+   Register only `device-public.pem` with the controller against the assigned
+   device identity and fleet. Keep the private key on the device; install it
+   at the example config's `private_key_file` path with mode 0600, owned by
+   the service account. Keep the directory and its parent paths protected
+   against modification by other users.
+3. Provision the controller's independently generated P-256 approval public
+   key at `approval_public_key_file`. Verify that key through a trusted
+   administrative channel. The controller's private key stays on the
+   controller. Install the public key with mode 0644 or stricter, with no
+   group/other write permissions. Copy and edit
+   [remote.toml](examples/remote/remote.toml), assigning the real HTTPS origin
+   and registered device ID. The config requires mode 0600 and must be
+   readable by the service account. Never put private-key contents in TOML.
+4. Review and copy the example
+   [service](examples/remote/guarded-update-remote.service) and
+   [timer](examples/remote/guarded-update-remote.timer) into the system's unit
+   directory. The service uses `StateDirectory` to create private persistent
+   state. Validate the units with `systemd-analyze verify`, run one pass as
+   the service account, and inspect the resulting report before explicitly
+   enabling `guarded-update-remote.timer`. No scheduling is installed or
+   enabled automatically.
+5. Verify the timer using `systemctl list-timers guarded-update-remote.timer`
+   and results using `journalctl -u guarded-update-remote.service`. Disable
+   the timer with `systemctl disable --now guarded-update-remote.timer` to
+   stop future polling. Revoke the device registration server-side if its
+   private key is compromised; disabling the timer alone does not revoke it.
+
+The timer polls about every five minutes with up to 30 seconds of jitter.
+`report_every_secs` controls proposal recollection, not polling frequency;
+accepted values are 300–86400 seconds. Durable state preserves the proposal
+identity between polls. A missing controller or failed signature does not
+permit installation. APT metadata age, repository identity and service impact
+remain unverified; stale local indexes can hide available updates.
+
+Examples belong only with an explicitly selected remote-agent distribution;
+ordinary/default and local-only builds should not ship or activate them.
+Release packaging currently remains unchanged.
