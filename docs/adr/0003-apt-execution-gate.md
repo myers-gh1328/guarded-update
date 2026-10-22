@@ -1,0 +1,87 @@
+# ADR-0003: Dormant APT execution transaction gate
+
+Status: accepted for pure validation only. No package execution, root service,
+provisioning, key generation, or live APT command is implemented by this slice.
+
+## Build boundary
+
+The optional `apt-executor` Cargo feature implies `apt-remote`. Only that artifact
+compiles `execution_gate`; default, local reporting, and remote reporting artifacts
+exclude it. It adds no crates, CLI commands, root path, or external tools. Existing
+personal updater behavior is unchanged. Module-wide dead-code allowance is
+intentional while this gate has no production caller.
+
+## Contract
+
+`ExecutionManifest` is a strict versioned JSON object, separately named from the
+reporting proposal. Its bounded decoder rejects unknown fields, including command
+or path payloads. It identifies one device and proposal and contains the complete
+approved dependency transaction. Each change contains bare package name, optional
+old version/architecture/Multi-Arch tuple, exact new tuple, and archive SHA-256.
+The manifest also binds package-state and authenticated repository-state hashes,
+held packages, creation time, metadata verification time, and validity deadline.
+A repository-state hash must eventually cover repository identity, signing-key
+identity, authenticated Release/index hashes and package mappings, source/pinning
+configuration and target architecture. A timestamp alone cannot prove freshness.
+
+`LocalEvidence` is independently collected trusted evidence, not copied from a
+server request. Package state must be clean; device, package-state hash,
+repository-state hash, verified provenance and freshness must match. Evidence is
+limited to one hour and must not be expired or from the future. Initial scope
+rejects downgrades, reinstallations, removals, architecture transitions, and held
+package changes. Every dependency must appear explicitly; extra or missing actions
+fail closed. The full transaction must contain exactly one unpack and one
+configure record per approved package/architecture. More complex valid APT streams
+are conservatively unsupported until demonstrated by integration evidence.
+
+## APT protocol
+
+Primary references:
+
+- [APT apt.conf documentation](https://manpages.debian.org/bookworm/apt/apt.conf.5.en.html)
+- [APT 2.6.1 SendPkgsInfo source](https://github.com/Debian/apt/blob/2.6.1/apt-pkg/deb/dpkgpm.cc#L274-L374)
+
+Version 3 has nine space-separated fields: package, old version, old architecture,
+old Multi-Arch, comparison direction, new version, new architecture, new Multi-Arch,
+action. Missing version and architecture use `-`; absent version Multi-Arch is
+`none`. `no` and `none` normalize equivalently. The header must be exactly
+`VERSION 3`; an opaque key=value configuration section ends at a blank line.
+Configuration is never executed or applied. Supported actions are absolute .deb
+references and configuration records; removal records parse but cannot validate.
+Unknown actions, duplicate action phases, absent final newline, unsupported
+protocol versions and oversized/malformed streams fail closed.
+
+An injected `ArchiveInspector` must verify archive package metadata and SHA-256
+from a trusted pinned handle; the stream filename is untrusted. It must implement
+Debian version ordering, including epochs, revisions and tilde, independently of
+the hook comparison symbol. There is deliberately no production adapter yet.
+No archive, key, file or command is read or executed by this module.
+
+## What validation does not authorize
+
+`ValidatedTransaction` is private-state evidence, not a claim or apply permit.
+The reporting protocol's `execution_allowed:false` approval cannot authorize it.
+Before dispatch exists, a separate controller-signed single-use claim must bind
+this manifest, device, approval, fresh executor nonce and short expiration. The
+controller atomically claims or revokes; claim acceptance defines execution start.
+Root must journal consumption durably. Interrupted operations require explicit
+reconciliation, never automatic replay or a blind repair command.
+
+A future production gate must run as a mandatory APT protocol-v3 pre-install hook
+while APT owns package locks, retain immutable trusted archives through dpkg use,
+verify hook/lock context and complete action coverage, clear inherited environment,
+and enforce root-owned descriptor-safe configuration/state paths. A separate
+simulation followed by an unlocked install is insufficient. Root networking is
+excluded; an unprivileged poller transports bounded claim requests/responses.
+
+## Verification and next slice
+
+Tests use only synthetic manifests, fake archive inspection, and hook strings.
+They cover protocol downgrade/truncation, bounds, dependency completeness,
+duplicates, removals, downgrade/reinstall, holds, stale/unverified repositories,
+local drift and archive substitution. Failing tests were run before implementation.
+
+Next: implement the independent archive/repository evidence adapter and validate
+real protocol-v3 streams in disposable Linux, then signed single-use claims and
+crash reconciliation. No business endpoint deployment or package change is
+permitted by this ADR or this slice.

@@ -24,3 +24,7 @@ mod timefmt;
 fn main() -> std::process::ExitCode {
     apt_agent::main()
 }
+
+#[cfg(feature = "apt-executor")]
+#[allow(dead_code)]
+mod execution_gate;
