@@ -28,7 +28,7 @@ env:
 
 jobs:
   rust:
-    name: Rust ${{ matrix.platform.target }} / ${{ matrix.profile }}
+    name: ${{ matrix.profile == 'default' && format('Rust {0}', matrix.platform.target) || format('Rust {0} / {1}', matrix.platform.target, matrix.profile) }}
     strategy:
       fail-fast: false
       matrix:
