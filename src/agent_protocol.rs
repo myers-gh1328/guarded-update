@@ -403,7 +403,16 @@ fn persist(config: &RemoteConfig, state: &RemoteState) -> Result<(), String> {
         .map_err(|_| "Cannot sync agent state directory")?;
     Ok(())
 }
-fn state_directory(path: &Path) -> Result<File, String> {
+struct AgentLock(File);
+impl Drop for AgentLock {
+    fn drop(&mut self) {
+        // A concurrent fork can temporarily inherit this descriptor. Unlock the
+        // shared open-file description rather than waiting for every copy to close.
+        let _ = self.0.unlock();
+    }
+}
+
+fn state_directory(path: &Path) -> Result<AgentLock, String> {
     if !path.exists() {
         let mut builder = fs::DirBuilder::new();
         #[cfg(unix)]
@@ -443,7 +452,7 @@ fn state_directory(path: &Path) -> Result<File, String> {
         .map_err(|_| "Cannot open remote agent lock")?;
     file.try_lock()
         .map_err(|_| "Another remote agent is running")?;
-    Ok(file)
+    Ok(AgentLock(file))
 }
 
 pub(crate) fn sync(
@@ -604,6 +613,21 @@ mod tests {
                 serde_json::json!({"schema_version":1,"proposal_id":id,"status":"pending","decision":null}),
             )
         }
+    }
+
+    #[test]
+    fn lock_release_is_explicit_even_if_a_child_inherited_the_descriptor() {
+        let dir = TestDirectory::new();
+        let config = dir.config();
+        let lock = state_directory(&config.state_dir).unwrap();
+        let inherited = lock.0.try_clone().unwrap();
+        drop(lock);
+        let next = state_directory(&config.state_dir);
+        assert!(
+            next.is_ok(),
+            "inherited descriptors must not retain the completed cycle lock"
+        );
+        drop(inherited);
     }
 
     #[test]
