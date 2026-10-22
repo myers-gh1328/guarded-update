@@ -28,30 +28,57 @@ env:
 
 jobs:
   rust:
-    name: Rust ${{ matrix.target }}
+    name: ${{ matrix.profile == 'default' && format('Rust {0}', matrix.platform.target) || format('Rust {0} / {1}', matrix.platform.target, matrix.profile) }}
     strategy:
       fail-fast: false
       matrix:
-        include:
+        platform:
           - target: aarch64-apple-darwin
             os: macos-15
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-24.04-arm
-    runs-on: ${{ matrix.os }}
+        profile: [default, apt-agent, apt-remote]
+    runs-on: ${{ matrix.platform.os }}
     steps:
       - uses: actions/checkout@v7
-
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
-
       - uses: Swatinem/rust-cache@v2
-
+        with:
+          key: ${{ matrix.profile }}
       - name: Check formatting
         run: cargo fmt --all -- --check
-
+      - name: Select build profile
+        env:
+          PROFILE: ${{ matrix.profile }}
+        run: |
+          if [ "$PROFILE" = default ]; then
+            echo 'FEATURE_ARGS=' >> "$GITHUB_ENV"
+          else
+            echo "FEATURE_ARGS=--no-default-features --features $PROFILE" >> "$GITHUB_ENV"
+          fi
       - name: Test
-        run: cargo test --all --locked
-
+        run: cargo test --all --locked $FEATURE_ARGS
       - name: Clippy
-        run: cargo clippy --all-targets --locked -- -D warnings
+        run: cargo clippy --all-targets --locked $FEATURE_ARGS -- -D warnings
+
+  armv7:
+    name: ARMv7 remote build (not a release)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: armv7-unknown-linux-gnueabihf
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: armv7-apt-remote
+      - name: Install cross linker on CI runner
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes gcc-arm-linux-gnueabihf
+      - name: Build remote agent for ARMv7
+        env:
+          CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER: arm-linux-gnueabihf-gcc
+        run: cargo build --release --locked --target armv7-unknown-linux-gnueabihf --no-default-features --features apt-remote

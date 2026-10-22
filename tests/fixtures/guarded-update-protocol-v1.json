@@ -1,0 +1,32 @@
+{
+  "description": "Synthetic protocol fixture only. Private fixture keys discarded.",
+  "request": {
+    "device_id": "fixture-pi",
+    "method": "POST",
+    "path": "/api/agent/v1/proposals",
+    "timestamp": "1700000000",
+    "nonce": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "body": "{\"schema_version\":1,\"proposal_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"proposal\":{\"schema_version\":1,\"kind\":\"apt-upgrade-proposal\",\"generated_at_unix\":1700000000,\"changes\":[],\"explicitly_held_packages\":[],\"metadata_freshness\":\"unknown\",\"restart_impact\":\"unknown\",\"repository_identity_verified\":false,\"execution_supported\":false,\"coverage\":[\"Synthetic protocol fixture; never endpoint data\"]}}",
+    "body_sha256": "ef893d04deda945209f7eba3833aa9c46ed1b7f25f94a63528425da0024a9166",
+    "public_key": "-----BEGIN PUBLIC KEY-----\nMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEpuS5Wrtht/zNYPaJyifVRRxK5HzW\nSKQCJorkqVDrInvCRr9UgdukVnNq6KvoRboY0xzk210yQrk4pSYi4mAwig==\n-----END PUBLIC KEY-----\n",
+    "canonical": "guarded-update-v1\nfixture-pi\nPOST\n/api/agent/v1/proposals\n1700000000\nbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\nef893d04deda945209f7eba3833aa9c46ed1b7f25f94a63528425da0024a9166",
+    "signature": "304502200febe6aeb687e79f3f095952c8a58ada2eb8758b9d4d3c818e992a7220a6048d022100e84da319ba3cccd032a7128016b26bf5bc2e01ee947976d1662600913a9fce97"
+  },
+  "approval": {
+    "decision": {
+      "id": "00000000-0000-4000-8000-000000000001",
+      "device_id": "fixture-pi",
+      "proposal_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "report_sha256": "ef893d04deda945209f7eba3833aa9c46ed1b7f25f94a63528425da0024a9166",
+      "issued_at_unix": 1700000001,
+      "expires_at_unix": 1700003601,
+      "allow_service_restarts": true,
+      "allow_reboot": false,
+      "execution_allowed": false,
+      "status": "approved",
+      "signature": "3045022012efbf1430eb6a2761474db897adeed00e4d271556ff46f332a468d44dedcd93022100e5285e7050bffd60e31cf322d70cc8af60d282a081e52a96856d8f903e6280e6"
+    },
+    "public_key": "-----BEGIN PUBLIC KEY-----\nMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEjd1n27g+tTxJY79LWtjFgyfzjOit\n2KBIcSVwWMLUnIlLvcRqg2NKFa6q0cjogkeG9bNxYx1kMS5bFAxhElbnxg==\n-----END PUBLIC KEY-----\n",
+    "canonical": "guarded-update-approval-v1\n00000000-0000-4000-8000-000000000001\nfixture-pi\naaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nef893d04deda945209f7eba3833aa9c46ed1b7f25f94a63528425da0024a9166\n1700000001\n1700003601\ntrue\nfalse\nfalse"
+  }
+}

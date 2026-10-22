@@ -1,0 +1,25 @@
+[Unit]
+Description=Report APT update proposals and retrieve signed decisions
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=guarded-update
+Group=guarded-update
+ExecStart=/usr/local/bin/guarded-update sync --config /etc/guarded-update/remote.toml
+StateDirectory=guarded-update
+StateDirectoryMode=0700
+UMask=0077
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+CapabilityBoundingSet=
+TimeoutStartSec=5min

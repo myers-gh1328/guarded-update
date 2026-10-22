@@ -47,3 +47,15 @@ No coverage tooling yet.
 - Work on a branch; open a PR; squash-merge only when every check is green.
 - Release: bump `Cargo.toml`, update `CHANGELOG.md`, merge, then push a
   `vX.Y.Z` tag on `main`.
+
+## Minimal Linux build variants
+
+- `apt-agent` is a local read-only APT proposal CLI.
+- `apt-remote` adds signed HTTPS reporting and polling for remotely managed devices,
+  including owner-selected business devices. The user explicitly requested this
+  separate opt-in path. Keep the legacy CLI's personal/no-root boundaries intact.
+- Remote builds use existing system OpenSSL for P-256 signatures and curl for HTTPS;
+  no private keys are bundled. The device signs requests; the controller signs
+  approvals. Pin public keys at provisioning. See ADR-0002 and synthetic protocol
+  vectors. No installation/execution authority exists in these builds yet.
+- Verify default, apt-agent and apt-remote test/clippy profiles independently.
