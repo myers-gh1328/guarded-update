@@ -274,7 +274,9 @@ fn verify_decision(config: &RemoteConfig, decision: &Decision) -> Result<(), Str
     let bytes: Vec<u8> = decision
         .signature
         .as_bytes()
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap_or(""), 16).unwrap_or(0))
         .collect();
     let signature = TempFile::bytes(&config.state_dir, &bytes)?;
@@ -626,7 +628,9 @@ mod tests {
         let mut config = dir.config();
         let signature_bytes: Vec<_> = text("signature")
             .as_bytes()
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|p| u8::from_str_radix(std::str::from_utf8(p).unwrap(), 16).unwrap())
             .collect();
         let sig = TempFile::bytes(&dir.0, &signature_bytes).unwrap();
