@@ -25,3 +25,10 @@ Review ADR-0003 and gate boundaries; implement a trusted archive/provenance adap
 and disposable Linux protocol-v3 integration tests before adding any dispatcher.
 Fresh signed single-use claims, root-safe paths, journaling and reconciliation are
 still mandatory. Reporting approval signatures never authorize installation.
+
+## Latest inherited fix and verification
+
+Cherry-picked the reporting branch's explicit remote-lock release fix after the
+gate commit. Reverified executor suite: 44 tests passed; executor Clippy with
+warnings denied and formatting also passed. Working tree is ready for parent
+review; no push, release, deployment or live update was performed.
