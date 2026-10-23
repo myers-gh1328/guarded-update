@@ -21,3 +21,4 @@ strip = true
 default = []
 apt-agent = []
 apt-remote = ["apt-agent"]
+apt-executor = ["apt-remote"]
