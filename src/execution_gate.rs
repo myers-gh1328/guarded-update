@@ -530,7 +530,13 @@ mod gate_tests {
             archive_sha256: archive.sha256,
         }];
         let stream = std::fs::read_to_string(stream_path).expect("captured APT hook");
-        assert!(validate_gate(&manifest, &local, &stream, &inspector).is_ok());
+        let result = validate_gate(&manifest, &local, &stream, &inspector);
+        let actions = stream.split_once("\n\n").map(|(_, actions)| actions);
+        assert!(
+            result.is_ok(),
+            "gate error: {}; synthetic actions: {actions:?}",
+            result.err().unwrap_or_default()
+        );
         manifest.changes[0].archive_sha256 = "0".repeat(64);
         assert!(validate_gate(&manifest, &local, &stream, &inspector).is_err());
     }
