@@ -1,0 +1,20 @@
+{
+  "description": "Synthetic execution claim generated through DCC store; no private keys or real endpoint data.",
+  "manifest_json": "{\"schema_version\":1,\"kind\":\"apt-execution-manifest\",\"device_id\":\"fixture-device\",\"proposal_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"generated_at_unix\":2000000000,\"metadata_checked_at_unix\":2000000000,\"metadata_valid_until_unix\":2000007200,\"repository_identity_verified\":true,\"package_state_sha256\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"repository_state_sha256\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"held_packages\":[],\"changes\":[{\"package\":\"fixture\",\"old\":{\"version\":\"1\",\"architecture\":\"arm64\",\"multi_arch\":\"none\"},\"new\":{\"version\":\"2\",\"architecture\":\"arm64\",\"multi_arch\":\"none\"},\"archive_sha256\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\"}]}",
+  "public_key": "-----BEGIN PUBLIC KEY-----\nMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE6kBzMOkWx2SzVDT/IkBEbIpsV22U\njJCNdaD4nZJDXIIeloxHP9Ga7MQKpyuPkfdMsbb/z3EmMtYFF8UOXNf3SQ==\n-----END PUBLIC KEY-----\n",
+  "canonical": "guarded-update-execution-claim-v1\n62deb57b-10da-4643-8e10-697a8acf59c1\nfixture-device\naaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nc0f658ba1a79ff57247494bf789464fb7f5b3e0d5183182f0d0f11de940fd4fe\neeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\n2000000001\n2000000121\ntrue\ntrue\nfalse",
+  "claim": {
+    "schema_version": 1,
+    "claim_id": "62deb57b-10da-4643-8e10-697a8acf59c1",
+    "device_id": "fixture-device",
+    "proposal_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "manifest_sha256": "c0f658ba1a79ff57247494bf789464fb7f5b3e0d5183182f0d0f11de940fd4fe",
+    "claim_nonce": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    "issued_at_unix": 2000000001,
+    "expires_at_unix": 2000000121,
+    "allow_service_restarts": true,
+    "execution_allowed": true,
+    "allow_reboot": false,
+    "signature": "3046022100f19753ab626864f733501afd1b467d001a05d0c9b971261bfcf94dbaf4d6fa38022100d2ae55bc30c2e748eb97c0f4167d8389b3a7b030e82ad674e30207ab8afc25d3"
+  }
+}

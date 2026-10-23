@@ -1,4 +1,6 @@
 //! OS-specific entry points. The APT artifact excludes the legacy module tree.
+#[cfg(feature = "apt-executor")]
+mod execution_broker;
 #[cfg(not(feature = "apt-agent"))]
 include!("legacy.rs");
 
@@ -28,3 +30,15 @@ fn main() -> std::process::ExitCode {
 #[cfg(feature = "apt-executor")]
 #[allow(dead_code)]
 mod execution_gate;
+
+#[cfg(feature = "apt-executor")]
+#[allow(dead_code)]
+mod execution_journal;
+
+#[cfg(feature = "apt-executor")]
+#[allow(dead_code)]
+mod execution_claim;
+
+#[cfg(feature = "apt-executor")]
+#[allow(dead_code)]
+mod execution_validate;

@@ -124,3 +124,31 @@ transaction validation and substituted-hash rejection pass; the mandatory hook
 rejects before dpkg, with both status hashes unchanged and fixture payload absent.
 Native executor suites pass on macOS ARM64 and Linux ARM64. This evidence covers
 the synthetic new-package transaction only, not production update execution.
+
+## Authorized executor follow-up
+
+The optional `apt-executor` profile now adds a strict signed claim verifier,
+root-owned durable consumption journal, system Python `python3-apt` adapter and
+unprivileged broker. Legacy and reporting-only artifacts keep their boundaries.
+Root-owned configuration selects a nonempty package batch; libapt determines its
+complete dependency closure and authenticated package record hashes. Root copies
+hash-verified archives from acquisition running as `_apt` into a private store.
+Authentication or freshness bypasses in repository sources are rejected. Fresh
+strict authenticated refresh is required; the local acceptance policy limits
+signed Release Date to seven days, upstream Valid-Until when supplied, and
+prepared evidence to one hour. A local deadline is not an upstream expiry claim.
+
+Prepared transactions cannot execute after state or archive drift. A mandatory
+APT hook validates actual actions while APT owns locks, obtains a fresh signed
+claim through the broker, verifies it and durably consumes authority before
+release. Root never holds device/controller private signing keys. A global local
+lock and persistent attempt records prevent overlapping or automatic repeated
+executions; interrupted outcomes require manual reconciliation. Durable terminal
+results cannot be contradicted by a later observation. No automatic reboot or
+root execution timer is included. Provisioning starts with reporting only.
+
+The disposable integration job checks real isolated upgrades and rejections for
+expired, mismatched, unacknowledged, invalidly signed, drifted, stale, held,
+substituted and replayed authority. Production hook cases use a synthetic signed
+controller response and actual root adapter; acquisition provenance remains a
+separate preparation check. CI must pass before executor deployment.

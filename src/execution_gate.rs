@@ -44,6 +44,8 @@ pub(crate) fn decode_manifest(input: &str) -> Result<ExecutionManifest, String> 
     serde_json::from_str(input).map_err(|_| "Invalid execution manifest".into())
 }
 /// Supplied by a future trusted local collector, never copied from the server.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct LocalEvidence {
     pub device_id: String,
     pub now_unix: u64,
@@ -57,6 +59,8 @@ pub(crate) struct LocalEvidence {
 }
 /// A production implementation must inspect a pinned, trusted archive handle;
 /// following the stream's path or trusting its basename is insufficient.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ArchiveEvidence {
     pub package: String,
     pub version: PackageVersion,

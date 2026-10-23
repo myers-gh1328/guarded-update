@@ -14,9 +14,18 @@ SPEC.loader.exec_module(helper)
 
 
 class ExecutorTests(unittest.TestCase):
+    def test_signed_date_bounds_metadata_without_valid_until(self):
+        now = 1792700000
+        with patch.object(helper.Path, 'glob', return_value=[Path('/synthetic/InRelease')]), patch.object(helper, 'checked', return_value=b'Date: Thu, 01 Oct 2026 11:51:57 UTC\n'):
+            with self.assertRaisesRegex(ValueError, 'expired'):
+                helper.expiry(now)
+        with patch.object(helper.Path, 'glob', return_value=[Path('/synthetic/InRelease')]), patch.object(helper, 'checked', return_value=b'Origin: synthetic\n'):
+            with self.assertRaisesRegex(ValueError, 'Date'):
+                helper.expiry(now)
+
     def test_authentication_and_freshness_overrides_are_rejected(self):
         settings = ['deb [trusted=yes] https://fixture.invalid stable main',
-                    'Trusted: yes', 'Allow-Insecure: true',
+                    'Trusted: yes', 'Trusted:\n yes', 'Allow-Insecure: true',
                     'allow-weak=1', 'allow-downgrade-to-insecure=yes',
                     'Check-Valid-Until: no', 'check-date=false']
         with tempfile.TemporaryDirectory() as directory:
@@ -97,6 +106,29 @@ class ExecutorTests(unittest.TestCase):
         self.assertEqual(result['version']['version'], '2:1.0-1')
         self.assertEqual(result['sha256'], helper.sha(b'actual archive bytes'))
         self.assertNotEqual(result['sha256'], helper.sha(b'tampered archive bytes'))
+
+
+    def test_reconciliation_preserves_a_durable_terminal_outcome(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory)
+            manifest = {'changes': [{'package': 'fixture', 'new': {'version': '2', 'architecture': 'arm64'}}]}
+            stored = {'manifest.json': json.dumps(manifest).encode(),
+                      'execution-started.json': b'{"claim_id":"fixture-claim"}',
+                      'execution-result.json': json.dumps({'status': 'interrupted', 'manifest_sha256': helper.sha(json.dumps(manifest).encode())}).encode()}
+            (state / 'execution-result.json').write_bytes(stored['execution-result.json'])
+            with patch.object(helper, 'checked', side_effect=lambda path, **kwargs: stored[Path(path).name]), patch.object(helper, 'package_hash', return_value='state-hash'), patch.object(helper.subprocess, 'run', return_value=Mock(returncode=1)), patch.object(helper, 'command', return_value=b'ii \t2\tarm64\n'), patch.object(helper, 'write_new'), patch.object(helper, 'request') as request:
+                helper.reconcile({'state_dir': directory})
+                self.assertEqual(request.call_args.args[2]['status'], 'interrupted')
+
+
+
+    def test_repository_metadata_without_authenticated_expiry_stays_unknown(self):
+        root = Mock()
+        root.glob.side_effect = [[Path('/var/lib/apt/lists/fixture_InRelease')], []]
+        with patch.object(helper, 'Path', return_value=root), patch.object(helper, 'checked', return_value=b'Date: Mon, 01 Jan 2024 00:00:00 UTC\n'):
+            with self.assertRaises(ValueError):
+                helper.expiry(2_000_000_000)
+
 
 
 if __name__ == '__main__':

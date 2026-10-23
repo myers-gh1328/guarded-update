@@ -59,3 +59,14 @@ No coverage tooling yet.
   approvals. Pin public keys at provisioning. See ADR-0002 and synthetic protocol
   vectors. No installation/execution authority exists in these builds yet.
 - Verify default, apt-agent and apt-remote test/clippy profiles independently.
+
+## Explicit remote execution profile
+
+The owner authorized an isolated `apt-executor` profile for explicitly enrolled
+remote business devices. This profile alone includes the system Python APT
+adapter, root validator and unprivileged controller broker. Its scoped privileged
+path does not change the legacy personal/no-root CLI or local reporting profile.
+No credentials are packaged; no services or updates activate on package install.
+Every transaction requires exact manifest approval, fresh one-use controller
+claim, root state/archive verification and the mandatory APT hook. No reboot.
+Interrupted execution is held for manual reconciliation and never replayed.
