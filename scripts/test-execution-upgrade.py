@@ -95,6 +95,14 @@ def main(binary):
     required = {'GUARDED_UPDATE_DISPOSABLE_TEST': '1', 'GITHUB_ACTIONS': 'true', 'RUNNER_ENVIRONMENT': 'github-hosted'}
     if sys.platform != 'linux' or os.geteuid() != 0 or any(os.environ.get(k) != v for k, v in required.items()):
         raise SystemExit('Requires opted-in root on disposable GitHub-hosted Linux')
+    # Hosted images make this directory writable by the runner. Harden only the
+    # disposable fixture environment; production checks retain their strict policy.
+    keyrings = Path('/usr/share/keyrings')
+    for path in [keyrings, *keyrings.rglob('*')]:
+        if path.is_symlink():
+            raise AssertionError('Unexpected symlink in fixture runner keyrings')
+        os.chown(path, 0, 0)
+        path.chmod(0o755 if path.is_dir() else 0o644)
     parent = Path('/var/lib/guarded-update-ci')
     parent.mkdir(mode=0o700, exist_ok=True)
     base = parent/secrets.token_hex(16)
