@@ -1,11 +1,8 @@
 name: CI
 
-# Public repo: runs on free GitHub-hosted runners. Docs-only changes skip it.
+# Public repo: required PR checks always run; docs-only main pushes skip it.
 on:
   pull_request:
-    paths-ignore:
-      - "docs/**"
-      - "**/*.md"
   push:
     branches:
       - main
