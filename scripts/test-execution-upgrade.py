@@ -14,7 +14,10 @@ import importlib.util
 
 
 def run(args, **kwargs):
-    return subprocess.run(args, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, **kwargs).stdout
+    result = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, **kwargs)
+    if result.returncode:
+        raise RuntimeError('Synthetic fixture command failed: ' + Path(args[0]).name + ': ' + result.stderr.decode(errors='replace')[:2048])
+    return result.stdout
 
 
 def write(path, data):
@@ -107,7 +110,6 @@ def main(binary):
     (keyrings/'guarded-update-fixture.pgp').write_bytes(b'synthetic keyring fingerprint fixture')
     (keyrings/'guarded-update-fixture.pgp').chmod(0o644)
     (keyrings/'guarded-update-fixture.gpg').symlink_to('guarded-update-fixture.pgp')
-    os.umask(0o077)  # Match the installed privileged systemd service.
     parent = Path('/var/lib/guarded-update-ci')
     parent.mkdir(mode=0o700, exist_ok=True)
     base = parent/secrets.token_hex(16)
@@ -133,6 +135,7 @@ def main(binary):
         archive = base/('fixture'+version+'.deb')
         run(['/usr/bin/dpkg-deb', '--build', '--root-owner-group', str(package), str(archive)])
         archives.append(archive)
+    os.umask(0o077)  # Match systemd for APT/hooks after building fixture packages.
     for case in ('expired', 'mismatch', 'no-ack', 'invalid-signature', 'drift', 'stale', 'held', 'archive', 'replay', 'approved', 'production-expired', 'production-approved'):
         directory = base/case
         directory.mkdir(mode=0o700)
