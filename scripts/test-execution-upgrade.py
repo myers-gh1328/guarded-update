@@ -105,6 +105,7 @@ def main(binary):
         path.chmod(0o755 if path.is_dir() else 0o644)
     # Exercise the root-owned sibling aliases used by Raspberry Pi OS keyrings.
     (keyrings/'guarded-update-fixture.pgp').write_bytes(b'synthetic keyring fingerprint fixture')
+    (keyrings/'guarded-update-fixture.pgp').chmod(0o644)
     (keyrings/'guarded-update-fixture.gpg').symlink_to('guarded-update-fixture.pgp')
     parent = Path('/var/lib/guarded-update-ci')
     parent.mkdir(mode=0o700, exist_ok=True)
