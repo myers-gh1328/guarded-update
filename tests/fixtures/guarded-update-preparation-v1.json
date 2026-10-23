@@ -1,0 +1,11 @@
+{
+  "public_key": "-----BEGIN PUBLIC KEY-----\nMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEIJf5fb6Axqe59UTXZYJFuGoxoTSq\nPhYROButq2AR1zaY6VEgugg0ZAQUFq6xKIDhAyd1fTfQZhW2lR83HyxI8Q==\n-----END PUBLIC KEY-----\n",
+  "job": {
+    "payload_json": "{\"schema_version\":1,\"kind\":\"apt-prepare\",\"job_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"device_id\":\"fixture-pi\",\"fleet\":\"business\",\"proposal_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"packages\":[\"nano\"],\"refresh_metadata\":true,\"issued_at_unix\":1000,\"expires_at_unix\":4600,\"execution_allowed\":false,\"allow_reboot\":false}",
+    "signature": "30450221009d8af19cb897afbb799524b17658ba131e576e19a7c34a4a704ce72f9dccd3cc02206ff55ee2e79b29ac56ae04152d24b8c27e838a2a06b21933e63d58eaa67f2ed5"
+  },
+  "delivery": {
+    "payload_json": "{\"schema_version\":1,\"kind\":\"apt-preparation-delivery\",\"device_id\":\"fixture-pi\",\"poll_nonce\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"issued_at_unix\":1000,\"expires_at_unix\":1120,\"job\":{\"payload_json\":\"{\\\"schema_version\\\":1,\\\"kind\\\":\\\"apt-prepare\\\",\\\"job_id\\\":\\\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\\",\\\"device_id\\\":\\\"fixture-pi\\\",\\\"fleet\\\":\\\"business\\\",\\\"proposal_id\\\":\\\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\\",\\\"packages\\\":[\\\"nano\\\"],\\\"refresh_metadata\\\":true,\\\"issued_at_unix\\\":1000,\\\"expires_at_unix\\\":4600,\\\"execution_allowed\\\":false,\\\"allow_reboot\\\":false}\",\"signature\":\"30450221009d8af19cb897afbb799524b17658ba131e576e19a7c34a4a704ce72f9dccd3cc02206ff55ee2e79b29ac56ae04152d24b8c27e838a2a06b21933e63d58eaa67f2ed5\"}}",
+    "signature": "304402204126db21f9b372eeed8807f98dbf21fafee50d78e03adf540bd7d72b88e08ccc02204da8143d4fd25de1582f66b8f53b1e2c5507d8b2c9d1eb146ae6d2d11b5d6026"
+  }
+}

@@ -58,3 +58,44 @@ Archive location is not an identity boundary: a relocated path may be anywhere
 with protected root-controlled ancestry and a regular root-owned non-writable
 file; symlinks and writable parents are rejected. The independently inspected
 bytes and complete package identity must still match the approved manifest.
+
+
+### Optional Linux preparation dispatcher
+
+Only `apt-executor` includes this capability. Package installation creates no
+keys, root policy, enrollment or active service. The fictional
+`examples/dispatcher-policy.json` is inactive and denies metadata refresh by
+default. Owner provisioning must explicitly choose package names, identity,
+fleet, protected directories and the pinned controller public key. Preparation
+refreshes APT metadata and downloads archives using existing system Python/APT;
+it does not grant installation or reboot authority.
+
+An explicit `dispatch --config <root-policy>` invocation uses the same singleton
+executor lock. The existing executor service's `cycle --config` also recognizes
+`kind: apt-dispatcher-policy`, so an owner may provision that policy at the existing
+executor config path. Retaining the original fixed-transaction config provides a
+rollback mode. Do not run either mode against overlapping active transactions.
+
+The root adapter polls through the unprivileged broker. Both the fresh nonce-bound
+delivery and inner package-selection job require controller signatures. Root
+accepts only a local allowlist (1–100 unique sorted package names), explicit
+metadata-refresh permission and a selection lifetime no greater than one hour.
+Outer delivery lifetime is at most 120 seconds. Exact payload bytes are signed
+with domain-separated SHA256/P-256 envelopes. No device private key is available
+to the root adapter.
+
+Each accepted job has immutable evidence and a derived executor config in its own
+root-owned directory. Partial preparation is retained and reported interrupted,
+never retried automatically. Publication retries preserve the manifest bytes.
+Expired or rejected unattempted proposals close locally; an uncertain attempted
+transaction blocks new delivery until explicit reconciliation. Terminal result
+upload retries remain durable. Directory history stops at 1024 entries and needs
+operator archival; consumed claims and transaction evidence must be retained.
+
+Preparation retains the archive limit (1 GiB total, 512 MiB per archive) and
+three-times-download plus 512 MiB free-space requirement. Dispatcher preparation
+commands have a combined 900-second deadline and individual command timeouts;
+timeout or output overflow kills their process group. Preparation stdout is
+streamed with a 32 MiB limit; command stderr is discarded. Controller outages
+never authorize execution.
+A successful APT result does not establish application health or refresh inventory.
