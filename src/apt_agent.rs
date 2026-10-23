@@ -48,6 +48,23 @@ fn package_name(name: &str) -> bool {
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || b"+.-:".contains(&c))
 }
 
+// APT appends transient dependency diagnostics after the parenthesized candidate.
+// They are not package versions or additional actions. Keep their grammar bounded.
+fn without_dependency_annotations(mut text: &str) -> Result<&str, String> {
+    text = text.trim_end();
+    while text.ends_with(']') {
+        let open = text
+            .rfind('[')
+            .ok_or("Malformed APT dependency annotation")?;
+        let annotation = &text[open + 1..text.len() - 1];
+        if annotation.len() > 16384 || !annotation.split_whitespace().all(package_name) {
+            return Err("Invalid APT dependency annotation".into());
+        }
+        text = text[..open].trim_end();
+    }
+    Ok(text)
+}
+
 fn parse_simulation(text: &str) -> Result<Vec<PackageChange>, String> {
     let summaries: Vec<_> = text
         .lines()
@@ -88,7 +105,7 @@ fn parse_simulation(text: &str) -> Result<Vec<PackageChange>, String> {
             return Err("Invalid APT package identity".into());
         }
         if verb == "Conf" {
-            let candidate = detail
+            let candidate = without_dependency_annotations(detail)?
                 .strip_prefix('(')
                 .and_then(|v| v.strip_suffix(')'))
                 .ok_or("Invalid APT configuration record")?;
@@ -118,6 +135,7 @@ fn parse_simulation(text: &str) -> Result<Vec<PackageChange>, String> {
         } else {
             (None, detail.trim())
         };
+        let tail = without_dependency_annotations(tail)?;
         let (target, source_description, operation) = if verb == "Remv" {
             if installed.is_none() || !tail.is_empty() {
                 return Err("Invalid APT removal".into());
@@ -396,6 +414,19 @@ pub(crate) fn main() -> ExitCode {
 mod tests {
     use super::*;
 
+    #[test]
+    fn dependency_annotations_do_not_change_transaction_versions() {
+        let text = "1 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\nInst fixture [1] (2 Synthetic:stable [armhf]) [dependent:armhf on fixture:armhf] [dependent:armhf ]\nConf fixture (2 Synthetic:stable [armhf]) []\n";
+        let changes = parse_simulation(text).unwrap();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].installed.as_deref(), Some("1"));
+        assert_eq!(changes[0].target.as_deref(), Some("2"));
+        assert_eq!(
+            changes[0].source_description.as_deref(),
+            Some("Synthetic:stable [armhf]")
+        );
+        assert!(parse_simulation(&text.replace("[dependent:armhf ]", "[bad;command]")).is_err());
+    }
     #[test]
     fn configuration_version_must_match_the_proposed_target() {
         let prefix = "1 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\nInst foo [1] (2 Debian [armhf])\n";
