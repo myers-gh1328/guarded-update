@@ -27,7 +27,7 @@ def checked(path, directory=False, limit=MAX):
     for ancestor in path.parents:
         info = ancestor.lstat()
         if not stat.S_ISDIR(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
-            raise ValueError('Unsafe path ancestry')
+            raise ValueError('Unsafe path ancestry: ' + str(ancestor))
     before = path.lstat()
     if before.st_uid != 0 or before.st_mode & 0o022:
         raise ValueError('Unsafe root ownership or permissions')
