@@ -75,6 +75,7 @@ jobs:
         with:
           key: armv7-apt-remote
       - name: Install cross linker on CI runner
+        timeout-minutes: 5
         run: |
           sudo apt-get update
           sudo apt-get install --yes gcc-arm-linux-gnueabihf
