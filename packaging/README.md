@@ -54,3 +54,7 @@ validates the complete action set. A separate `execution-claimed.json` records
 result correlation before validation; it is never installation authority or proof
 of success. A rejected attempt can report interruption while its attempt marker
 remains intact. Do not reset or replay it to repair result reporting.
+Archive location is not an identity boundary: a relocated path may be anywhere
+with protected root-controlled ancestry and a regular root-owned non-writable
+file; symlinks and writable parents are rejected. The independently inspected
+bytes and complete package identity must still match the approved manifest.

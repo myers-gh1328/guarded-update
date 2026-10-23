@@ -54,3 +54,13 @@ class RelocationTests(unittest.TestCase):
             with patch.object(helper, 'checked', return_value=b'{}'):
                 with self.assertRaisesRegex(ValueError, 'cannot establish'):
                     helper.attempt_claim({'state_dir': directory}, 'succeeded')
+
+    def test_claim_correlation_must_match_the_current_manifest(self):
+        with tempfile.TemporaryDirectory() as directory:
+            marker = Path(directory)/'execution-claimed.json'
+            marker.write_text('{}')
+            def read(path):
+                return b'{"manifest_sha256":"wrong"}' if Path(path).name == marker.name else b'{}'
+            with patch.object(helper, 'checked', side_effect=read):
+                with self.assertRaisesRegex(ValueError, 'manifest'):
+                    helper.attempt_claim({'state_dir': directory}, 'interrupted')

@@ -377,7 +377,10 @@ def attempt_claim(config, status=None):
         if status == 'succeeded':
             raise ValueError('Claim correlation cannot establish successful installation')
         path = state / 'execution-claimed.json'
-    return json.loads(checked(path))
+    claim = json.loads(checked(path))
+    if path.name == 'execution-claimed.json' and claim.get('manifest_sha256') != sha(checked(state / 'manifest.json')):
+        raise ValueError('Claim correlation does not match current manifest')
+    return claim
 
 
 def hook(config):
