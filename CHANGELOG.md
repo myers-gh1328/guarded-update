@@ -2,6 +2,16 @@
 
 All notable changes are listed here. Versions follow semantic versioning.
 
+## [0.1.5] - Unreleased
+
+### Fixed
+
+- Root executor response waits consume both request and response spool entries on
+  success, rejection or timeout. Late broker responses and interrupted temporary
+  writes expire after ten minutes through bounded response-only cleanup. Stale
+  cleanup skips symlinks and foreign-owned files; transaction/claim journals stay
+  untouched.
+
 ## [0.1.4] - Unreleased
 
 ### Added
