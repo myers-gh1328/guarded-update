@@ -22,15 +22,17 @@ for profile in apt-agent apt-remote apt-executor; do
    # Verify syntax using a synthetic executable path; the artifact is ARMv7.
    sed "s|ExecStart=/usr/bin/guarded-update |ExecStart=/usr/bin/true |" \
      "$extracted/usr/lib/systemd/system/guarded-update-remote.service" > "$extracted/guarded-update-remote.service"
+   cp "$extracted/usr/lib/systemd/system/guarded-update-remote.timer" "$extracted/guarded-update-remote.timer"
    systemd-analyze verify "$extracted/guarded-update-remote.service" \
-     "$extracted/usr/lib/systemd/system/guarded-update-remote.timer"
+     "$extracted/guarded-update-remote.timer"
  fi
  if [[ $profile = apt-executor ]]; then
    [[ -x $extracted/usr/lib/guarded-update/apt_executor.py ]]
    sed "s|ExecStart=/usr/bin/guarded-update |ExecStart=/usr/bin/true |" \
      "$extracted/usr/lib/systemd/system/guarded-update-broker.service" > "$extracted/guarded-update-broker.service"
+   cp "$extracted/usr/lib/systemd/system/guarded-update-broker.timer" "$extracted/guarded-update-broker.timer"
    systemd-analyze verify "$extracted/guarded-update-broker.service" \
-     "$extracted/usr/lib/systemd/system/guarded-update-broker.timer"
+     "$extracted/guarded-update-broker.timer"
  else
    [[ ! -e $extracted/usr/lib/guarded-update/apt_executor.py ]]
    [[ ! -e $extracted/usr/lib/systemd/system/guarded-update-broker.service ]]
