@@ -1,6 +1,7 @@
 """Synthetic adapter tests: no real APT, dpkg or endpoint changes."""
 import importlib.util
 import json
+import os
 from pathlib import Path
 import subprocess
 import stat
@@ -16,6 +17,16 @@ SPEC.loader.exec_module(helper)
 
 
 class ExecutorTests(unittest.TestCase):
+    def test_broker_requests_remain_group_readable_under_systemd_umask(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)/'request.json'
+            previous = os.umask(0o077)
+            try:
+                helper.write_new(path, b'{}', 0o640)
+            finally:
+                os.umask(previous)
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o640)
+
     def test_repository_keyring_alias_requires_root_chain_and_regular_target(self):
         with tempfile.TemporaryDirectory() as directory:
             link = Path('/usr/share/keyrings/fixture.gpg')

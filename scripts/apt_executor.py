@@ -58,6 +58,7 @@ def encode(value):
 def write_new(path, data, mode=0o600):
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode)
     try:
+        os.fchmod(fd, mode)
         with os.fdopen(fd, 'wb', closefd=False) as stream:
             stream.write(data)
             stream.flush()
