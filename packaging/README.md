@@ -101,3 +101,13 @@ timeout or output overflow kills their process group. Preparation stdout is
 streamed with a 32 MiB limit; command stderr is discarded. Controller outages
 never authorize execution.
 A successful APT result does not establish application health or refresh inventory.
+
+
+Broker request/response files are ephemeral transport, separate from transaction
+and claim journals. Response waits remove their exact request and response on
+success, rejection or timeout. The root adapter pins the response directory
+without following its symlink and performs bounded stale-response cleanup after
+each wait: only regular files owned by that broker directory's owner and named
+`<32 lowercase hex>.json` or `.<32 lowercase hex>.tmp`, at least ten minutes old.
+Each pass scans at most 1024 entries and removes at most 128. Cleanup never
+recurses, follows response symlinks or visits transaction state directories.

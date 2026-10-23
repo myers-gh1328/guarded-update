@@ -222,13 +222,44 @@ def request(config, kind, body, claim_id=None):
     return identity
 
 
+def prune_responses(directory, now=None):
+    # Only ephemeral broker spool entries, never root transaction directories.
+    owner = os.fstat(directory)
+    if not stat.S_ISDIR(owner.st_mode) or owner.st_mode & 0o077:
+        raise ValueError('Broker responses must be private')
+    now = time.time() if now is None else now
+    removed = 0
+    with os.scandir(directory) as entries:
+        for _ in range(1024):
+            entry = next(entries, None)
+            if entry is None or removed >= 128:
+                break
+            if not re.fullmatch(r'(?:[a-f0-9]{32}\.json|\.[a-f0-9]{32}\.tmp)', entry.name):
+                continue
+            try:
+                info = os.stat(entry.name, dir_fd=directory, follow_symlinks=False)
+                if not stat.S_ISREG(info.st_mode) or info.st_uid != owner.st_uid or info.st_mtime > now - 600:
+                    continue
+                # unlinkat never follows the leaf, including a concurrent swap
+                # to a symlink by the unprivileged broker.
+                os.unlink(entry.name, dir_fd=directory)
+                removed += 1
+            except FileNotFoundError:
+                pass
+    return removed
+
+
 def response(config, identity, timeout=90):
-    path = Path(config['responses_dir']) / (identity + '.json')
+    if not isinstance(identity, str) or not re.fullmatch(r'[a-f0-9]{32}', identity):
+        raise ValueError('Invalid broker response identity')
+    name = identity + '.json'
+    directory = None
     end = time.monotonic() + timeout
     try:
+        directory = os.open(config['responses_dir'], os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         while time.monotonic() < end:
             try:
-                fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+                fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
             except FileNotFoundError:
                 time.sleep(1)
                 continue
@@ -248,7 +279,20 @@ def response(config, identity, timeout=90):
             return result['body']
         raise ValueError('Controller unavailable; transaction remains held')
     finally:
-        (Path(config['broker_dir']) / (identity + '.json')).unlink(missing_ok=True)
+        try:
+            (Path(config['broker_dir']) / name).unlink(missing_ok=True)
+        finally:
+            if directory is not None:
+                try:
+                    try:
+                        os.unlink(name, dir_fd=directory)
+                    except FileNotFoundError:
+                        pass
+                finally:
+                    try:
+                        prune_responses(directory)
+                    finally:
+                        os.close(directory)
 
 
 def load(config_path):

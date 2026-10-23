@@ -110,7 +110,7 @@ class ExecutorTests(unittest.TestCase):
             request_path = Path(directory) / (identity + '.json')
             # Use separate dirs because the queue entry is removed after the wait.
             response_dir = Path(directory) / 'responses'
-            response_dir.mkdir()
+            response_dir.mkdir(mode=0o700)
             config['responses_dir'] = str(response_dir)
             request_path.write_text('{}')
             response_path = response_dir / (identity + '.json')
@@ -118,7 +118,7 @@ class ExecutorTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'rejected'):
                 helper.response(config, identity)
             self.assertFalse(request_path.exists())
-            response_path.unlink()
+            self.assertFalse(response_path.exists())
             secret = response_dir / 'other'
             secret.write_text('{}')
             response_path.symlink_to(secret)
