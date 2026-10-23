@@ -37,7 +37,7 @@ jobs:
             os: macos-15
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-24.04-arm
-        profile: [default, apt-agent, apt-remote]
+        profile: [default, apt-agent, apt-remote, apt-executor]
     runs-on: ${{ matrix.platform.os }}
     steps:
       - uses: actions/checkout@v7
@@ -82,3 +82,29 @@ jobs:
         env:
           CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER: arm-linux-gnueabihf-gcc
         run: cargo build --release --locked --target armv7-unknown-linux-gnueabihf --no-default-features --features apt-remote
+
+  apt-hook:
+    name: Disposable Linux APT rejection hook
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: apt-executor-hook
+      - name: Capture rejected synthetic transaction in isolated APT state
+        run: |
+          sudo env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+            GUARDED_UPDATE_DISPOSABLE_TEST=1 GITHUB_ACTIONS=true \
+            RUNNER_ENVIRONMENT=github-hosted RUNNER_TEMP="$RUNNER_TEMP" \
+            GUARDED_UPDATE_HOOK_OUTPUT="$RUNNER_TEMP/apt-hook-fixture" \
+            bash scripts/test-apt-hook.sh
+      - name: Validate real protocol stream as ordinary runner user
+        env:
+          GUARDED_UPDATE_DISPOSABLE_TEST: "1"
+          GUARDED_UPDATE_HOOK_STREAM_FILE: ${{ runner.temp }}/apt-hook-fixture/hook-stream
+          GUARDED_UPDATE_FIXTURE_ARCHIVE: ${{ runner.temp }}/apt-hook-fixture/fixture.deb
+        run: >-
+          cargo test --locked --features apt-executor
+          execution_gate::gate_tests::disposable_linux_real_apt_hook_stream_matches_archive
+          -- --ignored --exact

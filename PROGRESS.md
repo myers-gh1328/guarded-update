@@ -48,3 +48,10 @@ APT invocation, fixture build or package operation ran on the development host.
 Next exact action: wire and run the disposable Linux job, then inspect its evidence
 before claiming APT hook integration works. Production adapters, claims and
 dispatch remain absent.
+
+## CI integration
+
+Rebased on merged reporting main. Added executor native matrix profiles and a
+disposable Ubuntu rejection job. Fresh local executor run: 44 passed, one
+integration test ignored; formatting, Clippy and Bash syntax passed. Pending CI
+proof of actual hook capture. No production execution adapter exists.
