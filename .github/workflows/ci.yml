@@ -1,11 +1,8 @@
 name: CI
 
-# Public repo: runs on free GitHub-hosted runners. Docs-only changes skip it.
+# Public repo: required PR checks always run; docs-only main pushes skip it.
 on:
   pull_request:
-    paths-ignore:
-      - "docs/**"
-      - "**/*.md"
   push:
     branches:
       - main
@@ -75,6 +72,7 @@ jobs:
         with:
           key: armv7-apt-remote
       - name: Install cross linker on CI runner
+        timeout-minutes: 5
         run: |
           sudo apt-get update
           sudo apt-get install --yes gcc-arm-linux-gnueabihf
@@ -128,4 +126,4 @@ jobs:
             RUNNER_ENVIRONMENT=github-hosted \
             python3 -I scripts/test-execution-upgrade.py "$PWD/target/debug/guarded-update"
       - name: Test production APT adapter invariants
-        run: python3 -B -m unittest discover -s tests -p 'test_apt_executor.py' -v
+        run: python3 -B -m unittest discover -s tests -p 'test_*.py' -v

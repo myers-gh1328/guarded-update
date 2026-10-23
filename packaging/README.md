@@ -36,8 +36,7 @@ unprivileged execution-claim broker service/timer (five-second polling). It uses
 existing system Python and python3-apt; no Python runtime or additional libraries
 are bundled. Both timers remain disabled until provisioning explicitly enables
 them. The broker retrieves controller-signed claims; it cannot install packages.
-No root executor service or automatic installation schedule is included. Root
-preparation and application require separate explicit host provisioning.
+Root preparation and application require separate explicit host provisioning.
 
 The executor profile also contains a disabled root cycle service/timer. Explicit
 provisioning supplies a root-owned nonempty package selection before activation.
@@ -46,3 +45,16 @@ installation after approved status. The mandatory hook remains the authority
 boundary and obtains a fresh signed claim. A durable attempt never executes again;
 terminal results are retried independently until acknowledged. Future batches
 require deliberate new root-owned transaction state, not automatic replay.
+
+APT may copy a selected archive into its cache before the mandatory hook runs.
+The adapter inspects that actual unpack path using the same root ownership,
+protected ancestry and no-symlink checks, and requires the exact approved package,
+version, architecture and SHA-256. The Rust transaction gate still independently
+validates the complete action set. A separate `execution-claimed.json` records
+result correlation before validation; it is never installation authority or proof
+of success. A rejected attempt can report interruption while its attempt marker
+remains intact. Do not reset or replay it to repair result reporting.
+Archive location is not an identity boundary: a relocated path may be anywhere
+with protected root-controlled ancestry and a regular root-owned non-writable
+file; symlinks and writable parents are rejected. The independently inspected
+bytes and complete package identity must still match the approved manifest.

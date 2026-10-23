@@ -136,7 +136,7 @@ def main(binary):
         run(['/usr/bin/dpkg-deb', '--build', '--root-owner-group', str(package), str(archive)])
         archives.append(archive)
     os.umask(0o077)  # Match systemd for APT/hooks after building fixture packages.
-    for case in ('expired', 'mismatch', 'no-ack', 'invalid-signature', 'drift', 'stale', 'held', 'archive', 'replay', 'approved', 'production-expired', 'production-approved'):
+    for case in ('expired', 'mismatch', 'no-ack', 'invalid-signature', 'drift', 'stale', 'held', 'archive', 'replay', 'approved', 'production-expired', 'production-approved', 'production-relocated'):
         directory = base/case
         directory.mkdir(mode=0o700)
         for name in ('root', 'dpkg', 'log', 'state/lists/partial', 'cache/archives/partial', 'etc/parts', 'etc/sources', 'journal'):
@@ -167,6 +167,13 @@ def main(binary):
             selected_archive = directory/'archives'/(archive_hash+'.deb')
             shutil.copyfile(archives[1], selected_archive)
             selected_archive.chmod(0o600)
+            if case == 'production-relocated':
+                # Model APT 3 selecting a cache copy rather than the original
+                # hash-named archive. Both bytes and metadata must still match.
+                cached_archive = directory/'cache/archives/guarded-update-upgrade-fixture_2_all.deb'
+                shutil.copyfile(selected_archive, cached_archive)
+                cached_archive.chmod(0o600)
+                selected_archive = cached_archive
             now = int(time.time())
             old = dict(version='1', architecture='all', multi_arch='none')
             manifest = dict(schema_version=1, kind='apt-execution-manifest', device_id='synthetic-fixture', proposal_id='a'*32, generated_at_unix=now, metadata_checked_at_unix=now, metadata_valid_until_unix=now+3600, repository_identity_verified=True, package_state_sha256=adapter.package_hash(), repository_state_sha256=adapter.repository_hash(), held_packages=adapter.holds(), changes=[dict(package='guarded-update-upgrade-fixture', old=old, new=dict(old, version='2'), archive_sha256=archive_hash)])
@@ -196,7 +203,7 @@ DPkg::Tools::Options::{hook_script}::InfoFD "0";
             if broker.wait(timeout=35) != 0:
                 raise AssertionError('Fixture controller did not complete')
         marker = directory/'root/usr/share/guarded-update-upgrade-fixture/marker'
-        approved = case in ('approved', 'production-approved')
+        approved = case in ('approved', 'production-approved', 'production-relocated')
         expected = '2' if approved else '1'
         if (result.returncode == 0) != approved or marker.read_text() != expected:
             raise AssertionError(f'{case}: unexpected upgrade outcome: {result.stdout.decode()} {result.stderr.decode()}')
