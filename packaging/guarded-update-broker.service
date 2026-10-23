@@ -1,0 +1,26 @@
+[Unit]
+Description=Retrieve signed single-use execution claims
+Wants=network-online.target
+After=network-online.target
+ConditionPathExists=/etc/guarded-update/remote.toml
+
+[Service]
+Type=oneshot
+User=guarded-update
+Group=guarded-update
+ExecStart=/usr/bin/guarded-update broker --config /etc/guarded-update/remote.toml --requests /var/lib/guarded-update/broker --responses /var/lib/guarded-update/responses
+StateDirectory=guarded-update
+StateDirectoryMode=0700
+UMask=0077
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+CapabilityBoundingSet=
+TimeoutStartSec=40s

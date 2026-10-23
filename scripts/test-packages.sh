@@ -25,4 +25,14 @@ for profile in apt-agent apt-remote apt-executor; do
    systemd-analyze verify "$extracted/guarded-update-remote.service" \
      "$extracted/usr/lib/systemd/system/guarded-update-remote.timer"
  fi
+ if [[ $profile = apt-executor ]]; then
+   [[ -x $extracted/usr/lib/guarded-update/apt_executor.py ]]
+   sed "s|ExecStart=/usr/bin/guarded-update |ExecStart=/usr/bin/true |" \
+     "$extracted/usr/lib/systemd/system/guarded-update-broker.service" > "$extracted/guarded-update-broker.service"
+   systemd-analyze verify "$extracted/guarded-update-broker.service" \
+     "$extracted/usr/lib/systemd/system/guarded-update-broker.timer"
+ else
+   [[ ! -e $extracted/usr/lib/guarded-update/apt_executor.py ]]
+   [[ ! -e $extracted/usr/lib/systemd/system/guarded-update-broker.service ]]
+ fi
 done

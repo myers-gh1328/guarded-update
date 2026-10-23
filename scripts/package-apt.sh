@@ -32,6 +32,12 @@ if [[ $profile != apt-agent ]]; then
  install -m 0644 packaging/guarded-update-remote.service packaging/guarded-update-remote.timer "$stage/usr/lib/systemd/system/"
  install -m 0644 examples/remote/remote.toml "$stage/usr/share/guarded-update/examples/remote.toml"
 fi
+if [[ $profile = apt-executor ]]; then
+ dependencies+=', python3, python3-apt, dpkg'
+ mkdir -p "$stage/usr/lib/guarded-update"
+ install -m 0755 scripts/apt_executor.py "$stage/usr/lib/guarded-update/apt_executor.py"
+ install -m 0644 packaging/guarded-update-broker.service packaging/guarded-update-broker.timer "$stage/usr/lib/systemd/system/"
+fi
 cat > "$stage/DEBIAN/control" <<CONTROL
 Package: guarded-update-$profile
 Version: $version

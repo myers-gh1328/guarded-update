@@ -30,3 +30,11 @@ After verifying configuration, explicitly enable the polling timer using the
 host's deployment tooling. Disabling the timer stops future polling; it does not
 revoke already issued short-lived execution claims. Revoke controller approvals
 and disable the separately configured executor when withdrawing execution access.
+
+Only `apt-executor` also includes `/usr/lib/guarded-update/apt_executor.py` and an
+unprivileged execution-claim broker service/timer (five-second polling). It uses
+existing system Python and python3-apt; no Python runtime or additional libraries
+are bundled. Both timers remain disabled until provisioning explicitly enables
+them. The broker retrieves controller-signed claims; it cannot install packages.
+No root executor service or automatic installation schedule is included. Root
+preparation and application require separate explicit host provisioning.
