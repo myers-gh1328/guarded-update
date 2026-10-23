@@ -2,7 +2,19 @@
 
 All notable changes are listed here. Versions follow semantic versioning.
 
-## [Unreleased]
+## [0.1.4] - Unreleased
+
+### Added
+
+- The opt-in APT executor can poll signed, bounded package-preparation requests
+  through its unprivileged broker. Root policy pins device/fleet, allowed package
+  names and metadata-refresh permission. Each job retains immutable state;
+  preparation never grants installation or reboot authority.
+- Interrupted preparation, controller outages and lost publication responses retain
+  conservative recovery state. Prepared transactions still require exact human
+  approval and the existing fresh one-use execution claim.
+- Executor packages include an inactive dispatcher policy example. Local-only
+  builds contain no dispatcher, remote credentials or services.
 
 ### Fixed
 

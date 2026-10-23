@@ -11,13 +11,17 @@ import pwd
 import re
 import shutil
 import secrets
+import signal
+import selectors
 import stat
 import subprocess
 import sys
 import time
+import tempfile
 
 ENV = {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LC_ALL": "C", "DEBIAN_FRONTEND": "noninteractive", "NEEDRESTART_MODE": "l"}
 MAX = 2 * 1024 * 1024
+PREPARATION_DEADLINE = None
 
 
 def checked(path, directory=False, limit=MAX):
@@ -73,7 +77,40 @@ def write_new(path, data, mode=0o600):
 
 
 def command(args, timeout=120):
-    result = subprocess.run(args, env=ENV, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout, check=False)
+    if PREPARATION_DEADLINE is None:
+        result = subprocess.run(args, env=ENV, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout, check=False)
+    else:
+        remaining = PREPARATION_DEADLINE - time.monotonic()
+        if remaining <= 0:
+            raise subprocess.TimeoutExpired(args, 0)
+        budget = remaining if timeout is None else min(timeout, remaining)
+        with subprocess.Popen(args, env=ENV, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, start_new_session=True) as process:
+            try:
+                output = bytearray()
+                end = time.monotonic() + budget
+                with selectors.DefaultSelector() as selector:
+                    selector.register(process.stdout, selectors.EVENT_READ)
+                    while selector.get_map():
+                        remaining = end - time.monotonic()
+                        if remaining <= 0:
+                            raise subprocess.TimeoutExpired(args, budget)
+                        for key, _ in selector.select(remaining):
+                            chunk = os.read(key.fileobj.fileno(), 65536)
+                            if not chunk:
+                                selector.unregister(key.fileobj)
+                            elif len(output) + len(chunk) > 16 * MAX:
+                                raise ValueError('Executor prerequisite output exceeds limit')
+                            else:
+                                output.extend(chunk)
+                process.wait(timeout=max(0, end - time.monotonic()))
+            except BaseException:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                process.wait()
+                raise
+            result = subprocess.CompletedProcess(args, process.returncode, bytes(output), b'')
     if result.returncode:
         raise ValueError('Executor prerequisite command failed: ' + Path(args[0]).name)
     if len(result.stdout) > 16 * MAX:
@@ -527,9 +564,225 @@ def failure_category(error):
     return categories.get(str(error), type(error).__name__)
 
 
+def strict_json(raw):
+    def pairs(items):
+        result = {}
+        for key, value in items:
+            if key in result:
+                raise ValueError('Duplicate JSON field')
+            result[key] = value
+        return result
+    return json.loads(raw, object_pairs_hook=pairs)
+
+
+def verify_preparation_signature(policy, envelope, domain):
+    if not isinstance(envelope, dict) or set(envelope) != {'payload_json', 'signature'}:
+        raise ValueError('Invalid signed preparation envelope')
+    raw, signature = envelope['payload_json'], envelope['signature']
+    limit = 32768 if domain == 'guarded-update-preparation-delivery-v1' else 12288
+    if not isinstance(raw, str) or len(raw.encode()) > limit or not isinstance(signature, str) or not re.fullmatch(r'[a-f0-9]{128,160}', signature) or len(signature) % 2:
+        raise ValueError('Invalid signed preparation bounds')
+    checked(policy['approval_public_key_file'], limit=16384)
+    checked(policy['state_dir'], directory=True)
+    with tempfile.TemporaryDirectory(prefix='.verify-', dir=policy['state_dir']) as directory:
+        target = Path(directory) / 'signature.der'
+        write_new(target, bytes.fromhex(signature))
+        result = subprocess.run(['/usr/bin/openssl', 'dgst', '-sha256', '-verify', policy['approval_public_key_file'], '-signature', str(target)], input=(domain + '\n' + sha(raw.encode())).encode(), env=ENV, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10, check=False)
+        if result.returncode:
+            raise ValueError('Preparation signature rejected')
+
+
+def valid_window(value, now, maximum):
+    start, end = value.get('issued_at_unix'), value.get('expires_at_unix')
+    return type(start) is int and type(end) is int and 0 <= start <= now < end and 0 < end - start <= maximum
+
+
+def valid_packages(packages, maximum=100):
+    return isinstance(packages, list) and 0 < len(packages) <= maximum and all(isinstance(p, str) and len(p) <= 256 and re.fullmatch(r'[a-z0-9][a-z0-9+.-]*', p) for p in packages) and packages == sorted(set(packages))
+
+
+class PreparationRejected(ValueError):
+    def __init__(self, job):
+        super().__init__('Authenticated preparation rejected by local policy')
+        self.job = job
+
+
+def validate_preparation_delivery(policy, envelope, nonce, now):
+    verify_preparation_signature(policy, envelope, 'guarded-update-preparation-delivery-v1')
+    outer = strict_json(envelope['payload_json'])
+    fields = {'schema_version', 'kind', 'device_id', 'poll_nonce', 'issued_at_unix', 'expires_at_unix', 'job'}
+    if not isinstance(outer, dict) or set(outer) != fields or type(outer['schema_version']) is not int or outer['schema_version'] != 1 or outer['kind'] != 'apt-preparation-delivery' or outer['device_id'] != policy['device_id'] or outer['poll_nonce'] != nonce or not re.fullmatch(r'[a-f0-9]{32}', nonce) or not valid_window(outer, now, 120):
+        raise ValueError('Preparation delivery does not match fresh poll')
+    if outer['job'] is None:
+        return None
+    verify_preparation_signature(policy, outer['job'], 'guarded-update-preparation-v1')
+    job = strict_json(outer['job']['payload_json'])
+    fields = {'schema_version', 'kind', 'job_id', 'device_id', 'fleet', 'proposal_id', 'packages', 'refresh_metadata', 'issued_at_unix', 'expires_at_unix', 'execution_allowed', 'allow_reboot'}
+    if not isinstance(job, dict) or set(job) != fields or type(job['schema_version']) is not int or job['schema_version'] != 1 or job['kind'] != 'apt-prepare' or not isinstance(job['job_id'], str) or not re.fullmatch(r'[a-f0-9]{32}', job['job_id']) or job['proposal_id'] != job['job_id'] or job['device_id'] != policy['device_id'] or job['fleet'] != policy['fleet'] or job['execution_allowed'] is not False or job['allow_reboot'] is not False or job['refresh_metadata'] is not True:
+        raise ValueError('Preparation job does not match local policy')
+    if not valid_window(job, now, 3600) or policy['allow_metadata_refresh'] is not True or not valid_packages(job['packages']) or not set(job['packages']).issubset(policy['allowed_packages']):
+        raise PreparationRejected(job)
+    return job
+
+
+def load_dispatcher(config_path):
+    if os.geteuid() != 0:
+        raise ValueError('Dispatcher requires root')
+    policy = strict_json(checked(config_path, limit=128 * 1024))
+    fields = {'schema_version', 'kind', 'device_id', 'fleet', 'state_dir', 'broker_dir', 'responses_dir', 'approval_public_key_file', 'validator_binary', 'allowed_packages', 'allow_metadata_refresh'}
+    if not isinstance(policy, dict) or set(policy) != fields or type(policy['schema_version']) is not int or policy['schema_version'] != 1 or policy['kind'] != 'apt-dispatcher-policy' or not isinstance(policy['device_id'], str) or not re.fullmatch(r'[a-zA-Z0-9_.-]{1,128}', policy['device_id']) or policy['fleet'] not in ('personal', 'business') or not valid_packages(policy['allowed_packages'], maximum=5000) or type(policy['allow_metadata_refresh']) is not bool:
+        raise ValueError('Invalid root preparation policy')
+    for field in ('state_dir', 'broker_dir'):
+        checked(policy[field], directory=True)
+    checked(policy['approval_public_key_file'], limit=16384)
+    checked(policy['validator_binary'], limit=64 * MAX)
+    if not isinstance(policy['responses_dir'], str) or not Path(policy['responses_dir']).is_absolute() or '..' in Path(policy['responses_dir']).parts:
+        raise ValueError('Invalid broker response directory')
+    return policy
+
+
+def preparation_status(config, job_id, status, reason=None):
+    identity = request(config, 'preparation-status', {'schema_version': 1, 'job_id': job_id, 'status': status, 'reason': reason})
+    response(config, identity)
+
+
+def preparation_failure(state, reason):
+    if not (state / 'preparation-failed.json').exists():
+        write_new(state / 'preparation-failed.json', encode({'reason': reason}))
+
+
+def continue_preparation(policy, state):
+    global PREPARATION_DEADLINE
+    job = strict_json(checked(state / 'job.json', limit=16384))
+    failure = state / 'preparation-failed.json'
+    if failure.exists():
+        reason = strict_json(checked(failure))['reason']
+        preparation_status(policy, job['job_id'], 'failed', reason)
+        write_new(state / 'failure-reported.json', b'{}')
+        return
+    config_path = state / 'executor.json'
+    if not config_path.exists():
+        config = {field: policy[field] for field in ('device_id', 'broker_dir', 'responses_dir', 'approval_public_key_file', 'validator_binary')}
+        config.update(proposal_id=job['proposal_id'], packages=job['packages'], state_dir=str(state))
+        write_new(config_path, encode(config))
+    config = strict_json(checked(config_path, limit=16384))
+    if (state / 'execution-attempted.json').exists():
+        # Existing gate owns this attempt. Unknown outcome blocks the queue.
+        cycle(config, config_path)
+        return
+    if not (state / 'received-reported.json').exists():
+        preparation_status(policy, job['job_id'], 'received')
+        write_new(state / 'received-reported.json', b'{}')
+    if not (state / 'manifest.json').exists():
+        if (state / 'preparation-started.json').exists():
+            # Partial downloads and unknown preparation side effects are retained.
+            preparation_failure(state, 'preparation_interrupted')
+            return
+        if job['expires_at_unix'] <= int(time.time()):
+            preparation_failure(state, 'policy_rejected')
+            return
+        if policy['allow_metadata_refresh'] is not True or not valid_packages(job['packages']) or not set(job['packages']).issubset(policy['allowed_packages']):
+            preparation_failure(state, 'policy_rejected')
+            return
+        write_new(state / 'preparation-started.json', b'{}')
+        PREPARATION_DEADLINE = time.monotonic() + 900
+        try:
+            prepare(config)
+        except (ValueError, OSError, subprocess.SubprocessError, KeyError, TypeError):
+            # prepare may have finished freezing a manifest before transport failed.
+            if not (state / 'manifest.json').exists():
+                preparation_failure(state, 'preparation_failed')
+            return
+        finally:
+            PREPARATION_DEADLINE = None
+    raw = checked(state / 'manifest.json')
+    manifest = strict_json(raw)
+    now = int(time.time())
+    if manifest['metadata_valid_until_unix'] <= now or any(type(manifest.get(field)) is not int or not 0 <= now - manifest[field] < 3600 for field in ('generated_at_unix', 'metadata_checked_at_unix')):
+        # A lost publication response can hide a controller-side manifest.
+        # Probe typed absence before reporting a failure of preparation.
+        identity = request(config, 'status', {'schema_version': 1, 'proposal_id': job['proposal_id'], 'allow_missing': True})
+        status = response(config, identity)
+        if not (state / 'manifest-reported.json').exists() and status.get('status') == 'not_found' and status.get('schema_version') == 1 and status.get('proposal_id') == job['proposal_id'] and status.get('manifest_sha256') is None:
+            preparation_failure(state, 'metadata_unavailable')
+            preparation_status(policy, job['job_id'], 'failed', 'metadata_unavailable')
+            write_new(state / 'failure-reported.json', b'{}')
+        elif status.get('manifest_sha256') == sha(raw) and status.get('status') in ('rejected', 'revoked', 'expired'):
+            write_new(state / 'controller-closed.json', encode({'status': status['status']}))
+        # Missing transport, mismatching identity, live or claimed manifests
+        # remain held. A controller hint never establishes execution success.
+        return
+    if not (state / 'manifest-reported.json').exists():
+        identity = request(config, 'manifest', {'schema_version': 1, 'proposal_id': job['proposal_id'], 'manifest_json': raw.decode()})
+        response(config, identity)
+        write_new(state / 'manifest-reported.json', b'{}')
+    identity = request(config, 'status', {'schema_version': 1, 'proposal_id': job['proposal_id']})
+    status = response(config, identity)
+    if status.get('manifest_sha256') != sha(raw):
+        raise ValueError('Controller status does not match prepared manifest')
+    if status.get('status') in ('rejected', 'revoked', 'expired'):
+        write_new(state / 'controller-closed.json', encode({'status': status['status']}))
+    elif status.get('status') == 'approved':
+        if not set(job['packages']).issubset(policy['allowed_packages']):
+            raise ValueError('Current root package policy holds prepared transaction')
+        # This trigger still passes through the existing fresh-claim APT hook.
+        execute(config, config_path)
+
+
+def dispatch_preparations(policy):
+    root = checked(policy['state_dir'], directory=True)
+    paths = list(root.iterdir())
+    if len(paths) > 1024:
+        raise ValueError('Dispatcher history limit requires operator archival')
+    active = []
+    for state in sorted(paths):
+        if not re.fullmatch(r'[a-f0-9]{32}', state.name):
+            continue
+        checked(state, directory=True)
+        if not (state / 'job.json').exists():
+            # A crash during initial durable acceptance never silently loses work.
+            raise ValueError('Incomplete preparation acceptance requires reconciliation')
+        if not any((state / marker).exists() for marker in ('failure-reported.json', 'result-reported.json', 'controller-closed.json')):
+            active.append(state)
+    if len(active) > 1:
+        raise ValueError('Multiple active preparations require reconciliation')
+    if active:
+        continue_preparation(policy, active[0])
+        return
+    nonce = secrets.token_hex(16)
+    identity = request(policy, 'preparation-poll', {'schema_version': 1, 'poll_nonce': nonce})
+    envelope = response(policy, identity)
+    rejected = False
+    try:
+        job = validate_preparation_delivery(policy, envelope, nonce, int(time.time()))
+    except PreparationRejected as error:
+        job, rejected = error.job, True
+    if job is None:
+        return
+    state = root / job['job_id']
+    if state.exists():
+        old = strict_json(checked(state / 'job.json', limit=16384))
+        if old != job:
+            raise ValueError('Preparation identity changed on replay')
+        # Terminal requests never prepare again, even with a fresh delivery.
+        return
+    state.mkdir(mode=0o700)
+    parent = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(parent)
+    finally:
+        os.close(parent)
+    write_new(state / 'job.json', encode(job))
+    # Preserve exact signed bytes as immutable evidence, independently of config.
+    write_new(state / 'delivery.json', encode(envelope))
+    if rejected:
+        preparation_failure(state, 'policy_rejected')
+    continue_preparation(policy, state)
+
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('operation', choices=('prepare', 'hook', 'execute', 'download', 'reconcile', 'report-result', 'cycle'))
+    parser.add_argument('operation', choices=('prepare', 'hook', 'execute', 'download', 'reconcile', 'report-result', 'cycle', 'dispatch'))
     parser.add_argument('--config', type=Path)
     parser.add_argument('--directory')
     parser.add_argument('--package')
@@ -540,6 +793,15 @@ def main():
         return
     if args.config is None:
         raise ValueError('Explicit executor config required')
+    mode = strict_json(checked(args.config, limit=128 * 1024)).get('kind')
+    if args.operation == 'dispatch' or (args.operation == 'cycle' and mode == 'apt-dispatcher-policy'):
+        policy = load_dispatcher(args.config)
+        lock = executor_lock()
+        try:
+            dispatch_preparations(policy)
+        finally:
+            os.close(lock)
+        return
     config = load(args.config)
     lock = None if args.operation == 'hook' else executor_lock()
     try:

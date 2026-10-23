@@ -74,8 +74,37 @@ jobs:
       - name: Install cross linker on CI runner
         timeout-minutes: 5
         run: |
-          sudo apt-get update
-          sudo apt-get install --yes gcc-arm-linux-gnueabihf
+          # The runner's Azure mirror can stall past this step's five-minute bound.
+          # Use official Ubuntu sources only for this CI prerequisite installation.
+          ci_sources_file="$RUNNER_TEMP/guarded-update-ci.sources"
+          ci_apt_lists="/var/lib/apt/guarded-update-ci-lists"
+          cat > "$ci_sources_file" <<'SOURCES'
+          Types: deb
+          URIs: https://archive.ubuntu.com/ubuntu
+          Suites: noble noble-updates
+          Components: main universe
+          Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+
+          Types: deb
+          URIs: https://security.ubuntu.com/ubuntu
+          Suites: noble-security
+          Components: main universe
+          Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+          SOURCES
+          sudo install -d -m 0755 "$ci_apt_lists" "$ci_apt_lists/partial"
+          ci_apt_options=(
+            -o "Dir::Etc::sourcelist=$ci_sources_file"
+            -o 'Dir::Etc::sourceparts=-'
+            -o "Dir::State::lists=$ci_apt_lists"
+            -o 'Acquire::Retries=1'
+            -o 'Acquire::http::Timeout=20'
+            -o 'Acquire::https::Timeout=20'
+            -o 'Acquire::AllowInsecureRepositories=false'
+            -o 'APT::Get::AllowUnauthenticated=false'
+            -o 'APT::Update::Error-Mode=any'
+          )
+          sudo apt-get "${ci_apt_options[@]}" update
+          sudo apt-get "${ci_apt_options[@]}" install --yes --no-install-recommends gcc-arm-linux-gnueabihf libc6-dev-armhf-cross
       - name: Build Linux-only ARMv7 packages
         env:
           CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER: arm-linux-gnueabihf-gcc

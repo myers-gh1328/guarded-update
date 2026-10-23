@@ -35,6 +35,8 @@ fn route(r: &Request) -> Result<String, String> {
         return Err("Invalid broker request".into());
     }
     match (r.kind.as_str(), r.claim_id.as_deref()) {
+        ("preparation-poll", None) => Ok("/api/agent/v1/preparation-poll".into()),
+        ("preparation-status", None) => Ok("/api/agent/v1/preparation-status".into()),
         ("manifest", None) => Ok("/api/agent/v1/execution-manifests".into()),
         ("status", None) => Ok("/api/agent/v1/execution-status".into()),
         ("claim", None) => Ok("/api/agent/v1/execution-claims".into()),
@@ -196,6 +198,13 @@ mod tests {
             route(&request("claim", None)).unwrap(),
             "/api/agent/v1/execution-claims"
         );
+        for (kind, expected) in [
+            ("preparation-poll", "/api/agent/v1/preparation-poll"),
+            ("preparation-status", "/api/agent/v1/preparation-status"),
+        ] {
+            assert_eq!(route(&request(kind, None)).unwrap(), expected);
+            assert!(route(&request(kind, Some("a".repeat(36)))).is_err());
+        }
         assert!(route(&request("https://evil.invalid", None)).is_err());
         assert!(route(&request("result", Some("../secret".into()))).is_err());
         assert!(serde_json::from_str::<Request>(r#"{"schema_version":1,"kind":"claim","request_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","body":{},"command":"sh"}"#).is_err());

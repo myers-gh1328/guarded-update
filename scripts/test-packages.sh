@@ -28,6 +28,7 @@ for profile in apt-agent apt-remote apt-executor; do
  fi
  if [[ $profile = apt-executor ]]; then
    [[ -x $extracted/usr/lib/guarded-update/apt_executor.py ]]
+   [[ -f $extracted/usr/share/guarded-update/examples/dispatcher-policy.json ]]
    [[ -f $extracted/usr/lib/systemd/system/guarded-update-executor.timer ]]
    sed "s|ExecStart=.*|ExecStart=/usr/bin/true|" "$extracted/usr/lib/systemd/system/guarded-update-executor.service" > "$extracted/guarded-update-executor.service"
    cp "$extracted/usr/lib/systemd/system/guarded-update-executor.timer" "$extracted/guarded-update-executor.timer"
@@ -40,6 +41,7 @@ for profile in apt-agent apt-remote apt-executor; do
  else
    [[ ! -e $extracted/usr/lib/systemd/system/guarded-update-executor.service ]]
    [[ ! -e $extracted/usr/lib/guarded-update/apt_executor.py ]]
+   [[ ! -e $extracted/usr/share/guarded-update/examples/dispatcher-policy.json ]]
    [[ ! -e $extracted/usr/lib/systemd/system/guarded-update-broker.service ]]
  fi
 done

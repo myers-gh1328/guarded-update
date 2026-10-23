@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "kind": "apt-dispatcher-policy",
+  "device_id": "example-pi",
+  "fleet": "business",
+  "state_dir": "/var/lib/guarded-update/jobs",
+  "broker_dir": "/var/lib/guarded-update/broker-requests",
+  "responses_dir": "/var/lib/guarded-update/broker-responses",
+  "approval_public_key_file": "/etc/guarded-update/controller-public.pem",
+  "validator_binary": "/usr/bin/guarded-update",
+  "allowed_packages": ["nano"],
+  "allow_metadata_refresh": false
+}
