@@ -152,3 +152,12 @@ expired, mismatched, unacknowledged, invalidly signed, drifted, stale, held,
 substituted and replayed authority. Production hook cases use a synthetic signed
 controller response and actual root adapter; acquisition provenance remains a
 separate preparation check. CI must pass before executor deployment.
+
+Verified executor follow-up: all ten checks passed in CI run39894575730,
+including production hook accepted/expired cases, all negative transaction
+cases, ARMv7 packaging and disabled unit verification. ARMv7 binaries measured
+461996bytes local, 761004bytes remote-reporting and920748bytes executor. These
+are CI artifacts, not a tagged release. Executor cycle polls approval status
+without consuming it; only the mandatory hook's fresh signed claim authorizes
+execution. Root attempt records prohibit automatic replay; result retries are
+independent. All units remain disabled until explicit provisioning.
