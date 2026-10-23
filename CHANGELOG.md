@@ -4,6 +4,14 @@ All notable changes are listed here. Versions follow semantic versioning.
 
 ## [Unreleased]
 
+### Fixed
+
+- The opt-in APT executor verifies the actual root-controlled archive path APT
+  will unpack, including cache copies, against the approved identity and digest.
+- Claims rejected before execution starts retain separate correlation so their
+  interrupted result is reported without replaying APT. Correlation cannot prove
+  successful installation. Logs use static rejection categories.
+
 ## [0.1.3] - 2026-10-19
 
 ### Changed

@@ -155,6 +155,7 @@ class ExecutorTests(unittest.TestCase):
                       'execution-started.json': b'{"claim_id":"fixture-claim"}',
                       'execution-result.json': json.dumps({'status': 'interrupted', 'manifest_sha256': helper.sha(json.dumps(manifest).encode())}).encode()}
             (state / 'execution-result.json').write_bytes(stored['execution-result.json'])
+            (state / 'execution-started.json').write_bytes(stored['execution-started.json'])
             with patch.object(helper, 'checked', side_effect=lambda path, **kwargs: stored[Path(path).name]), patch.object(helper, 'package_hash', return_value='state-hash'), patch.object(helper.subprocess, 'run', return_value=Mock(returncode=1)), patch.object(helper, 'command', return_value=b'ii \t2\tarm64\n'), patch.object(helper, 'write_new'), patch.object(helper, 'request') as request:
                 helper.reconcile({'state_dir': directory})
                 self.assertEqual(request.call_args.args[2]['status'], 'interrupted')

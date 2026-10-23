@@ -342,6 +342,44 @@ def inspect_archive(path):
     return {'package': record['Package'], 'version': {'version': record['Version'], 'architecture': record['Architecture'], 'multi_arch': record.get('Multi-Arch', 'none')}, 'sha256': sha(data)}
 
 
+def transaction_archives(config, manifest, stream):
+    """Pin the bytes APT will unpack, including root-controlled cache copies."""
+    result = {}
+    for change in manifest['changes']:
+        path = Path(config['state_dir']) / 'archives' / (change['archive_sha256'] + '.deb')
+        result[str(path)] = inspect_archive(path)
+    _, separator, actions = stream.partition('\n\n')
+    if not separator:
+        raise ValueError('APT action separator missing')
+    for line in actions.splitlines():
+        fields = line.split(' ')
+        if len(fields) != 9 or not fields[8].startswith('/') or not fields[8].endswith('.deb'):
+            continue  # The mandatory Rust parser rejects malformed/unsupported actions.
+        path = fields[8]
+        if path in result:
+            continue
+        archive = inspect_archive(Path(path))
+        def normalized(version):
+            return dict(version, multi_arch='none' if version['multi_arch'] == 'no' else version['multi_arch'])
+        if not any(archive['package'] == change['package']
+                   and normalized(archive['version']) == normalized(change['new'])
+                   and archive['sha256'] == change['archive_sha256']
+                   for change in manifest['changes']):
+            raise ValueError('APT cached archive differs from approved bytes')
+        result[path] = archive
+    return result
+
+
+def attempt_claim(config, status=None):
+    state = Path(config['state_dir'])
+    path = state / 'execution-started.json'
+    if not path.exists():
+        if status == 'succeeded':
+            raise ValueError('Claim correlation cannot establish successful installation')
+        path = state / 'execution-claimed.json'
+    return json.loads(checked(path))
+
+
 def hook(config):
     if os.environ.get('APT_HOOK_INFO_FD') != '0' or os.environ.get('DPKG_FRONTEND_LOCKED') != 'true':
         raise ValueError('APT hook lock context missing')
@@ -355,11 +393,13 @@ def hook(config):
     claim = response(config, identity)
     if claim.get('allow_service_restarts') is not True:
         raise ValueError('Explicit service-restart approval required')
+    if not re.fullmatch(r'[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}', claim.get('claim_id', '')):
+        raise ValueError('Invalid claim correlation identity')
+    # Correlation is not execution authority. Only the Rust gate can consume the
+    # signature/nonce journal and permit the actual APT transaction.
+    write_new(Path(config['state_dir']) / 'execution-claimed.json', encode({'claim_id': claim['claim_id'], 'claim_nonce': nonce, 'manifest_sha256': sha(raw)}))
     evidence = {'device_id': config['device_id'], 'now_unix': int(time.time()), 'package_state_sha256': package_hash(), 'repository_state_sha256': repository_hash(), 'held_packages': holds(), 'repository_identity_verified': True, 'metadata_checked_at_unix': manifest['metadata_checked_at_unix'], 'metadata_valid_until_unix': manifest['metadata_valid_until_unix'], 'package_state_clean': True}
-    archive_map = {}
-    for change in manifest['changes']:
-        path = Path(config['state_dir']) / 'archives' / (change['archive_sha256'] + '.deb')
-        archive_map[str(path)] = inspect_archive(path)
+    archive_map = transaction_archives(config, manifest, stream.decode())
     value = {'manifest': raw.decode(), 'evidence': evidence, 'stream': stream.decode(), 'archives': archive_map, 'claim': claim, 'nonce': nonce, 'manifest_sha256': sha(raw)}
     validation = Path(config['state_dir']) / ('validation-' + nonce + '.json')
     write_new(validation, encode(value))
@@ -397,15 +437,15 @@ def execute(config, config_path):
         raise
     finally:
         write_new(state / 'execution-result.json', encode({'status': result, 'finished_at_unix': int(time.time()), 'manifest_sha256': sha(raw)}))
-        if (state / 'execution-started.json').exists():
-            started = json.loads(checked(state / 'execution-started.json'))
+        if (state / 'execution-started.json').exists() or (state / 'execution-claimed.json').exists():
+            started = attempt_claim(config, result)
             request(config, 'result', {'schema_version': 1, 'status': result, 'manifest_sha256': sha(raw)}, claim_id=started['claim_id'])
 
 
 def cycle(config, config_path):
     state = Path(config['state_dir'])
     if (state / 'execution-attempted.json').exists():
-        if (state / 'execution-result.json').exists() and (state / 'execution-started.json').exists():
+        if (state / 'execution-result.json').exists() and ((state / 'execution-started.json').exists() or (state / 'execution-claimed.json').exists()):
             resend_result(config)
         # Terminal or uncertain attempts never start again automatically.
         return
@@ -443,7 +483,7 @@ def reconcile(config):
         write_new(terminal_path, encode(terminal))
     identity = secrets.token_hex(16)
     write_new(state / ('reconciliation-' + identity + '.json'), encode({'status': terminal['status'], 'observed_package_state_sha256': observed_state, 'observed_at_unix': int(time.time())}))
-    started = json.loads(checked(state / 'execution-started.json'))
+    started = attempt_claim(config, terminal['status'])
     request(config, 'result', {'schema_version': 1, 'status': terminal['status'], 'manifest_sha256': digest}, claim_id=started['claim_id'])
 
 
@@ -452,7 +492,7 @@ def resend_result(config):
     if (state / 'result-reported.json').exists():
         return
     result = json.loads(checked(state / 'execution-result.json'))
-    started = json.loads(checked(state / 'execution-started.json'))
+    started = attempt_claim(config, result['status'])
     identity = request(config, 'result', {'schema_version': 1, 'status': result['status'], 'manifest_sha256': result['manifest_sha256']}, claim_id=started['claim_id'])
     response(config, identity)
     write_new(state / 'result-reported.json', encode({'claim_id': started['claim_id'], 'reported_at_unix': int(time.time())}))
@@ -471,6 +511,17 @@ def executor_lock():
         os.close(fd)
         raise
     return fd
+
+
+def failure_category(error):
+    # Static categories only: command stderr, URLs and root paths stay private.
+    categories = {
+        'Executor prerequisite command failed: guarded-update': 'validator_rejected',
+        'Executor prerequisite command failed: apt-get': 'apt_transaction_rejected',
+        'APT cached archive differs from approved bytes': 'archive_identity_rejected',
+        'Claim correlation cannot establish successful installation': 'uncertain_execution_outcome',
+    }
+    return categories.get(str(error), type(error).__name__)
 
 
 def main():
@@ -499,5 +550,5 @@ if __name__ == '__main__':
     try:
         main()
     except (ValueError, OSError, subprocess.SubprocessError, KeyError, TypeError) as error:
-        sys.stderr.write('guarded-update executor held: ' + type(error).__name__ + '\n')
+        sys.stderr.write('guarded-update executor held: ' + failure_category(error) + '\n')
         raise SystemExit(1)
