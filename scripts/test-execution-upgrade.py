@@ -98,7 +98,7 @@ def main(binary):
     # Hosted images make this directory writable by the runner. Harden only the
     # disposable fixture environment; production checks retain their strict policy.
     keyrings = Path('/usr/share/keyrings')
-    for path in [keyrings, *keyrings.rglob('*')]:
+    for path in [*keyrings.parents, keyrings, *keyrings.rglob('*')]:
         if path.is_symlink():
             raise AssertionError('Unexpected symlink in fixture runner keyrings')
         os.chown(path, 0, 0)
