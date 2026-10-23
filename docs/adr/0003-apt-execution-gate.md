@@ -119,5 +119,8 @@ rejects a substituted expected hash. Device/package/repository evidence remains
 synthetic; this test does not prove production provenance, freshness, claim
 authorization, interrupted recovery, or archive immutability through installation.
 Scratch disappears with runner teardown. This harness must never run on managed
-endpoints. It is prepared but not considered verified until the disposable Linux
-CI job passes; local development only checks syntax, refusal guards and Rust tests.
+endpoints. Verified by the disposable Ubuntu CI job in PR #10: actual protocol-v3
+transaction validation and substituted-hash rejection pass; the mandatory hook
+rejects before dpkg, with both status hashes unchanged and fixture payload absent.
+Native executor suites pass on macOS ARM64 and Linux ARM64. This evidence covers
+the synthetic new-package transaction only, not production update execution.
