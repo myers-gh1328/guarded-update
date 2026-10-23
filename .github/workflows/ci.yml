@@ -118,3 +118,14 @@ jobs:
           cargo test --locked --features apt-executor
           execution_gate::gate_tests::disposable_linux_real_apt_hook_stream_matches_archive
           -- --ignored --exact
+
+      - name: Build executor for isolated upgrade integration
+        run: cargo build --locked --features apt-executor
+      - name: Verify real isolated upgrade and rejection cases
+        run: |
+          sudo env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+            GUARDED_UPDATE_DISPOSABLE_TEST=1 GITHUB_ACTIONS=true \
+            RUNNER_ENVIRONMENT=github-hosted \
+            python3 -I scripts/test-execution-upgrade.py "$PWD/target/debug/guarded-update"
+      - name: Test production APT adapter invariants
+        run: python3 -B -m unittest discover -s tests -p 'test_apt_executor.py' -v
