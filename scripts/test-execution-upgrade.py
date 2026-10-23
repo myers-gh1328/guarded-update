@@ -107,6 +107,7 @@ def main(binary):
     (keyrings/'guarded-update-fixture.pgp').write_bytes(b'synthetic keyring fingerprint fixture')
     (keyrings/'guarded-update-fixture.pgp').chmod(0o644)
     (keyrings/'guarded-update-fixture.gpg').symlink_to('guarded-update-fixture.pgp')
+    os.umask(0o077)  # Match the installed privileged systemd service.
     parent = Path('/var/lib/guarded-update-ci')
     parent.mkdir(mode=0o700, exist_ok=True)
     base = parent/secrets.token_hex(16)
