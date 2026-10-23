@@ -78,10 +78,20 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --yes gcc-arm-linux-gnueabihf
-      - name: Build remote agent for ARMv7
+      - name: Build Linux-only ARMv7 packages
         env:
           CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER: arm-linux-gnueabihf-gcc
-        run: cargo build --release --locked --target armv7-unknown-linux-gnueabihf --no-default-features --features apt-remote
+        run: |
+          for profile in apt-agent apt-remote apt-executor; do
+            bash scripts/package-apt.sh "$profile" armv7-unknown-linux-gnueabihf dist
+          done
+          bash scripts/test-packages.sh dist
+      - name: Upload explicit opt-in ARMv7 packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: guarded-update-armhf-packages
+          path: dist/*.deb
+          if-no-files-found: error
 
   apt-hook:
     name: Disposable Linux APT rejection hook
@@ -108,3 +118,14 @@ jobs:
           cargo test --locked --features apt-executor
           execution_gate::gate_tests::disposable_linux_real_apt_hook_stream_matches_archive
           -- --ignored --exact
+
+      - name: Build executor for isolated upgrade integration
+        run: cargo build --locked --features apt-executor
+      - name: Verify real isolated upgrade and rejection cases
+        run: |
+          sudo env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+            GUARDED_UPDATE_DISPOSABLE_TEST=1 GITHUB_ACTIONS=true \
+            RUNNER_ENVIRONMENT=github-hosted \
+            python3 -I scripts/test-execution-upgrade.py "$PWD/target/debug/guarded-update"
+      - name: Test production APT adapter invariants
+        run: python3 -B -m unittest discover -s tests -p 'test_apt_executor.py' -v

@@ -252,6 +252,62 @@ pub(crate) fn main() -> ExitCode {
         .collect::<Vec<_>>()
         .as_slice()
     {
+        #[cfg(feature = "apt-executor")]
+        [
+            "broker",
+            "--config",
+            path,
+            "--requests",
+            requests,
+            "--responses",
+            responses,
+        ] if cfg!(target_os = "linux") => {
+            let result = crate::agent_protocol::RemoteConfig::load(std::path::Path::new(path))
+                .and_then(|config| {
+                    let now = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .map_err(|_| "Invalid clock")?
+                        .as_secs();
+                    crate::execution_broker::run(
+                        &config,
+                        std::path::Path::new(requests),
+                        std::path::Path::new(responses),
+                        now,
+                    )
+                });
+            match result {
+                Ok(message) => {
+                    out.stdout(&message);
+                    ExitCode::SUCCESS
+                }
+                Err(error) => {
+                    out.stdout(&error);
+                    ExitCode::from(1)
+                }
+            }
+        }
+        #[cfg(feature = "apt-executor")]
+        [
+            "validate-execution",
+            "--input",
+            input,
+            "--key",
+            key,
+            "--journal",
+            journal,
+        ] if cfg!(target_os = "linux") => {
+            match crate::execution_validate::validate(
+                std::path::Path::new(input),
+                std::path::Path::new(key),
+                std::path::Path::new(journal),
+            ) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(error) => {
+                    out.stdout(&error);
+                    ExitCode::from(1)
+                }
+            }
+        }
         #[cfg(feature = "apt-remote")]
         ["sync", "--config", path] if cfg!(target_os = "linux") => {
             let result = crate::agent_protocol::RemoteConfig::load(std::path::Path::new(path))
@@ -283,7 +339,13 @@ pub(crate) fn main() -> ExitCode {
             }
         }
         ["--version"] => {
-            #[cfg(feature = "apt-remote")]
+            #[cfg(feature = "apt-executor")]
+            out.stdout(concat!(
+                "guarded-update ",
+                env!("CARGO_PKG_VERSION"),
+                " (apt-executor)"
+            ));
+            #[cfg(all(feature = "apt-remote", not(feature = "apt-executor")))]
             out.stdout(concat!(
                 "guarded-update ",
                 env!("CARGO_PKG_VERSION"),
@@ -298,6 +360,8 @@ pub(crate) fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         ["--help"] | [] => {
+            #[cfg(feature = "apt-executor")]
+            out.stdout("Executor build: broker --config PATH --requests PATH --responses PATH; validate-execution --input PATH --key PATH --journal PATH. Privileged updates require the installed root adapter, exact dashboard approval, fresh signed claim and local transaction checks.");
             out.stdout("APT build: guarded-update propose\nRead-only simulation using cached indexes. Installation is unavailable.");
             #[cfg(feature = "apt-remote")]
             out.stdout("Remote build: guarded-update sync --config /absolute/path/remote.toml\nReports proposals and verifies polled approvals. No installation.");

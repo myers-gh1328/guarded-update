@@ -557,6 +557,16 @@ fn sync_with(
     ))
 }
 
+#[cfg(feature = "apt-executor")]
+pub(crate) fn signed_post(
+    config: &RemoteConfig,
+    path: &str,
+    body: &str,
+    now: u64,
+) -> Result<Value, String> {
+    SignedTransport(config).request("POST", path, body, now)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

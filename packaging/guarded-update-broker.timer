@@ -1,0 +1,10 @@
+[Unit]
+Description=Poll opted-in execution claim requests
+
+[Timer]
+OnBootSec=5s
+OnUnitActiveSec=5s
+Unit=guarded-update-broker.service
+
+[Install]
+WantedBy=timers.target
