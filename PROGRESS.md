@@ -55,3 +55,11 @@ Rebased on merged reporting main. Added executor native matrix profiles and a
 disposable Ubuntu rejection job. Fresh local executor run: 44 passed, one
 integration test ignored; formatting, Clippy and Bash syntax passed. Pending CI
 proof of actual hook capture. No production execution adapter exists.
+
+## First disposable evidence
+
+The mandatory hook ran under APT frontend locking and rejected before dpkg;
+status hashes and absent payload checks passed. The Rust gate correctly rejected
+APT's **ERROR** action: --no-download had skipped local-file acquisition. Added
+an isolated local-archive download-only preparation before the rejection pass;
+empty sources are retained. Pending repeated CI; nine other matrix jobs passed.
