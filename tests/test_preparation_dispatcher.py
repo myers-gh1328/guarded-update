@@ -224,4 +224,26 @@ class AcceptedJobTests(unittest.TestCase):
                 prepare_mock.assert_not_called()
 
 
+class LocalAllowlistTests(unittest.TestCase):
+    def test_large_root_allowlist_does_not_widen_each_signed_job(self):
+        policy = dict(schema_version=1,kind='apt-dispatcher-policy',device_id='fixture-device',fleet='business',state_dir='/var/lib/guarded-update/jobs',broker_dir='/var/lib/guarded-update/requests',responses_dir='/var/lib/guarded-update/responses',approval_public_key_file='/etc/guarded-update/controller-public.pem',validator_binary='/usr/bin/guarded-update',allowed_packages=['package%04d'%i for i in range(5000)],allow_metadata_refresh=True)
+        raw = json.dumps(policy).encode()
+        self.assertGreater(len(raw),16384)
+        self.assertLess(len(raw),128*1024)
+        def checked(path, **kwargs):
+            if str(path)=='/etc/guarded-update/executor.json':
+                if len(raw)>kwargs.get('limit',helper.MAX): raise ValueError('Oversized file')
+                return raw
+            return Path(path) if kwargs.get('directory') else b'fixture'
+        with patch.object(helper,'checked',side_effect=checked), patch.object(helper.os,'geteuid',return_value=0):
+            self.assertEqual(len(helper.load_dispatcher('/etc/guarded-update/executor.json')['allowed_packages']),5000)
+            with patch.object(helper.sys,'argv',['adapter','cycle','--config','/etc/guarded-update/executor.json']), patch.object(helper,'executor_lock',return_value=99), patch.object(helper.os,'close'), patch.object(helper,'dispatch_preparations') as dispatch:
+                helper.main()
+                dispatch.assert_called_once()
+        self.assertFalse(helper.valid_packages(policy['allowed_packages'][:101]))
+        policy['allowed_packages'].append('package9999')
+        with patch.object(helper,'checked',return_value=json.dumps(policy).encode()), patch.object(helper.os,'geteuid',return_value=0):
+            with self.assertRaises(ValueError): helper.load_dispatcher('/etc/guarded-update/executor.json')
+
+
 if __name__ == '__main__': unittest.main()

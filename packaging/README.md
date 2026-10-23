@@ -78,8 +78,10 @@ rollback mode. Do not run either mode against overlapping active transactions.
 
 The root adapter polls through the unprivileged broker. Both the fresh nonce-bound
 delivery and inner package-selection job require controller signatures. Root
-accepts only a local allowlist (1–100 unique sorted package names), explicit
-metadata-refresh permission and a selection lifetime no greater than one hour.
+accepts only a root policy allowlist (1–5000 unique sorted bare package names,
+within a 128 KiB policy file), explicit metadata-refresh permission and a selection
+lifetime no greater than one hour. Each signed selection remains limited to
+1–100 names and a 12 KiB payload; there are no wildcard package permissions.
 Outer delivery lifetime is at most 120 seconds. Exact payload bytes are signed
 with domain-separated SHA256/P-256 envelopes. No device private key is available
 to the root adapter.

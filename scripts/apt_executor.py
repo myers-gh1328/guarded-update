@@ -597,8 +597,8 @@ def valid_window(value, now, maximum):
     return type(start) is int and type(end) is int and 0 <= start <= now < end and 0 < end - start <= maximum
 
 
-def valid_packages(packages):
-    return isinstance(packages, list) and 0 < len(packages) <= 100 and all(isinstance(p, str) and len(p) <= 256 and re.fullmatch(r'[a-z0-9][a-z0-9+.-]*', p) for p in packages) and packages == sorted(set(packages))
+def valid_packages(packages, maximum=100):
+    return isinstance(packages, list) and 0 < len(packages) <= maximum and all(isinstance(p, str) and len(p) <= 256 and re.fullmatch(r'[a-z0-9][a-z0-9+.-]*', p) for p in packages) and packages == sorted(set(packages))
 
 
 class PreparationRejected(ValueError):
@@ -628,9 +628,9 @@ def validate_preparation_delivery(policy, envelope, nonce, now):
 def load_dispatcher(config_path):
     if os.geteuid() != 0:
         raise ValueError('Dispatcher requires root')
-    policy = strict_json(checked(config_path, limit=16384))
+    policy = strict_json(checked(config_path, limit=128 * 1024))
     fields = {'schema_version', 'kind', 'device_id', 'fleet', 'state_dir', 'broker_dir', 'responses_dir', 'approval_public_key_file', 'validator_binary', 'allowed_packages', 'allow_metadata_refresh'}
-    if not isinstance(policy, dict) or set(policy) != fields or type(policy['schema_version']) is not int or policy['schema_version'] != 1 or policy['kind'] != 'apt-dispatcher-policy' or not isinstance(policy['device_id'], str) or not re.fullmatch(r'[a-zA-Z0-9_.-]{1,128}', policy['device_id']) or policy['fleet'] not in ('personal', 'business') or not valid_packages(policy['allowed_packages']) or type(policy['allow_metadata_refresh']) is not bool:
+    if not isinstance(policy, dict) or set(policy) != fields or type(policy['schema_version']) is not int or policy['schema_version'] != 1 or policy['kind'] != 'apt-dispatcher-policy' or not isinstance(policy['device_id'], str) or not re.fullmatch(r'[a-zA-Z0-9_.-]{1,128}', policy['device_id']) or policy['fleet'] not in ('personal', 'business') or not valid_packages(policy['allowed_packages'], maximum=5000) or type(policy['allow_metadata_refresh']) is not bool:
         raise ValueError('Invalid root preparation policy')
     for field in ('state_dir', 'broker_dir'):
         checked(policy[field], directory=True)
@@ -793,7 +793,7 @@ def main():
         return
     if args.config is None:
         raise ValueError('Explicit executor config required')
-    mode = strict_json(checked(args.config, limit=16384)).get('kind')
+    mode = strict_json(checked(args.config, limit=128 * 1024)).get('kind')
     if args.operation == 'dispatch' or (args.operation == 'cycle' and mode == 'apt-dispatcher-policy'):
         policy = load_dispatcher(args.config)
         lock = executor_lock()
