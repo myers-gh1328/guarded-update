@@ -3,6 +3,8 @@ import importlib.util
 import json
 from pathlib import Path
 import subprocess
+import stat
+from types import SimpleNamespace
 import tempfile
 import unittest
 from unittest.mock import Mock, patch
@@ -14,6 +16,20 @@ SPEC.loader.exec_module(helper)
 
 
 class ExecutorTests(unittest.TestCase):
+    def test_repository_keyring_alias_requires_root_chain_and_regular_target(self):
+        with tempfile.TemporaryDirectory() as directory:
+            link = Path('/usr/share/keyrings/fixture.gpg')
+            trusted = SimpleNamespace(st_mode=stat.S_IFLNK|0o777, st_uid=0)
+            regular = SimpleNamespace(st_mode=stat.S_IFREG|0o644, st_uid=0)
+            with patch.object(helper.Path, 'lstat', side_effect=[trusted, regular]), patch.object(helper.os, 'readlink', return_value='fixture.pgp'), patch.object(helper, 'checked', return_value=b'public-key'):
+                self.assertEqual(helper.repository_file(link), b'public-key')
+            untrusted = SimpleNamespace(st_mode=stat.S_IFLNK|0o777, st_uid=1000)
+            with patch.object(helper.Path, 'lstat', return_value=untrusted), patch.object(helper, 'checked') as checked:
+                with self.assertRaises(ValueError): helper.repository_file(link)
+                checked.assert_not_called()
+            with patch.object(helper.Path, 'lstat', return_value=trusted), patch.object(helper, 'checked', side_effect=ValueError('Unsafe parent')):
+                with self.assertRaises(ValueError): helper.repository_file(link)
+
     def test_cycle_waits_for_approval_without_consuming_an_attempt(self):
         with tempfile.TemporaryDirectory() as directory:
             config = {'state_dir': directory, 'proposal_id': 'a'*32}
