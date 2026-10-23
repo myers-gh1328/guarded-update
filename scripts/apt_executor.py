@@ -84,7 +84,30 @@ def sha(data):
     return hashlib.sha256(data).hexdigest()
 
 
-def tree_hash(roots):
+def repository_file(path):
+    # Raspberry Pi OS ships root-owned .gpg aliases to sibling .pgp keyrings.
+    # Accept aliases only in read-only repository fingerprints, never config,
+    # controller pins, archive paths or journal files. Every hop and parent is
+    # root controlled, and the final descriptor still passes checked().
+    path = Path(path)
+    for _ in range(8):
+        info = path.lstat()
+        if not stat.S_ISLNK(info.st_mode):
+            return checked(path, limit=512 * 1024 * 1024)
+        if info.st_uid != 0 or path.parent != Path('/usr/share/keyrings'):
+            raise ValueError('Repository alias must be a root-owned system keyring')
+        for ancestor in path.parents:
+            checked(ancestor, directory=True)
+        target = Path(os.readlink(path))
+        if '..' in target.parts:
+            raise ValueError('Parent traversal in repository alias is unsupported')
+        path = target if target.is_absolute() else path.parent / target
+        if path.parent != Path('/usr/share/keyrings') or path.suffix not in ('.gpg', '.pgp'):
+            raise ValueError('Repository alias must stay within system keyrings')
+    raise ValueError('Repository alias chain exceeds limit')
+
+
+def tree_hash(roots, repository=False):
     digest = hashlib.sha256()
     count = 0
     for root in roots:
@@ -98,7 +121,7 @@ def tree_hash(roots):
                 continue
             if not path.exists():
                 continue
-            data = checked(path, limit=512 * 1024 * 1024)
+            data = repository_file(path) if repository else checked(path, limit=512 * 1024 * 1024)
             digest.update(str(path).encode() + b'\0' + hashlib.sha256(data).digest())
             count += 1
     if not count:
@@ -113,7 +136,7 @@ def package_hash():
 
 
 def repository_hash():
-    return tree_hash(['/var/lib/apt/lists', '/etc/apt', '/usr/share/keyrings'])
+    return tree_hash(['/var/lib/apt/lists', '/etc/apt', '/usr/share/keyrings'], repository=True)
 
 
 def holds():
