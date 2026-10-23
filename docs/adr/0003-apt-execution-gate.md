@@ -85,3 +85,37 @@ Next: implement the independent archive/repository evidence adapter and validate
 real protocol-v3 streams in disposable Linux, then signed single-use claims and
 crash reconciliation. No business endpoint deployment or package change is
 permitted by this ADR or this slice.
+
+## Disposable Linux integration harness
+
+`scripts/test-apt-hook.sh` is restricted to an explicitly opted-in, root,
+GitHub-hosted Linux runner. It creates one synthetic local archive with no
+dependencies or maintainer scripts. APT uses empty isolated package state,
+cache, configuration and sources; `--no-download` prevents acquisition. Dpkg
+options additionally redirect the root and administrative directory into scratch.
+The mandatory version-3 hook checks its protocol descriptor and APT's frontend
+lock indicator, captures the actual stream, and exits unsuccessfully. The harness
+requires failure and unchanged isolated and host dpkg status hashes plus absent
+fixture payloads in both roots. It never exports host status contents.
+
+The harness requires a new `GUARDED_UPDATE_HOOK_OUTPUT` child of `RUNNER_TEMP`.
+It exports only `fixture.deb` and `hook-stream`, readable by the ordinary runner.
+No Rust tool runs as root. A separate unprivileged step sets:
+
+```sh
+GUARDED_UPDATE_DISPOSABLE_TEST=1 \
+GUARDED_UPDATE_HOOK_STREAM_FILE="$RUNNER_TEMP/apt-hook-fixture/hook-stream" \
+GUARDED_UPDATE_FIXTURE_ARCHIVE="$RUNNER_TEMP/apt-hook-fixture/fixture.deb" \
+cargo test --locked --features apt-executor \
+  execution_gate::gate_tests::disposable_linux_real_apt_hook_stream_matches_archive \
+  -- --ignored --exact
+```
+
+That explicitly ignored test inspects only the exported fixture with test-only
+`dpkg-deb` and `sha256sum` adapters and verifies its real hook transaction, then
+rejects a substituted expected hash. Device/package/repository evidence remains
+synthetic; this test does not prove production provenance, freshness, claim
+authorization, interrupted recovery, or archive immutability through installation.
+Scratch disappears with runner teardown. This harness must never run on managed
+endpoints. It is prepared but not considered verified until the disposable Linux
+CI job passes; local development only checks syntax, refusal guards and Rust tests.

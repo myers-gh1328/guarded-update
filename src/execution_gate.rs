@@ -372,6 +372,73 @@ mod gate_tests {
             Ok(self.upgrade)
         }
     }
+    // Test-only archive adapter. Production execution has no filesystem adapter.
+    struct FixtureArchiveInspector {
+        archive: std::path::PathBuf,
+    }
+    impl FixtureArchiveInspector {
+        fn new(path: &str) -> Self {
+            Self {
+                archive: std::path::PathBuf::from(path),
+            }
+        }
+        fn field(&self, field: &str) -> Result<String, String> {
+            let output = std::process::Command::new("/usr/bin/dpkg-deb")
+                .arg("--field")
+                .arg(&self.archive)
+                .arg(field)
+                .output()
+                .map_err(|_| "Fixture metadata command failed")?;
+            if !output.status.success() || output.stdout.len() > 4096 {
+                return Err("Invalid fixture metadata".into());
+            }
+            String::from_utf8(output.stdout)
+                .map(|s| s.trim().to_owned())
+                .map_err(|_| "Invalid fixture text".into())
+        }
+    }
+    impl ArchiveInspector for FixtureArchiveInspector {
+        fn inspect(&self, path: &str) -> Result<ArchiveEvidence, String> {
+            let metadata = std::fs::symlink_metadata(path).map_err(|_| "Missing fixture")?;
+            if !metadata.is_file()
+                || metadata.len() > 1024 * 1024
+                || std::path::Path::new(path) != self.archive
+            {
+                return Err("Unexpected fixture archive".into());
+            }
+            let output = std::process::Command::new("/usr/bin/sha256sum")
+                .arg("--")
+                .arg(&self.archive)
+                .output()
+                .map_err(|_| "Fixture hash failed")?;
+            if !output.status.success() || output.stdout.len() > 4096 {
+                return Err("Invalid fixture hash".into());
+            }
+            let hash = String::from_utf8(output.stdout)
+                .map_err(|_| "Invalid hash text")?
+                .split_whitespace()
+                .next()
+                .ok_or("Missing hash")?
+                .to_owned();
+            let multi = self.field("Multi-Arch")?;
+            Ok(ArchiveEvidence {
+                package: self.field("Package")?,
+                version: PackageVersion {
+                    version: self.field("Version")?,
+                    architecture: self.field("Architecture")?,
+                    multi_arch: if multi.is_empty() {
+                        "none".into()
+                    } else {
+                        multi
+                    },
+                },
+                sha256: hash,
+            })
+        }
+        fn is_upgrade(&self, _: &str, _: &str) -> Result<bool, String> {
+            Err("Fixture covers new installation only".into())
+        }
+    }
     fn version(s: &str) -> PackageVersion {
         PackageVersion {
             version: s.into(),
@@ -438,6 +505,34 @@ mod gate_tests {
             "{fresh}extra - - none < 2 armhf none /cache/extra.deb\nextra - - none < 2 armhf none **CONFIGURE**\n"
         );
         assert!(validate_gate(&m, &e, &extra, &i).is_err());
+    }
+    #[test]
+    #[ignore = "requires explicit disposable Linux APT hook harness"]
+    fn disposable_linux_real_apt_hook_stream_matches_archive() {
+        assert_eq!(std::env::consts::OS, "linux");
+        assert_eq!(
+            std::env::var("GUARDED_UPDATE_DISPOSABLE_TEST").as_deref(),
+            Ok("1")
+        );
+        let stream_path =
+            std::env::var("GUARDED_UPDATE_HOOK_STREAM_FILE").expect("harness stream path");
+        let archive_path =
+            std::env::var("GUARDED_UPDATE_FIXTURE_ARCHIVE").expect("fixture archive path");
+        let inspector = FixtureArchiveInspector::new(&archive_path);
+        let archive = inspector
+            .inspect(&archive_path)
+            .expect("inspect generated fixture");
+        let (mut manifest, local, _, _) = fixture();
+        manifest.changes = vec![ManifestChange {
+            package: archive.package,
+            old: None,
+            new: archive.version,
+            archive_sha256: archive.sha256,
+        }];
+        let stream = std::fs::read_to_string(stream_path).expect("captured APT hook");
+        assert!(validate_gate(&manifest, &local, &stream, &inspector).is_ok());
+        manifest.changes[0].archive_sha256 = "0".repeat(64);
+        assert!(validate_gate(&manifest, &local, &stream, &inspector).is_err());
     }
     #[test]
     fn exact_transaction_validates_but_is_not_execution_authorization() {

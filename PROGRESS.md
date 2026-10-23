@@ -32,3 +32,19 @@ Cherry-picked the reporting branch's explicit remote-lock release fix after the
 gate commit. Reverified executor suite: 44 tests passed; executor Clippy with
 warnings denied and formatting also passed. Working tree is ready for parent
 review; no push, release, deployment or live update was performed.
+
+## Disposable integration harness prepared
+
+Added the GitHub-hosted Linux/root/explicit-opt-in rejection harness and ignored
+Rust test consuming its actual hook stream and synthetic archive. The test-only
+archive adapter was introduced after its test failed to compile. No CI job is
+wired here; the parent owns workflow changes and must review before pushing.
+
+Native checks: 44 tests passed, one Linux integration test intentionally ignored;
+formatting, Clippy with warnings denied, Bash syntax and ShellCheck passed. Running
+the harness without disposable Linux/root opt-in exited 2 as required. No sudo,
+APT invocation, fixture build or package operation ran on the development host.
+
+Next exact action: wire and run the disposable Linux job, then inspect its evidence
+before claiming APT hook integration works. Production adapters, claims and
+dispatch remain absent.
