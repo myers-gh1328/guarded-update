@@ -36,6 +36,7 @@ fn route(r: &Request) -> Result<String, String> {
     }
     match (r.kind.as_str(), r.claim_id.as_deref()) {
         ("manifest", None) => Ok("/api/agent/v1/execution-manifests".into()),
+        ("status", None) => Ok("/api/agent/v1/execution-status".into()),
         ("claim", None) => Ok("/api/agent/v1/execution-claims".into()),
         ("result", Some(id))
             if id.len() == 36 && id.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-') =>

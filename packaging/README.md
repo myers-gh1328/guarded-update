@@ -38,3 +38,11 @@ are bundled. Both timers remain disabled until provisioning explicitly enables
 them. The broker retrieves controller-signed claims; it cannot install packages.
 No root executor service or automatic installation schedule is included. Root
 preparation and application require separate explicit host provisioning.
+
+The executor profile also contains a disabled root cycle service/timer. Explicit
+provisioning supplies a root-owned nonempty package selection before activation.
+It prepares one transaction, polls without consuming approval, and only attempts
+installation after approved status. The mandatory hook remains the authority
+boundary and obtains a fresh signed claim. A durable attempt never executes again;
+terminal results are retried independently until acknowledged. Future batches
+require deliberate new root-owned transaction state, not automatic replay.

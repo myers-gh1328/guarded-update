@@ -1,0 +1,16 @@
+[Unit]
+Description=Apply only explicitly approved guarded-update transactions
+ConditionPathExists=/etc/guarded-update/executor.json
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+UMask=0077
+ExecStart=/usr/bin/python3 -I /usr/lib/guarded-update/apt_executor.py cycle --config /etc/guarded-update/executor.json
+TimeoutStartSec=infinity
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true

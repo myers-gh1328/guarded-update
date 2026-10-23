@@ -14,6 +14,18 @@ SPEC.loader.exec_module(helper)
 
 
 class ExecutorTests(unittest.TestCase):
+    def test_cycle_waits_for_approval_without_consuming_an_attempt(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = {'state_dir': directory, 'proposal_id': 'a'*32}
+            raw = b'{"proposal_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}'
+            (Path(directory)/'manifest.json').write_bytes(raw)
+            with patch.object(helper, 'checked', return_value=raw), patch.object(helper, 'request', return_value='request'), patch.object(helper, 'response', return_value={'status':'pending','manifest_sha256':helper.sha(raw)}), patch.object(helper, 'execute') as execute:
+                helper.cycle(config, Path('/etc/fixture.json'))
+                execute.assert_not_called()
+            with patch.object(helper, 'checked', return_value=raw), patch.object(helper, 'request', return_value='request'), patch.object(helper, 'response', return_value={'status':'approved','manifest_sha256':helper.sha(raw)}), patch.object(helper, 'execute') as execute:
+                helper.cycle(config, Path('/etc/fixture.json'))
+                execute.assert_called_once()
+
     def test_signed_date_bounds_metadata_without_valid_until(self):
         now = 1792700000
         with patch.object(helper.Path, 'glob', return_value=[Path('/synthetic/InRelease')]), patch.object(helper, 'checked', return_value=b'Date: Thu, 01 Oct 2026 11:51:57 UTC\n'):

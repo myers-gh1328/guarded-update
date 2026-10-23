@@ -378,6 +378,27 @@ def execute(config, config_path):
             request(config, 'result', {'schema_version': 1, 'status': result, 'manifest_sha256': sha(raw)}, claim_id=started['claim_id'])
 
 
+def cycle(config, config_path):
+    state = Path(config['state_dir'])
+    if (state / 'execution-attempted.json').exists():
+        if (state / 'execution-result.json').exists() and (state / 'execution-started.json').exists():
+            resend_result(config)
+        # Terminal or uncertain attempts never start again automatically.
+        return
+    if not (state / 'manifest.json').exists():
+        prepare(config)
+    raw = checked(state / 'manifest.json')
+    manifest = json.loads(raw)
+    identity = request(config, 'status', {'schema_version': 1, 'proposal_id': manifest['proposal_id']})
+    status = response(config, identity)
+    if status.get('manifest_sha256') != sha(raw):
+        raise ValueError('Controller status does not match prepared manifest')
+    if status.get('status') == 'approved':
+        # Status is merely a trigger. Only the fresh signed claim inside the
+        # mandatory APT hook can authorize a package mutation.
+        execute(config, config_path)
+
+
 def reconcile(config):
     state = Path(config['state_dir'])
     active = subprocess.run(['/usr/bin/pgrep', '-x', 'dpkg'], env=ENV, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
@@ -404,9 +425,13 @@ def reconcile(config):
 
 def resend_result(config):
     state = Path(config['state_dir'])
+    if (state / 'result-reported.json').exists():
+        return
     result = json.loads(checked(state / 'execution-result.json'))
     started = json.loads(checked(state / 'execution-started.json'))
-    request(config, 'result', {'schema_version': 1, 'status': result['status'], 'manifest_sha256': result['manifest_sha256']}, claim_id=started['claim_id'])
+    identity = request(config, 'result', {'schema_version': 1, 'status': result['status'], 'manifest_sha256': result['manifest_sha256']}, claim_id=started['claim_id'])
+    response(config, identity)
+    write_new(state / 'result-reported.json', encode({'claim_id': started['claim_id'], 'reported_at_unix': int(time.time())}))
 
 
 def executor_lock():
@@ -426,7 +451,7 @@ def executor_lock():
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('operation', choices=('prepare', 'hook', 'execute', 'download', 'reconcile', 'report-result'))
+    parser.add_argument('operation', choices=('prepare', 'hook', 'execute', 'download', 'reconcile', 'report-result', 'cycle'))
     parser.add_argument('--config', type=Path)
     parser.add_argument('--directory')
     parser.add_argument('--package')
@@ -440,7 +465,7 @@ def main():
     config = load(args.config)
     lock = None if args.operation == 'hook' else executor_lock()
     try:
-        {'prepare': lambda: prepare(config), 'hook': lambda: hook(config), 'execute': lambda: execute(config, args.config), 'reconcile': lambda: reconcile(config), 'report-result': lambda: resend_result(config)}[args.operation]()
+        {'cycle': lambda: cycle(config, args.config), 'prepare': lambda: prepare(config), 'hook': lambda: hook(config), 'execute': lambda: execute(config, args.config), 'reconcile': lambda: reconcile(config), 'report-result': lambda: resend_result(config)}[args.operation]()
     finally:
         if lock is not None:
             os.close(lock)

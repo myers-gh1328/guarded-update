@@ -11,11 +11,14 @@ and upstream expiry, and acquires archives as existing _apt. Controller transpor
 is unprivileged. Local/default builds exclude remote/executor components.
 
 Current checks: 52 executor Rust tests pass (one Linux test ignored locally),
-9 Python adapter tests pass; Clippy and formatting pass. Shared Node-generated
+10 Python adapter tests pass; Clippy and formatting pass. Shared Node-generated
 P256 fixture verified by Rust/OpenSSL. Disposable actual-upgrade tests and ARMv7
 package contents/size checks are wired; First CI: all nine rejection cases held version1; valid authorization upgraded
 fixture to version2. APT then reported missing isolated log directory; harness
-now creates it. Production-hook cases pending rerun.
+now creates it. Production hook accepted a valid signed claim and rejected expiry in real isolated
+APT upgrades; all integration cases now passed. Added disabled executor cycle
+units that poll status without consuming authority, then use the mandatory hook.
+ARMv7 artifact job queued; latest polling-cycle changes need CI rerun.
 
 Next: run draft PR CI, fix integration evidence failures, then deploy verified
 reporting package+keys/controller config. Keep root execution disabled until all

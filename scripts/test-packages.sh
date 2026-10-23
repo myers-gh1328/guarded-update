@@ -28,12 +28,17 @@ for profile in apt-agent apt-remote apt-executor; do
  fi
  if [[ $profile = apt-executor ]]; then
    [[ -x $extracted/usr/lib/guarded-update/apt_executor.py ]]
+   [[ -f $extracted/usr/lib/systemd/system/guarded-update-executor.timer ]]
+   sed "s|ExecStart=.*|ExecStart=/usr/bin/true|" "$extracted/usr/lib/systemd/system/guarded-update-executor.service" > "$extracted/guarded-update-executor.service"
+   cp "$extracted/usr/lib/systemd/system/guarded-update-executor.timer" "$extracted/guarded-update-executor.timer"
+   systemd-analyze verify "$extracted/guarded-update-executor.service" "$extracted/guarded-update-executor.timer"
    sed "s|ExecStart=/usr/bin/guarded-update |ExecStart=/usr/bin/true |" \
      "$extracted/usr/lib/systemd/system/guarded-update-broker.service" > "$extracted/guarded-update-broker.service"
    cp "$extracted/usr/lib/systemd/system/guarded-update-broker.timer" "$extracted/guarded-update-broker.timer"
    systemd-analyze verify "$extracted/guarded-update-broker.service" \
      "$extracted/guarded-update-broker.timer"
  else
+   [[ ! -e $extracted/usr/lib/systemd/system/guarded-update-executor.service ]]
    [[ ! -e $extracted/usr/lib/guarded-update/apt_executor.py ]]
    [[ ! -e $extracted/usr/lib/systemd/system/guarded-update-broker.service ]]
  fi
