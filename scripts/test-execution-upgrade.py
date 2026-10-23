@@ -123,7 +123,7 @@ def main(binary):
     for case in ('expired', 'mismatch', 'no-ack', 'invalid-signature', 'drift', 'stale', 'held', 'archive', 'replay', 'approved', 'production-expired', 'production-approved'):
         directory = base/case
         directory.mkdir(mode=0o700)
-        for name in ('root', 'dpkg', 'state/lists/partial', 'cache/archives/partial', 'etc/parts', 'etc/sources', 'journal'):
+        for name in ('root', 'dpkg', 'log', 'state/lists/partial', 'cache/archives/partial', 'etc/parts', 'etc/sources', 'journal'):
             (directory/name).mkdir(parents=True, mode=0o700)
         (directory/'dpkg/status').touch()
         for name in ('sources.list', 'main.conf'):

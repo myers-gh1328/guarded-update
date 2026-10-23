@@ -13,7 +13,9 @@ is unprivileged. Local/default builds exclude remote/executor components.
 Current checks: 52 executor Rust tests pass (one Linux test ignored locally),
 9 Python adapter tests pass; Clippy and formatting pass. Shared Node-generated
 P256 fixture verified by Rust/OpenSSL. Disposable actual-upgrade tests and ARMv7
-package contents/size checks are wired; CI pending.
+package contents/size checks are wired; First CI: all nine rejection cases held version1; valid authorization upgraded
+fixture to version2. APT then reported missing isolated log directory; harness
+now creates it. Production-hook cases pending rerun.
 
 Next: run draft PR CI, fix integration evidence failures, then deploy verified
 reporting package+keys/controller config. Keep root execution disabled until all
