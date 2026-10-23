@@ -63,3 +63,7 @@ status hashes and absent payload checks passed. The Rust gate correctly rejected
 APT's **ERROR** action: --no-download had skipped local-file acquisition. Added
 an isolated local-archive download-only preparation before the rejection pass;
 empty sources are retained. Pending repeated CI; nine other matrix jobs passed.
+
+Local download-only preparation did not persist APT's volatile filename mapping.
+Removed --no-download from the isolated fixture invocation; empty sources and
+the single explicit local archive bound acquisition. Gate still rejects ERROR.

@@ -91,7 +91,9 @@ permitted by this ADR or this slice.
 `scripts/test-apt-hook.sh` is restricted to an explicitly opted-in, root,
 GitHub-hosted Linux runner. It creates one synthetic local archive with no
 dependencies or maintainer scripts. APT uses empty isolated package state,
-cache, configuration and sources; `--no-download` prevents acquisition. Dpkg
+cache, configuration and sources. Only the locally supplied archive is available
+for acquisition; `--no-download` cannot be used because APT then emits an unset
+archive error for this volatile local package. Dpkg
 options additionally redirect the root and administrative directory into scratch.
 The mandatory version-3 hook checks its protocol descriptor and APT's frontend
 lock indicator, captures the actual stream, and exits unsuccessfully. The harness

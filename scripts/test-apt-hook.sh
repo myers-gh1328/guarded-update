@@ -63,13 +63,11 @@ DPkg::Tools::Options::$fixture_dir/reject-hook::InfoFD "0";
 CONFIG
 system_before=$(sha256sum /var/lib/dpkg/status)
 isolated_before=$(sha256sum "$fixture_dir/dpkg/status")
-# Populate the isolated cache from the local archive only. --no-download skips
-# even APT's local-file acquisition and otherwise emits **ERROR** in its hook.
-env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C APT_CONFIG="$fixture_dir/apt.conf" \
-  /usr/bin/apt-get --download-only --yes install "$archive" > "$fixture_dir/acquire-output" 2>&1
+# Empty source lists permit acquisition of this local archive only. Do not use
+# --no-download: it leaves the volatile local archive filename unset in APT.
 set +e
 env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C APT_CONFIG="$fixture_dir/apt.conf" \
-  /usr/bin/apt-get --no-download --yes install "$archive" > "$fixture_dir/apt-output" 2>&1
+  /usr/bin/apt-get --yes install "$archive" > "$fixture_dir/apt-output" 2>&1
 apt_result=$?
 set -e
 [[ $apt_result != 0 ]]
