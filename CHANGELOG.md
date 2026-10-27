@@ -2,6 +2,16 @@
 
 All notable changes are listed here. Versions follow semantic versioning.
 
+## [0.1.8] - Unreleased
+
+### Fixed
+
+- Native macOS reports preserve the existing collector's application-identification
+  evidence for System Information apps, Homebrew casks and recognized server
+  formulae, keeping those apps visible in Command Center's default inventory view.
+- Unavailable/failed Homebrew inventory is explicitly partial and incomplete, so
+  it cannot erase packages from the last complete central inventory.
+
 ## [0.1.7] - Unreleased
 
 ### Fixed

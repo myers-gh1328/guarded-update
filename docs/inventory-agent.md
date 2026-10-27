@@ -31,6 +31,12 @@ as partial. Manual/portable applications and other users' inaccessible apps
 remain coverage gaps. System updates, CVEs, service telemetry and logs are not
 currently collected. macOS system updates remain report-only in the updater.
 
+Application-identification evidence matches the existing macOS collector, so
+third-party System Information apps, Homebrew casks and recognized service
+formulae appear in Command Center's default Applications & services view.
+Unreadable Homebrew inventory marks the report incomplete; it must not replace
+the previous complete central inventory with an apparently empty provider.
+
 ## Identity and managed installation
 
 Use the hosted `command-center-inventory-vVERSION-aarch64-apple-darwin.tar.gz`
