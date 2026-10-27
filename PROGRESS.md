@@ -8,12 +8,11 @@ reporter/provisioning PR22/infraPR208 already merged; six legacy recoveries clos
 and fresh. No live reporter/helper is installed.
 
 Current code: strict protocol, FD-only storage, structured trusted APT policy,
-private durable root journal and fixed unprivileged worker. Local helper suite33
-passes. Policy8/state12/storage4/protocol4/worker5. Worker only executes fixed
+private durable root journal and fixed unprivileged worker. Local helper suite35
+passes. Policy8/state12/storage5/protocol4/worker6. Worker only executes fixed
 apt-get update as isolated ccrefresh, never accepts caller commands/paths/options,
 reads admitted root job/config and discards native output. It requires reporter
-and refresh UID/GID separation; no root group. Worker is not exercised natively
-with APT yet. Root coordinator, request inbox consumption, native observation
+and refresh UID/GID separation; no root group. Native signed HTTPS/GPG/auth/expiry/all-repository acquisition proof is written and wired into hosted CI, not yet executed. Worker real/saved/effective UID/GID checks close independent review finding; no job/config reads before those checks. Root coordinator, request inbox consumption, native observation
 locks/receipts, actual signed HTTPS/GPG acquisition and packaging/provisioning of
 this new capability remain incomplete.
 
@@ -21,7 +20,7 @@ Independent reviews: contract/protocol/storage clear. Active reviewer
 /root/review_reporting_security cleared policy/state after a changed-policy
 replay finding was fixed test-first: start requires freshly admitted policy;
 successful finish binds publication policy. Coordinator must recheck before
-Store.publish. Worker review requested; never treat earlier review as full helper
+Store.publish. Worker review found saved-root identity gap, fixed test-first; verification requested; never treat earlier review as full helper
 approval. fsync actual-start authorization before spawning, entire worker cgroup
 empty/no same-UID outside writers before sealing, one fixed root lock for every
 publish/retire/head change, uncertain cleanup/persistence keeps guard. Observation

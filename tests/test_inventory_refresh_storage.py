@@ -57,6 +57,17 @@ class RefreshStorageTests(unittest.TestCase):
         self.assertEqual((published/'synthetic_Packages').stat().st_mode & 0o777, 0o440)
         self.assertFalse((self.root/('staging-'+self.stage)/'lists').exists())
 
+    def test_native_apt_index_names_with_explicit_repository_ports_are_supported(self):
+        directory = self.stage_lists()
+        entry = "repo.invalid:8443_repo_dists_proof_main_binary-arm64_Packages.lz4"
+        (directory/'synthetic_Packages').rename(directory/entry)
+        self.publish()
+        with self.store.lease_current() as lease:
+            self.assertEqual(lease.read_index(entry), b'synthetic-package-index')
+        for unsafe in ['../outside', '/outside', '..', '.', 'line\nfeed', 'back\\slash']:
+            with self.subTest(entry=unsafe), self.assertRaises(ValueError):
+                self.module.name(unsafe)
+
     def test_symlink_hardlink_and_special_files_cannot_be_published(self):
         for kind in ['symlink', 'hardlink', 'fifo']:
             with self.subTest(kind=kind):

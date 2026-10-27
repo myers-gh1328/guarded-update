@@ -21,7 +21,7 @@ LEASE = '_inventory-lease'
 
 
 def name(value):
-    if type(value) is not str or not re.fullmatch('[A-Za-z0-9_%+~.-]{1,255}', value) or value in ['.', '..']:
+    if type(value) is not str or not re.fullmatch('[A-Za-z0-9_%+~.:-]{1,255}', value) or value in ['.', '..']:
         raise ValueError('Invalid inventory cache entry')
     return value
 

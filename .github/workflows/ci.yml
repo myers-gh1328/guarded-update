@@ -88,6 +88,14 @@ jobs:
       - name: Prove actual tmpfs, cgroup and separate-UID limits on disposable runner
         run: |
           sudo --preserve-env=GITHUB_ACTIONS python3 -B tests/native_inventory_refresh_storage.py > native-refresh-storage-proof.json
+      - name: Verify real signed TLS repository acquisition through the fixed low-privilege worker
+        run: |
+          sudo --preserve-env=GITHUB_ACTIONS python3 -B tests/native_inventory_refresh_apt.py > native-refresh-apt-proof.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-inventory-refresh-apt-proof
+          path: native-refresh-apt-proof.json
+          if-no-files-found: error
       - uses: actions/upload-artifact@v4
         with:
           name: native-inventory-refresh-storage-proof

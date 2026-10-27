@@ -160,6 +160,9 @@ def worker_main():
                 user.pw_gid in os.getgrouplist(REPORTER_ACCOUNT, reporter.pw_gid) or os.geteuid() != user.pw_uid or os.getegid() != user.pw_gid or
                 set(os.getgroups()) - {user.pw_gid}):
             return EXIT_UNSUPPORTED
+        if (not hasattr(os, 'getresuid') or not hasattr(os, 'getresgid') or
+                os.getresuid() != (user.pw_uid,)*3 or os.getresgid() != (user.pw_gid,)*3):
+            return EXIT_UNSUPPORTED
         job = parse_job(root_file(RUNTIME_ROOT+'/job.json', user.pw_gid))
         config = root_file(RUNTIME_ROOT+'/worker-apt.conf', user.pw_gid)
         if hashlib.sha256(config).hexdigest() != job['config_sha256']:

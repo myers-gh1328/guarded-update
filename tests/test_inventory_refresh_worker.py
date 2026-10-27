@@ -72,6 +72,26 @@ class RefreshWorkerTests(unittest.TestCase):
                     read.assert_not_called()
                     run.assert_not_called()
 
+    def test_effective_uid_drop_cannot_hide_real_or_saved_root_identity(self):
+        worker = SimpleNamespace(pw_uid=60001, pw_gid=60001)
+        reporter = SimpleNamespace(pw_uid=60002, pw_gid=60002)
+        def account(name):
+            return worker if name == self.p.REFRESH_ACCOUNT else reporter
+        for users, groups in [((0, 60001, 0), (60001,)*3), ((60001,)*3, (0, 60001, 0))]:
+            with self.subTest(users=users, groups=groups), \
+                 patch.object(self.p.pwd, 'getpwnam', side_effect=account), \
+                 patch.object(self.p.os, 'geteuid', return_value=60001), \
+                 patch.object(self.p.os, 'getegid', return_value=60001), \
+                 patch.object(self.p.os, 'getgroups', return_value=[60001]), \
+                 patch.object(self.p.os, 'getgrouplist', return_value=[60002]), \
+                 patch.object(self.p.os, 'getresuid', return_value=users, create=True), \
+                 patch.object(self.p.os, 'getresgid', return_value=groups, create=True), \
+                 patch.object(self.p, 'root_file', return_value=b'invalid-fixture') as read, \
+                 patch.object(self.p.subprocess, 'run') as run:
+                self.assertEqual(self.p.worker_main(), self.p.EXIT_UNSUPPORTED)
+                read.assert_not_called()
+                run.assert_not_called()
+
     def test_missing_account_never_executes_apt_or_initializes_host_state(self):
         with patch.object(self.p.pwd, 'getpwnam', side_effect=KeyError), \
              patch.object(self.p.subprocess, 'run') as run:
