@@ -224,6 +224,7 @@ def hosted():
     prefix = 'inventoryproof'+secrets.token_hex(6)
     base = Path('/run')/prefix
     base.mkdir(mode=0o755)
+    base.chmod(0o755)
     cache = base/'cache'
     cache.mkdir()
     shutil.copyfile(ROOT/'scripts/inventory_refresh_storage.py', base/'storage-helper.py')
@@ -239,6 +240,7 @@ def hosted():
     unit_file = Path('/run/systemd/system')/slice_name
     signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(SystemExit('Proof interrupted')))
     unit_file.write_text('[Unit]\nDescription=Disposable inventory containment proof\n'
+                         'StopWhenUnneeded=no\n'
                          '[Slice]\nMemoryAccounting=yes\nMemoryMax=256M\n'
                          'MemorySwapMax=0\nTasksMax=64\n')
     mounted = False
@@ -259,7 +261,10 @@ def hosted():
         assert fingerprint(unchanged) == before, 'Host/executor state changed during proof'
         proof['host_apt_and_executor_state_unchanged'] = True
     finally:
-        command(['/bin/systemctl', 'stop', unit_name])
+        stopped = subprocess.run(['/bin/systemctl', 'stop', unit_name], env=ENV,
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
+        # Completed transient units may already be unloaded; kernel emptiness is mandatory.
+        assert stopped.returncode in [0, 5], 'Owned unit stop failed unexpectedly'
         cgroup = Path('/sys/fs/cgroup')/slice_name
         assert metrics(cgroup/'cgroup.events')['populated'] == 0, 'Owned cgroup cleanup unconfirmed'
         if mounted:
