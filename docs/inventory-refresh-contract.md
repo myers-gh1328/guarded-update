@@ -37,8 +37,14 @@ its high-water mark and persists bounded active/last-terminal metadata before
 starting. Re-delivery of the exact active/last-terminal correlator returns existing
 state. A correlator at/below the high-water mark that is no longer retained returns
 `state_inconsistent` without starting work. Thus bounded retention cannot reopen
-an old operation. A different correlator during active work returns `busy`; it
-never replaces work. Missing/reset durable helper counters require explicit
+an old operation. A different correlator during started work returns `busy`; it never replaces
+started or uncertain work. A received/deferred operation that has durably never
+started may be explicitly abandoned by a higher correlator, retaining its failed
+not-started record; this lets an expired unstarted request stop blocking the next
+request. Retrying the same deferred operation preserves its original acceptance
+and identity. A deferred refresh does not block coherent cached observation.
+Only a release with the exact running observation's nonce/boot/policy may join
+that observation to close its locks. Missing/reset durable helper counters require explicit
 operator recovery, not silent initialization. A 15-minute monotonic minimum interval applies to actual refresh
 starts. Reboot/cache loss is explicit; a reused nonce cannot imply an earlier
 cache generation survived. This local capability does not grant remote requests
