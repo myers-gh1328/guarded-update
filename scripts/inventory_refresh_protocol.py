@@ -86,5 +86,5 @@ def post_acceptance_attempt(attempt, expected_correlator, boot_id, accepted_ms):
     helper_accepted = attempt['accepted_boottime_ms']
     finished = attempt['finished_boottime_ms']
     return (safe_integer(started) and safe_integer(helper_accepted) and
-            helper_accepted <= started and accepted_ms <= started and
+            accepted_ms <= helper_accepted <= started and
             (finished is None or safe_integer(finished) and started <= finished))

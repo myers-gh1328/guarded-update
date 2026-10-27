@@ -62,10 +62,12 @@ class InventoryRefreshProtocolTests(unittest.TestCase):
     def test_request_cannot_claim_helper_started_before_its_acceptance(self):
         attempt = {'correlator': self.nonce, 'helper_sequence': 1,
                    'boot_id': '11111111-1111-4111-8111-111111111111',
-                   'accepted_boottime_ms': 90, 'started_boottime_ms': 100,
+                   'accepted_boottime_ms': 96, 'started_boottime_ms': 100,
                    'finished_boottime_ms': 200}
         self.assertTrue(self.p.post_acceptance_attempt(attempt, self.nonce, attempt['boot_id'], 95))
         self.assertFalse(self.p.post_acceptance_attempt(attempt, self.nonce, attempt['boot_id'], 101))
+        preaccepted = dict(attempt, accepted_boottime_ms=94)
+        self.assertFalse(self.p.post_acceptance_attempt(preaccepted, self.nonce, attempt['boot_id'], 95))
         self.assertFalse(self.p.post_acceptance_attempt(attempt, '0000000000000002'+'b'*16,
                                                       attempt['boot_id'], 95))
         self.assertFalse(self.p.post_acceptance_attempt(attempt, self.nonce,

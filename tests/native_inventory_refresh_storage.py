@@ -33,8 +33,8 @@ def command(argv, **kwargs):
         raise RuntimeError('Disposable proof command failed: '+detail) from None
 
 
-def module():
-    spec = importlib.util.spec_from_file_location('inventory_refresh_storage', ROOT/'scripts/inventory_refresh_storage.py')
+def module(path=None):
+    spec = importlib.util.spec_from_file_location('inventory_refresh_storage', path or ROOT/'scripts/inventory_refresh_storage.py')
     result = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(result)
     return result
@@ -87,7 +87,7 @@ sys.exit(1)
 
 def child_reader(cache):
     drop(READER)
-    storage = module()
+    storage = module(cache.parent/'storage-helper.py')
     fd = os.open(cache, os.O_RDONLY | os.O_DIRECTORY)
     try:
         store = storage.Store(fd, 0, READER, WORKER)
@@ -226,6 +226,8 @@ def hosted():
     base.mkdir(mode=0o755)
     cache = base/'cache'
     cache.mkdir()
+    shutil.copyfile(ROOT/'scripts/inventory_refresh_storage.py', base/'storage-helper.py')
+    (base/'storage-helper.py').chmod(0o644)
     fixture = base/'executor-fixture'
     fixture.mkdir(mode=0o700)
     for entry in ['binary', 'unit', 'config', 'key', 'state']:

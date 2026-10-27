@@ -71,8 +71,9 @@ observation_lease: null | {
 }
 observation_receipt: null | {
   nonce: hex[32], boot_id: UUID, cache_generation: hex[32],
-  policy_generation: lowercase sha256, started_boottime_ms: safe integer,
-  finished_boottime_ms: safe integer, outcome: released | expired | unconfirmed,
+  policy_generation: lowercase sha256, expires_boottime_ms: safe integer,
+  lock_open_boottime_ms: safe integer, lock_held_until_boottime_ms: safe integer,
+  released_boottime_ms: safe integer, outcome: released | expired | unconfirmed,
   installed_before_sha256: lowercase sha256,
   installed_after_sha256: lowercase sha256
 }
@@ -98,10 +99,17 @@ source generation or controller enrollment. Agent refresh-status maps local
 received/running/deferred/failed/unconfirmed directly to those protocol states.
 Before submitting a new controller request, the agent durably records its
 request UUID, delivery sequence, local boot ID, acceptance CLOCK_BOOTTIME value
-and newly allocated helper correlator. The helper persists its own acceptance
+and newly allocated helper correlator, frozen with enrollment/source revision.
+This `local_accepted_boottime_ms` is distinct from the root helper's
+`accepted_boottime_ms`. Evidence fields may only fill previously null values;
+request/correlator/boot/sequence identity never changes. The helper persists its own acceptance
 and actual-start monotonic times before work. A request may use helper success
-only when the exact correlator matches, the same boot ID applies, and actual
-start is at/after that durable request acceptance. A helper already running when
+only when the exact correlator matches, the same boot ID applies, and the monotonic chain is local acceptance <= root helper acceptance <= actual
+start <= helper finish. Root observation, scan and release then require helper
+finish <= native lock open <= scan start <= scan finish <= confirmed lock-held
+until <= lease expiry, all on the same boot and exact cache/policy generation.
+Final proof binds the exact retained report ID/hash before upload. Metadata from
+an earlier root observation or a different attempt cannot be substituted. A helper already running when
 a request arrived is not retroactively attached: return deferred/busy, reconcile
 that older attempt separately, and allocate a later attempt only after its
 terminal result proves whether work started. Wall-clock timestamps alone never
@@ -191,7 +199,12 @@ policy/head and compare installed-state fingerprints before/after collection.
 After the last read/fingerprint, the reporter submits the fixed release nonce
 and requires a matching root-owned observation_receipt with outcome `released`.
 The coordinator computes its fixed native-state fingerprints under the held read
-locks and acknowledges release before unlocking. The receipt binds the exact
+locks, samples `lock_held_until_boottime_ms` immediately before unlock, samples
+`released_boottime_ms` after unlock and persists a matching bounded receipt before
+releasing the root coordination guard. Only the confirmed lock-held endpoint can
+bound a scan; the later actual-release timestamp cannot extend the claimed lock
+interval. A failed receipt fsync leaves the operation unconfirmed and blocks new
+work pending reconciliation. The receipt binds the exact
 cache/policy generation, boot and native-lock-held start/end interval. Merely
 seeing an unexpired active status is insufficient. A deadline expiry or unknown
 cleanup cannot produce a successful observation receipt. Root releases on the fixed
