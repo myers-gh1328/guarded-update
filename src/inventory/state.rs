@@ -22,6 +22,8 @@ pub struct Schedule {
     pub source_revision: u64,
     #[serde(default)]
     pub next_collection_at: u64,
+    #[serde(default)]
+    pub collection_error: bool,
 }
 
 pub fn matches_receipt(report: &Value, digest: &str, receipt: &Value) -> bool {
@@ -225,6 +227,7 @@ impl Store {
         self.schedule.retry_at = 0;
         self.schedule.retry_delay = 0;
         self.schedule.permanent_error = false;
+        self.schedule.collection_error = false;
         self.save()
     }
 }

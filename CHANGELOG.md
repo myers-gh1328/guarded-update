@@ -12,6 +12,9 @@ All notable changes are listed here. Versions follow semantic versioning.
   Hosted v0.1.6 release validation caught this case before publication.
 - The independent-heartbeat regression coordinates collection completion rather
   than assuming how often a busy hosted runner schedules a thread in 90ms.
+- Interrupted or failed local collection persists an error flag for the next
+  independent check-in; a later successful report clears it without sequence
+  reuse or loss of the previous latest report.
 
 ## [0.1.6] - Unreleased
 
