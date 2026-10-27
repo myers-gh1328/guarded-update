@@ -206,6 +206,7 @@ fn verify_at(original: &Value, current: &Value, now: u64) -> Result<(), String> 
         || original["execution_supported"] != false
         || [
             "provider",
+            "context",
             "selection",
             "state_sha256",
             "metadata_sha256",
@@ -233,7 +234,13 @@ mod tests {
         assert!(verify_at(&original, &original, 200).is_ok());
         assert!(verify_at(&original, &original, 1000).is_err());
         assert!(verify_at(&original, &original, 99).is_err());
-        for field in ["state_sha256", "metadata_sha256", "changes", "provider"] {
+        for field in [
+            "state_sha256",
+            "metadata_sha256",
+            "changes",
+            "provider",
+            "context",
+        ] {
             let mut changed = original.clone();
             changed[field] = json!("new");
             assert!(verify_at(&original, &changed, 200).is_err());
