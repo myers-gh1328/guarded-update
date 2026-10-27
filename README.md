@@ -449,3 +449,27 @@ remain unverified; stale local indexes can hide available updates.
 Examples belong only with an explicitly selected remote-agent distribution;
 ordinary/default and local-only builds should not ship or activate them.
 Release packaging currently remains unchanged.
+
+### Versioned provider preparation
+
+The optional APT root dispatcher supports compact all-eligible preparation jobs
+when its local policy explicitly sets `preparation_protocol_version` to `2`.
+The default remains the existing v1 selected-package protocol. V2 polls advertise
+`apt-prepare-v2`; the controller must withhold v2 jobs from polls without support.
+V2 jobs use schema `2`, kind `provider-prepare`, provider `apt`, and selection
+`{"mode":"all_eligible"}` or `{"mode":"selected","packages":["example"]}`.
+The inner signature domain is `guarded-update-preparation-v2`; fresh nonce-bound
+outer delivery remains v1. There is no new install authority.
+
+Root refreshes metadata, resolves installed allowed upgrade candidates excluding
+holds, verifies every root survives one complete dependency solve, then freezes
+the existing exact manifest. Local policy revocation is checked before preparation
+and execution. All existing resource budgets, archive/repository checks, no-removal
+rules, one-use claims and no-reboot behavior remain in force. V1 operator configs
+and signed jobs retain compatibility. Preparation cannot silently split a large
+transaction into arbitrary batches.
+
+A separate [WinGet discovery boundary](docs/WINGET-PROVIDER.md) emits structured
+native observations with explicit user/scope/pin gaps. It does not advertise remote
+preparation or execution. Homebrew's existing local policy engine is distinct from
+remote exact-manifest authority; OS updates remain reporting-only.

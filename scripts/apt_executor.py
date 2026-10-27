@@ -298,13 +298,16 @@ def response(config, identity, timeout=90):
 def load(config_path):
     if os.geteuid() != 0:
         raise ValueError('Executor requires root')
-    config = json.loads(checked(config_path, limit=16384))
+    config = strict_json(checked(config_path, limit=2 * MAX))
     fields = {'device_id', 'proposal_id', 'state_dir', 'broker_dir', 'responses_dir', 'approval_public_key_file', 'validator_binary', 'packages'}
+    v2 = 'selection' in config
+    if v2:
+        fields = fields - {'packages'} | {'selection', 'allowed_packages'}
     if set(config) != fields:
         raise ValueError('Unknown or missing configuration fields')
     if len(config['proposal_id']) != 32 or any(c not in '0123456789abcdef' for c in config['proposal_id']):
         raise ValueError('Invalid proposal identity')
-    if not isinstance(config['packages'], list) or not config['packages'] or len(config['packages']) > 100 or any(not isinstance(p, str) or not re.fullmatch(r'[a-z0-9][a-z0-9+.-]*', p) for p in config['packages']):
+    if (v2 and (not valid_selection(config['selection']) or not valid_packages(config['allowed_packages'], maximum=5000))) or (not v2 and (not isinstance(config['packages'], list) or not config['packages'] or len(config['packages']) > 100 or any(not isinstance(p, str) or not re.fullmatch(r'[a-z0-9][a-z0-9+.-]*', p) for p in config['packages']))):
         raise ValueError('Explicit bounded package allowlist required')
     checked(config['state_dir'], directory=True)
     checked(config['broker_dir'], directory=True)
@@ -328,6 +331,28 @@ def ensure_authenticated_sources(source_roots=None):
                 raise ValueError('Repository freshness bypass is configured')
 
 
+def valid_selection(selection):
+    return isinstance(selection, dict) and ((set(selection) == {'mode'} and selection['mode'] == 'all_eligible') or (set(selection) == {'mode', 'packages'} and selection['mode'] == 'selected' and valid_packages(selection['packages'], maximum=5000)))
+
+
+def preparation_roots(cache, selection, allowed, held):
+    if not valid_selection(selection) or not valid_packages(allowed, maximum=5000):
+        raise ValueError('Invalid provider selection policy')
+    if selection['mode'] == 'selected':
+        roots = selection['packages']
+        if not set(roots).issubset(allowed) or set(roots).intersection(held):
+            raise ValueError('Selected package is held or excluded by local policy')
+        if any(name not in cache or cache[name].installed is None or cache[name].candidate is None or not cache[name].is_upgradable for name in roots):
+            raise ValueError('Selected package has no installed upgrade candidate')
+        return roots
+    # Expand only after refreshing metadata. Never install a merely available
+    # allowlisted package or override a hold to satisfy an all-eligible intent.
+    roots = sorted(name for name in allowed if name not in held and name in cache and cache[name].installed is not None and cache[name].candidate is not None and cache[name].is_upgradable)
+    if not roots:
+        raise ValueError('No eligible installed upgrade candidates')
+    return roots
+
+
 def select_changes(cache, packages):
     for name in packages:
         if name not in cache or cache[name].candidate is None or not cache[name].is_upgradable:
@@ -336,6 +361,8 @@ def select_changes(cache, packages):
     changes = cache.get_changes()
     if any(package.marked_delete for package in changes):
         raise ValueError('Dependency resolution proposes removals')
+    if not {cache[name].name for name in packages}.issubset({package.name for package in changes}):
+        raise ValueError('Dependency resolution omitted a requested upgrade')
     return changes
 
 
@@ -349,7 +376,8 @@ def prepare(config):
     cache = apt.Cache()
     if cache.broken_count:
         raise ValueError('Broken dependencies require reconciliation')
-    changes = select_changes(cache, config['packages'])
+    roots = preparation_roots(cache, config['selection'], config['allowed_packages'], held) if 'selection' in config else config['packages']
+    changes = select_changes(cache, roots)
     if not changes or len(changes) > 5000:
         raise ValueError('No bounded upgrade transaction available')
     total = sum(package.candidate.size for package in changes if package.candidate is not None)
@@ -659,12 +687,22 @@ def validate_preparation_delivery(policy, envelope, nonce, now):
         raise ValueError('Preparation delivery does not match fresh poll')
     if outer['job'] is None:
         return None
-    verify_preparation_signature(policy, outer['job'], 'guarded-update-preparation-v1')
+    # Inspect only to select the verification domain; no authority is accepted
+    # until the exact original bytes have passed that domain's signature.
+    candidate = strict_json(outer['job'].get('payload_json', 'null')) if isinstance(outer['job'], dict) else None
+    version = candidate.get('schema_version') if isinstance(candidate, dict) else None
+    domain = 'guarded-update-preparation-v2' if type(version) is int and version == 2 else 'guarded-update-preparation-v1'
+    verify_preparation_signature(policy, outer['job'], domain)
     job = strict_json(outer['job']['payload_json'])
     fields = {'schema_version', 'kind', 'job_id', 'device_id', 'fleet', 'proposal_id', 'packages', 'refresh_metadata', 'issued_at_unix', 'expires_at_unix', 'execution_allowed', 'allow_reboot'}
-    if not isinstance(job, dict) or set(job) != fields or type(job['schema_version']) is not int or job['schema_version'] != 1 or job['kind'] != 'apt-prepare' or not isinstance(job['job_id'], str) or not re.fullmatch(r'[a-f0-9]{32}', job['job_id']) or job['proposal_id'] != job['job_id'] or job['device_id'] != policy['device_id'] or job['fleet'] != policy['fleet'] or job['execution_allowed'] is not False or job['allow_reboot'] is not False or job['refresh_metadata'] is not True:
+    v2 = type(version) is int and version == 2
+    if v2:
+        fields = fields - {'packages'} | {'provider', 'selection'}
+    if not isinstance(job, dict) or set(job) != fields or type(job['schema_version']) is not int or job['schema_version'] != (2 if v2 else 1) or job['kind'] != ('provider-prepare' if v2 else 'apt-prepare') or (v2 and job['provider'] != 'apt') or not isinstance(job['job_id'], str) or not re.fullmatch(r'[a-f0-9]{32}', job['job_id']) or job['proposal_id'] != job['job_id'] or job['device_id'] != policy['device_id'] or job['fleet'] != policy['fleet'] or job['execution_allowed'] is not False or job['allow_reboot'] is not False or job['refresh_metadata'] is not True:
         raise ValueError('Preparation job does not match local policy')
-    if not valid_window(job, now, 3600) or policy['allow_metadata_refresh'] is not True or not valid_packages(job['packages']) or not set(job['packages']).issubset(policy['allowed_packages']):
+    selection = job['selection'] if v2 else {'mode':'selected', 'packages':job['packages']}
+    valid = valid_selection(selection) if v2 else valid_packages(job['packages'])
+    if (v2 and policy.get('preparation_protocol_version', 1) != 2) or not valid_window(job, now, 3600) or policy['allow_metadata_refresh'] is not True or not valid or (selection.get('mode') == 'selected' and not set(selection['packages']).issubset(policy['allowed_packages'])):
         raise PreparationRejected(job)
     return job
 
@@ -674,6 +712,12 @@ def load_dispatcher(config_path):
         raise ValueError('Dispatcher requires root')
     policy = strict_json(checked(config_path, limit=128 * 1024))
     fields = {'schema_version', 'kind', 'device_id', 'fleet', 'state_dir', 'broker_dir', 'responses_dir', 'approval_public_key_file', 'validator_binary', 'allowed_packages', 'allow_metadata_refresh'}
+    if not isinstance(policy, dict):
+        raise ValueError('Invalid root preparation policy')
+    if 'preparation_protocol_version' in policy:
+        fields.add('preparation_protocol_version')
+    if policy.get('preparation_protocol_version', 1) not in (1, 2) or type(policy.get('preparation_protocol_version', 1)) is not int:
+        raise ValueError('Invalid preparation protocol version')
     if not isinstance(policy, dict) or set(policy) != fields or type(policy['schema_version']) is not int or policy['schema_version'] != 1 or policy['kind'] != 'apt-dispatcher-policy' or not isinstance(policy['device_id'], str) or not re.fullmatch(r'[a-zA-Z0-9_.-]{1,128}', policy['device_id']) or policy['fleet'] not in ('personal', 'business') or not valid_packages(policy['allowed_packages'], maximum=5000) or type(policy['allow_metadata_refresh']) is not bool:
         raise ValueError('Invalid root preparation policy')
     for field in ('state_dir', 'broker_dir'):
@@ -695,6 +739,15 @@ def preparation_failure(state, reason):
         write_new(state / 'preparation-failed.json', encode({'reason': reason}))
 
 
+def preparation_policy_allows(policy, job):
+    if policy.get('allow_metadata_refresh') is not True:
+        return False
+    if job['schema_version'] == 1:
+        return valid_packages(job['packages']) and set(job['packages']).issubset(policy['allowed_packages'])
+    selection = job['selection']
+    return valid_selection(selection) and (selection['mode'] == 'all_eligible' or set(selection['packages']).issubset(policy['allowed_packages']))
+
+
 def continue_preparation(policy, state):
     global PREPARATION_DEADLINE
     job = strict_json(checked(state / 'job.json', limit=16384))
@@ -707,9 +760,13 @@ def continue_preparation(policy, state):
     config_path = state / 'executor.json'
     if not config_path.exists():
         config = {field: policy[field] for field in ('device_id', 'broker_dir', 'responses_dir', 'approval_public_key_file', 'validator_binary')}
-        config.update(proposal_id=job['proposal_id'], packages=job['packages'], state_dir=str(state))
+        config.update(proposal_id=job['proposal_id'], state_dir=str(state))
+        if job['schema_version'] == 2:
+            config.update(selection=job['selection'], allowed_packages=policy['allowed_packages'])
+        else:
+            config['packages'] = job['packages']
         write_new(config_path, encode(config))
-    config = strict_json(checked(config_path, limit=16384))
+    config = strict_json(checked(config_path, limit=2 * MAX))
     if (state / 'execution-attempted.json').exists():
         # Existing gate owns this attempt. Unknown outcome blocks the queue.
         cycle(config, config_path)
@@ -725,7 +782,7 @@ def continue_preparation(policy, state):
         if job['expires_at_unix'] <= int(time.time()):
             preparation_failure(state, 'policy_rejected')
             return
-        if policy['allow_metadata_refresh'] is not True or not valid_packages(job['packages']) or not set(job['packages']).issubset(policy['allowed_packages']):
+        if not preparation_policy_allows(policy, job) or (job['schema_version'] == 2 and not set(config['allowed_packages']).issubset(policy['allowed_packages'])):
             preparation_failure(state, 'policy_rejected')
             return
         write_new(state / 'preparation-started.json', b'{}')
@@ -767,7 +824,7 @@ def continue_preparation(policy, state):
     if status.get('status') in ('rejected', 'revoked', 'expired'):
         write_new(state / 'controller-closed.json', encode({'status': status['status']}))
     elif status.get('status') == 'approved':
-        if not set(job['packages']).issubset(policy['allowed_packages']):
+        if not preparation_policy_allows(policy, job) or (job['schema_version'] == 2 and not set(config['allowed_packages']).issubset(policy['allowed_packages'])):
             raise ValueError('Current root package policy holds prepared transaction')
         # This trigger still passes through the existing fresh-claim APT hook.
         execute(config, config_path)
@@ -794,7 +851,10 @@ def dispatch_preparations(policy):
         continue_preparation(policy, active[0])
         return
     nonce = secrets.token_hex(16)
-    identity = request(policy, 'preparation-poll', {'schema_version': 1, 'poll_nonce': nonce})
+    poll = {'schema_version': 1, 'poll_nonce': nonce}
+    if policy.get('preparation_protocol_version', 1) == 2:
+        poll['capabilities'] = ['apt-prepare-v2']
+    identity = request(policy, 'preparation-poll', poll)
     envelope = response(policy, identity)
     rejected = False
     try:
