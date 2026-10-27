@@ -1,3 +1,4 @@
+// Disconnected request foundation; runtime integration is separately gated.
 #[cfg(any(target_os = "macos", test))]
 mod brew;
 #[cfg(any(target_os = "linux", test))]
@@ -5,6 +6,8 @@ mod linux;
 #[cfg(any(target_os = "macos", test))]
 mod macos;
 mod process;
+#[cfg(test)]
+mod requests;
 mod state;
 mod transport;
 use process::{SystemTools, Tools};
