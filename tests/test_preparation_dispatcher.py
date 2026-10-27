@@ -39,6 +39,29 @@ class PreparationTests(unittest.TestCase):
             with self.subTest(change=change), patch.object(helper, 'verify_preparation_signature'):
                 with self.assertRaises(ValueError): helper.validate_preparation_delivery(policy, envelope(outer), 'b'*32, 1001)
 
+    def test_v2_all_eligible_intent_is_provider_scoped_and_signed_separately(self):
+        policy = dict(device_id='fixture-device', fleet='business', allowed_packages=['nano'], allow_metadata_refresh=True, preparation_protocol_version=2)
+        value = job()
+        del value['packages']
+        value.update(schema_version=2, kind='provider-prepare', provider='apt', selection={'mode':'all_eligible'})
+        outer = dict(schema_version=1, kind='apt-preparation-delivery', device_id='fixture-device', poll_nonce='b'*32, issued_at_unix=1000, expires_at_unix=1120, job=envelope(value))
+        with patch.object(helper, 'verify_preparation_signature') as verify:
+            self.assertEqual(helper.validate_preparation_delivery(policy, envelope(outer), 'b'*32, 1001), value)
+            self.assertEqual(verify.call_args.args[2], 'guarded-update-preparation-v2')
+        for change in [dict(provider='homebrew_formula'), dict(selection={'mode':'all_eligible','packages':['nano']}), dict(selection={'mode':'selected','packages':['curl']}), dict(selection={'mode':'selected','packages':[]})]:
+            with self.subTest(change=change), patch.object(helper, 'verify_preparation_signature'):
+                outer['job'] = envelope(dict(value, **change))
+                with self.assertRaises(ValueError): helper.validate_preparation_delivery(policy, envelope(outer), 'b'*32, 1001)
+
+    def test_v2_authority_is_rejected_when_root_protocol_is_not_opted_in(self):
+        value = job()
+        del value['packages']
+        value.update(schema_version=2, kind='provider-prepare', provider='apt', selection={'mode':'all_eligible'})
+        outer = dict(schema_version=1, kind='apt-preparation-delivery', device_id='fixture-device', poll_nonce='b'*32, issued_at_unix=1000, expires_at_unix=1120, job=envelope(value))
+        policy = dict(device_id='fixture-device',fleet='business',allowed_packages=['nano'],allow_metadata_refresh=True)
+        with patch.object(helper, 'verify_preparation_signature'):
+            with self.assertRaises(helper.PreparationRejected): helper.validate_preparation_delivery(policy,envelope(outer),'b'*32,1001)
+
     def test_null_delivery_is_authenticated(self):
         outer = dict(schema_version=1, kind='apt-preparation-delivery', device_id='fixture-device', poll_nonce='b'*32, issued_at_unix=1000, expires_at_unix=1120, job=None)
         with patch.object(helper, 'verify_preparation_signature', side_effect=ValueError('bad signature')):
@@ -247,3 +270,27 @@ class LocalAllowlistTests(unittest.TestCase):
 
 
 if __name__ == '__main__': unittest.main()
+
+class AllEligiblePolicyRaceTests(unittest.TestCase):
+    def test_policy_revocation_before_preparation_rejects_retained_snapshot(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state=Path(directory)
+            value=job(); del value['packages']
+            value.update(schema_version=2,kind='provider-prepare',provider='apt',selection={'mode':'all_eligible'},expires_at_unix=5000)
+            for name,data in [('job.json',value),('executor.json',{'state_dir':directory,'selection':value['selection'],'allowed_packages':['curl','nano']}),('received-reported.json',{})]:
+                (state/name).write_text(json.dumps(data))
+            with patch.object(helper,'checked',side_effect=lambda p,**kw:Path(p).read_bytes() if not kw.get('directory') else Path(p)), patch.object(helper.time,'time',return_value=1001), patch.object(helper,'prepare') as prepare:
+                helper.continue_preparation(dict(allowed_packages=['nano'],allow_metadata_refresh=True),state)
+                prepare.assert_not_called()
+                self.assertEqual(json.loads((state/'preparation-failed.json').read_text())['reason'],'policy_rejected')
+
+class V2SharedSignatureTests(unittest.TestCase):
+    def test_real_v2_job_has_distinct_domain_and_legacy_policy_rejects(self):
+        fixture=json.loads((Path(__file__).parent/'fixtures/guarded-update-preparation-v2.json').read_text())
+        with tempfile.TemporaryDirectory() as directory:
+            public=Path(directory)/'public.pem';public.write_text(fixture['public_key'])
+            policy=dict(device_id='fixture-pi',fleet='business',allowed_packages=['nano'],allow_metadata_refresh=True,preparation_protocol_version=2,state_dir=directory,approval_public_key_file=str(public))
+            with patch.object(helper,'checked',side_effect=lambda p,**kw:Path(p).read_bytes() if not kw.get('directory') else Path(p)):
+                self.assertEqual(helper.validate_preparation_delivery(policy,fixture['delivery'],'b'*32,1001)['selection'],{'mode':'all_eligible'})
+                with self.assertRaises(ValueError): helper.verify_preparation_signature(policy,fixture['job'],'guarded-update-preparation-v1')
+                with self.assertRaises(helper.PreparationRejected): helper.validate_preparation_delivery(dict(policy,preparation_protocol_version=1),fixture['delivery'],'b'*32,1001)

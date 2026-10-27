@@ -94,6 +94,33 @@ class ExecutorTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'removals'):
             helper.select_changes(cache, ['selected'])
 
+    def test_native_resolver_must_not_silently_omit_any_requested_root(self):
+        selected = Mock(candidate=object(), is_upgradable=True, marked_delete=False)
+        deferred = Mock(candidate=object(), is_upgradable=True, marked_delete=False)
+        class Cache(dict):
+            def get_changes(self): return [selected]
+        with self.assertRaisesRegex(ValueError, 'omitted'):
+            helper.select_changes(Cache(selected=selected,deferred=deferred), ['deferred','selected'])
+
+    def test_legacy_executor_config_keeps_unsorted_package_compatibility(self):
+        import json
+        config = dict(device_id='fixture',proposal_id='a'*32,state_dir='/fixture/state',broker_dir='/fixture/broker',responses_dir='/fixture/responses',approval_public_key_file='/fixture/public',validator_binary='/fixture/binary',packages=['zulu','alpha'])
+        with patch.object(helper.os,'geteuid',return_value=0,create=True), patch.object(helper,'checked',return_value=json.dumps(config).encode()):
+            self.assertEqual(helper.load('/fixture/config')['packages'], ['zulu','alpha'])
+
+    def test_all_eligible_resolves_fresh_allowed_installed_candidates_without_holds(self):
+        def package(name, upgradable=True, installed=True):
+            return Mock(name=name, is_upgradable=upgradable, candidate=object(), installed=object() if installed else None)
+        cache = {name:package(name) for name in ['allowed','held','unlisted','current','missing-install']}
+        cache['current'].is_upgradable = False
+        cache['missing-install'].installed = None
+        self.assertEqual(helper.preparation_roots(cache, {'mode':'all_eligible'}, sorted(['allowed','held','current','missing-install']), ['held']), ['allowed'])
+        # No browser-side cap or artificial batches: one complete native solve.
+        many = {'p'+str(i):package('p'+str(i)) for i in range(180)}
+        self.assertEqual(len(helper.preparation_roots(many, {'mode':'all_eligible'}, sorted(many), [])), 180)
+        with self.assertRaises(ValueError): helper.preparation_roots(cache, {'mode':'selected','packages':['held']}, ['held'], ['held'])
+        with self.assertRaises(ValueError): helper.preparation_roots(cache, {'mode':'selected','packages':['unlisted']}, ['allowed'], [])
+
     def test_a_previous_execution_attempt_prevents_any_subprocess(self):
         for marker in ('execution-attempted.json', 'execution-started.json'):
             with tempfile.TemporaryDirectory() as directory:
