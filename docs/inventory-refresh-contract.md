@@ -59,6 +59,12 @@ cache_generation: lowercase hex[32] | null
 successful_checked_at: RFC3339 | null
 started_at: RFC3339 | null
 finished_at: RFC3339 | null
+attempt: null | {
+  correlator: lowercase hex[32], helper_sequence: safe integer,
+  boot_id: UUID, accepted_boottime_ms: safe integer,
+  started_boottime_ms: safe integer | null,
+  finished_boottime_ms: safe integer | null
+}
 observation_lease: null | {
   nonce: hex[32], boot_id: UUID, expires_boottime_ms: safe integer
 }
@@ -82,6 +88,21 @@ The agent maps the controller's request UUID/delivery sequence to its own opaque
 local nonce in its durable bounded journal; helper status never controls fleet,
 source generation or controller enrollment. Agent refresh-status maps local
 received/running/deferred/failed/unconfirmed directly to those protocol states.
+Before submitting a new controller request, the agent durably records its
+request UUID, delivery sequence, local boot ID, acceptance CLOCK_BOOTTIME value
+and newly allocated helper correlator. The helper persists its own acceptance
+and actual-start monotonic times before work. A request may use helper success
+only when the exact correlator matches, the same boot ID applies, and actual
+start is at/after that durable request acceptance. A helper already running when
+a request arrived is not retroactively attached: return deferred/busy, reconcile
+that older attempt separately, and allocate a later attempt only after its
+terminal result proves whether work started. Wall-clock timestamps alone never
+establish this ordering. Helpers that return no attempt/start evidence cannot
+satisfy a manual refresh request. Report/status metadata exposes only these
+bounded identifiers/times, not helper paths or commands. New protocol fields
+require explicit per-client/enrollment negotiation; v0.1.9 exact wire remains
+unchanged until a separately versioned compatible client is enrolled.
+
 Local `succeeded` only permits building a report with successful metadata evidence;
 it does not mean the controller request is Complete. Only a durable matching
 server receipt can complete that request. Timeout/uncertain cleanup never starts
@@ -101,8 +122,17 @@ executable. TLS/signatures and repository expiry remain strict. Any failed
 repository makes the entire generation unsuccessful; index mtimes never mean
 successful refresh.
 
-Policy-generation SHA-256 covers the exact admitted sources/trust/pins/arch/
-proxy/auth configuration without exposing private bytes. The same generation is
+The public policy_generation is HMAC-SHA256, not an unsalted configuration
+hash. A device-generated 256-bit random policy-commitment key is root-only, never
+readable by reporter/worker or exported. The publisher HMACs a domain-separated,
+length-framed canonical sequence of the exact admitted source/trust/pin/arch/
+proxy/auth bytes and schema. This covers private auth changes without making the
+public digest an offline verifier for low-entropy repository credentials. The
+worker receives the resulting identifier, not the commitment key. Private key
+loss/rotation invalidates cache generations and requires explicit recovery; it
+never silently reuses a raw-auth digest. Test that changing private auth changes
+the generation while a reporter lacking the key cannot reproduce the commitment
+from guessed credentials. The same generation is
 checked before work, before publication and by the reader. A policy change
 invalidates evidence and does not silently mix generations. Root policy paths are
 fixed; no helper CLI option points elsewhere. Repository credentials are readable
