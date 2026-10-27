@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import sys
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -53,6 +54,23 @@ class RefreshWorkerTests(unittest.TestCase):
         import inventory_refresh_policy as policy
         for field in ['POLICY_ROOT', 'CACHE_ROOT', 'RUNTIME_ROOT', 'REFRESH_ACCOUNT']:
             self.assertEqual(getattr(self.p, field), getattr(policy, field))
+
+    def test_worker_identity_cannot_share_root_group_or_reporting_identity(self):
+        for root_group, shared_reporter in [(True, False), (False, True)]:
+            with self.subTest(root_group=root_group, shared_reporter=shared_reporter):
+                worker = SimpleNamespace(pw_uid=60001, pw_gid=0 if root_group else 60001)
+                reporter = SimpleNamespace(pw_uid=60001 if shared_reporter else 60002, pw_gid=60002)
+                def account(name):
+                    return worker if name == self.p.REFRESH_ACCOUNT else reporter
+                with patch.object(self.p.pwd, 'getpwnam', side_effect=account), \
+                     patch.object(self.p.os, 'geteuid', return_value=worker.pw_uid), \
+                     patch.object(self.p.os, 'getegid', return_value=worker.pw_gid), \
+                     patch.object(self.p.os, 'getgroups', return_value=[worker.pw_gid]), \
+                     patch.object(self.p, 'root_file', return_value=b'invalid-fixture') as read, \
+                     patch.object(self.p.subprocess, 'run') as run:
+                    self.assertEqual(self.p.worker_main(), self.p.EXIT_UNSUPPORTED)
+                    read.assert_not_called()
+                    run.assert_not_called()
 
     def test_missing_account_never_executes_apt_or_initializes_host_state(self):
         with patch.object(self.p.pwd, 'getpwnam', side_effect=KeyError), \

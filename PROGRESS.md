@@ -1,11 +1,61 @@
-# Isolated inventory metadata helper
+# Isolated inventory metadata helper — PB-0998
 
-Approved next slice: fixed unprivileged refresh worker/root publisher under the device-agent reporting design. No endpoint activation, package upgrades or changes to host APT/executor metadata. Reporting-only v0.1.9 is already released; this branch begins from that released source.
+Approved scope: fixed low-privilege APT refresh worker, root coordinator/publisher,
+read-only completed-generation collector. No endpoint activation, installs,
+upgrades, reboots or host APT/executor metadata changes. Public PR23 is a draft on
+`codex/inventory-metadata-helper`, based on released v0.1.9 source5c58550. Linux
+reporter/provisioning PR22/infraPR208 already merged; six legacy recoveries closed
+and fresh. No live reporter/helper is installed.
 
-Current step: `docs/inventory-refresh-contract.md` drafts bounded trigger/status/cache leases and observation-lock contract plus test-first implementation checklist. Parent can prepare server refresh reconciliation/outbox against the contract, but integration and deployment wait approved dependencies. Independent review required before privileged behavior is implemented.
+Current code: strict protocol, FD-only storage, structured trusted APT policy,
+private durable root journal and fixed unprivileged worker. Local helper suite33
+passes. Policy8/state12/storage4/protocol4/worker5. Worker only executes fixed
+apt-get update as isolated ccrefresh, never accepts caller commands/paths/options,
+reads admitted root job/config and discards native output. It requires reporter
+and refresh UID/GID separation; no root group. Worker is not exercised natively
+with APT yet. Root coordinator, request inbox consumption, native observation
+locks/receipts, actual signed HTTPS/GPG acquisition and packaging/provisioning of
+this new capability remain incomplete.
 
-Open review focus: fixed observation lease/native read-lock coordination, request deduplication across reboot, status persistence versus disposable cache, root FD publication/race resistance, strict host APT-config exclusion, cgroup+tmpfs accounting/fit. Pure protocol functions now implement strict correlators/high-water replay decisions, keyed policy commitments and post-acceptance attempt ordering; four test-first tests pass. This module has no filesystem, process or privileged operations. CI runs these on both native inventory profiles. Descriptor-only storage library now seals admitted regular index objects via FDs, atomically publishes current references, leases completed generations and refuses retirement of current/leased data. Four test-first storage tests pass (links/FIFO rejection, old evidence preservation, immutable modes, lease retirement). Native hosted proof script and CI job are drafted for actual separate UIDs,128MiB/32768inode tmpfs,256MiB slice enforcement, current+staging+held reader/open-unlinked accounting, OOM containment and unchanged host/executor fixture hashes. This proof has NOT run yet; no native fit claim. No executable coordinator, policy admission, APT worker or endpoint service exists yet. No live device changes.
+Independent reviews: contract/protocol/storage clear. Active reviewer
+/root/review_reporting_security cleared policy/state after a changed-policy
+replay finding was fixed test-first: start requires freshly admitted policy;
+successful finish binds publication policy. Coordinator must recheck before
+Store.publish. Worker review requested; never treat earlier review as full helper
+approval. fsync actual-start authorization before spawning, entire worker cgroup
+empty/no same-UID outside writers before sealing, one fixed root lock for every
+publish/retire/head change, uncertain cleanup/persistence keeps guard. Observation
+receipt must bind exact nonce/boot/gen/policy/expiry and lock-held interval through
+final read/fingerprint; post-unlock release time cannot extend that interval.
 
-Native storage-only proof40591927544 passed all14jobs at232e94f; downloaded receipt in /private/tmp/inventory-refresh-storage-proof. Actual256MiB cgroupOOM,128MiB/32768inodes, crossUID/no-write, current/staging/held/open-unlinked charges and owned-cgroup-empty-before-unmount alltrue. Not actualAPT or targetrepositoryfit. Earlier fixture imports/private-home and transient-unit cleanup fixed based on hosted diagnostics.
+Hosted native storage-only proof40591927544 passed all14 jobs at232e94f; receipt
+/private/tmp/inventory-refresh-storage-proof/native-refresh-storage-proof.json.
+Actual128MiB/32768-inode tmpfs,256MiB slice OOM, cross-UID immutable data,
+current/staging/leased/open-unlinked byte+inode accounting, old-current retention
+and kernel-empty cgroup before unmount all proved. memory_peak256MiB is deliberate
+OOM stress, not normal-workload or target repository fit. apt_refresh_exercised=false.
+Initial native failures were diagnosed/fixed fixture import permissions and
+already-unloaded transient-unit cleanup. All checks through ci_monitor wrapper.
 
-Pure trusted policy module from provideragent handedoff (8tests), bounded durable helper journal added (12tests): fixed private root FD, marker/epoch no silentreset, fsync counter/start authorization, immutable outcomes, restartunconfirmed, no-start defer/cancel, exact observation release and15min start memory. Active independent reviewer found changed-policy deferred replay; fixed test-first by mandatory currentpolicy atstart and publication-policy match onsuccess. Current fullhelper28tests pass. Independent pure policy/state review cleared, changed-policy start/publication finding fixed and verified. Fixed low-privilege worker added with strict root-owned bounded job/config admission, exact UID/groups, fixed apt-get update argv, cleared environment and exit-only safe outcomes;4 test-first worker cases pass. New policy/state/worker files are not committed yet; commit before ending. No executable coordinator/actualAPT worker/nativeTLS/GPGproof yet. Current task next: native real signedHTTPS repository acquisition under fixedpolicy + coordinator/worker/observation lifecycle. RootMacagent owns portableRust request machinery; reserve linux_refresh.rs/Linuxcollector and helperPython here. Rootprovideragent is done; don't collide with their oldtaskotherrepo.
+Next: implement native signed HTTPS synthetic repository proof that runs the fixed
+worker with actual policy under containment, checks auth/TLS/GPG/expiry/all-repo
+failure, host hook/config exclusion, binary Packages acquisition, policy-change
+and old-generation preservation. Then fixed root coordinator/observation lifecycle
+and native crash/cleanup proofs. No production fit/activation claim from mocks.
+
+Ownership: provider agent handed off policy.py + tests (now ours); do not change
+its unrelated work. Mac agent owns portable Rust request state/journal and
+mod.rs/state.rs/transport.rs integration in separate worktree. Reserve Linux
+collector linux.rs + new linux_refresh.rs and helperPython/native proof here.
+Portable journal owns reporter nonce allocation (one helper counter daily/manual,
+observation independent; release reuses observation nonce). Root journal only
+receives/fences those counters. Never relax reporter-private state::read for root
+receipts; Linux adapter needs separate root-owner no-follow reader. Preserve exact
+v0.1.9 HTTP wire until explicit per-enrollment new capability negotiation.
+
+Root is implementing PB1003 server request/outbox proof against the stable contract
+in docs/inventory-refresh-contract.md. Frozen identity: request/delivery/enrollment/
+source revision, local nonce/helper sequence/boot/local acceptance. Later proof
+fills null fields only. localAccepted<=helperAccepted<=helperStart<=helperFinish
+<=nativeLockOpen<=scanStart<=scanFinish<=confirmedLockHeldUntil<=leaseExpiry.
+Final proof binds retained reportID/hash. Integration/deployment waits dependencies.

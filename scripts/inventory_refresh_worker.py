@@ -18,6 +18,7 @@ POLICY_ROOT = '/etc/command-center-inventory-refresh'
 CACHE_ROOT = '/var/cache/command-center-inventory-refresh'
 RUNTIME_ROOT = '/run/command-center-inventory-refresh'
 REFRESH_ACCOUNT = 'ccrefresh'
+REPORTER_ACCOUNT = 'ccinventory'
 APT_COMMAND = ('/usr/bin/apt-get', 'update')
 EXIT_UNSUPPORTED = 74
 EXIT_REPOSITORY = 75
@@ -153,7 +154,10 @@ def stage_ready(token, user):
 def worker_main():
     try:
         user = pwd.getpwnam(REFRESH_ACCOUNT)
-        if (user.pw_uid <= 0 or os.geteuid() != user.pw_uid or os.getegid() != user.pw_gid or
+        reporter = pwd.getpwnam(REPORTER_ACCOUNT)
+        if (user.pw_uid <= 0 or user.pw_gid <= 0 or reporter.pw_uid <= 0 or reporter.pw_gid <= 0 or
+                user.pw_uid == reporter.pw_uid or user.pw_gid == reporter.pw_gid or
+                user.pw_gid in os.getgrouplist(REPORTER_ACCOUNT, reporter.pw_gid) or os.geteuid() != user.pw_uid or os.getegid() != user.pw_gid or
                 set(os.getgroups()) - {user.pw_gid}):
             return EXIT_UNSUPPORTED
         job = parse_job(root_file(RUNTIME_ROOT+'/job.json', user.pw_gid))
