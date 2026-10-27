@@ -157,6 +157,11 @@ unsupported cgroup/mount primitives or repository size leaves refresh disabled
 with an explicit reason. A larger per-device profile is an Ansible policy change,
 never a caller field. No fallback to host APT directories is permitted.
 
+One fixed root lock serializes all publication, current-reference changes and
+retirement. The coordinator prevents any same-worker-UID writer outside its
+contained worker subtree; an empty child process alone does not prove that
+precondition. A status/fsync failure is unconfirmed, never succeeded.
+
 The root publisher opens the staging directory and files by stable no-follow
 FDs, validates types, link counts, ownership, manifest and aggregate bounds, and
 proves all worker descendants stopped. It converts completed data to root-owned,

@@ -24,8 +24,13 @@ ENV = {'PATH': '/usr/sbin:/usr/bin:/sbin:/bin', 'LC_ALL': 'C',
 
 
 def command(argv, **kwargs):
-    return subprocess.run(argv, check=True, env=ENV, timeout=kwargs.pop('timeout', 60),
-                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, **kwargs)
+    try:
+        return subprocess.run(argv, check=True, env=ENV, timeout=kwargs.pop('timeout', 60),
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, **kwargs)
+    except subprocess.CalledProcessError as error:
+        # Fixture-only proof commands never handle repository credentials or keys.
+        detail = error.stderr.decode('utf-8', errors='replace')[-8000:]
+        raise RuntimeError('Disposable proof command failed: '+detail) from None
 
 
 def module():
@@ -128,11 +133,14 @@ def workload(base, slice_name):
         identity_check(cache, READER)
         reader = subprocess.Popen([sys.executable, '-B', str(SCRIPT), '--reader', str(cache)],
                                   env=ENV, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                  stderr=subprocess.DEVNULL, text=True)
+                                  stderr=subprocess.PIPE, text=True)
         with selectors.DefaultSelector() as selector:
             selector.register(reader.stdout, selectors.EVENT_READ)
             assert selector.select(15), 'Native reader lease failed to start'
-        assert reader.stdout.readline() == 'ready\n'
+        ready = reader.stdout.readline()
+        if ready != 'ready\n':
+            reader.wait(timeout=10)
+            raise AssertionError('Native reader failed: '+reader.stderr.read(8000))
         stage(3, 40)
         store.publish('3'*32, '4'*32, 'a'*64, '2026-01-01T00:00:01Z')
         assert not store.retire('2'*32), 'Leased old generation must be retained'
@@ -156,10 +164,13 @@ def workload(base, slice_name):
         write_data(cache/'held-open', 16)
         held = os.open(cache/'held-open', os.O_RDONLY)
         allocated = os.statvfs(cache).f_bavail
+        allocated_inodes = os.statvfs(cache).f_favail
         (cache/'held-open').unlink()
         assert os.statvfs(cache).f_bavail == allocated
+        assert os.statvfs(cache).f_favail == allocated_inodes
         os.close(held)
         assert os.statvfs(cache).f_bavail > allocated
+        assert os.statvfs(cache).f_favail > allocated_inodes
         # Exhaust inode quota without filling bytes or crossing the cgroup ceiling.
         saturation = cache/'inodes'
         saturation.mkdir()
@@ -196,7 +207,8 @@ def workload(base, slice_name):
             'memory_peak': int((cgroup/'memory.peak').read_text()),
             'byte_limit_enforced': True, 'inode_limit_enforced': True,
             'memory_limit_enforced': True, 'old_reader_retained': True,
-            'unlinked_open_charged': True, 'cross_uid_immutable': True,
+            'unlinked_open_charged': True, 'unlinked_open_inode_charged': True,
+            'cross_uid_immutable': True,
             'previous_current_preserved_after_resource_failure': True}))
     finally:
         if reader is not None:
