@@ -1,5 +1,9 @@
 # guarded-update
 
+For separate reporting-only macOS application/Homebrew inventory, see
+[the inventory agent](docs/inventory-agent.md). Its opt-in
+`command-center-inventory` executable coexists with every updater variant.
+
 guarded-update keeps a self-hosted machine's software current overnight
 without manual work, and refuses updates that would break it.
 

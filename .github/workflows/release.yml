@@ -70,6 +70,13 @@ jobs:
           fi
           cat "${name}.tar.gz.sha256"
 
+      - name: Verify and package separate macOS inventory binary
+        if: matrix.target == 'aarch64-apple-darwin'
+        run: |
+          cargo test --locked --features inventory-agent --bin command-center-inventory
+          cargo clippy --locked --features inventory-agent --bin command-center-inventory -- -D warnings
+          bash scripts/package-inventory.sh aarch64-apple-darwin dist
+
       - uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.target }}

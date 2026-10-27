@@ -1,0 +1,8 @@
+# Synthetic example. Device enrollment/public key registration happens separately.
+schema_version = 1
+server_url = "https://inventory.example.invalid"
+device_id = "example-mac"
+enrollment_id = "11111111-1111-4111-8111-111111111111"
+key_id = "inventory-reporting-1"
+reporting_private_key_file = "/Library/Application Support/CommandCenterInventory/reporting-private.pem"
+state_dir = "/Library/Application Support/CommandCenterInventory/state"

@@ -34,7 +34,7 @@ jobs:
             os: macos-15
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-24.04-arm
-        profile: [default, apt-agent, apt-remote, apt-executor]
+        profile: [default, apt-agent, apt-remote, apt-executor, inventory-agent]
     runs-on: ${{ matrix.platform.os }}
     steps:
       - uses: actions/checkout@v7
@@ -59,6 +59,26 @@ jobs:
         run: cargo test --all --locked $FEATURE_ARGS
       - name: Clippy
         run: cargo clippy --all-targets --locked $FEATURE_ARGS -- -D warnings
+      - name: Build co-installable macOS inventory archive
+        if: matrix.profile == 'inventory-agent' && matrix.platform.target == 'aarch64-apple-darwin'
+        run: bash scripts/package-inventory.sh aarch64-apple-darwin dist
+      - uses: actions/upload-artifact@v4
+        if: matrix.profile == 'inventory-agent' && matrix.platform.target == 'aarch64-apple-darwin'
+        with:
+          name: command-center-inventory-macos
+          path: dist/command-center-inventory-*
+          if-no-files-found: error
+
+  windows-discovery:
+    name: Native Windows provider discovery contract
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Verify native PowerShell discovery with synthetic module data
+        shell: pwsh
+        run: |
+          if (-not (Test-Path tests/test_winget_provider.py)) { throw 'WinGet contract test missing' }
+          python -B -m unittest discover -s tests -p test_winget_provider.py -v
 
   armv7:
     name: ARMv7 remote build (not a release)
