@@ -59,6 +59,9 @@ jobs:
         run: cargo test --all --locked $FEATURE_ARGS
       - name: Clippy
         run: cargo clippy --all-targets --locked $FEATURE_ARGS -- -D warnings
+      - name: Verify pure isolated-refresh protocol contracts
+        if: matrix.profile == 'inventory-agent'
+        run: python3 -B -m unittest discover -s tests -p test_inventory_refresh_protocol.py -v
       - name: Compare native Linux inventory with dpkg without refresh
         if: matrix.profile == 'inventory-agent' && matrix.platform.target == 'aarch64-unknown-linux-gnu'
         env:
