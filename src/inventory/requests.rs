@@ -8,6 +8,9 @@ use serde_json::Value;
 
 const MAX: u64 = 9_007_199_254_740_991;
 pub const MAX_JOURNAL: usize = 64 * 1024;
+// The process lock excludes other processes, but its shared reference does not
+// exclude cached handles in this process. Serialize their compare-and-write.
+static JOURNAL_ACCESS: std::sync::Mutex<()> = std::sync::Mutex::new(());
 type Result<T> = std::result::Result<T, String>;
 fn require(value: bool) -> Result<()> {
     if value {
@@ -1000,6 +1003,7 @@ pub enum Admission {
 pub struct RequestJournal<'a> {
     dir: std::path::PathBuf,
     journal: Journal,
+    snapshot: Vec<u8>,
     poisoned: bool,
     _lock: &'a super::state::Lock,
 }
@@ -1010,6 +1014,9 @@ impl<'a> RequestJournal<'a> {
         seeds: CounterSeeds,
         _lock: &super::state::Lock,
     ) -> Result<()> {
+        let _access = JOURNAL_ACCESS
+            .lock()
+            .map_err(|_| "Request journal access uncertain; restart and reconcile")?;
         require(uuid(enrollment) && safe(seeds.helper) && safe(seeds.observation))?;
         let path = dir.join("requests.json");
         if std::fs::symlink_metadata(&path).is_ok() {
@@ -1033,23 +1040,34 @@ impl<'a> RequestJournal<'a> {
         enrollment: &str,
         lock: &'a super::state::Lock,
     ) -> Result<Self> {
-        let journal: Journal = serde_json::from_slice(&super::state::read(
-            &dir.join("requests.json"),
-            MAX_JOURNAL,
-        )?)
-        .map_err(|_| "Request journal invalid; explicit recovery required")?;
+        let _access = JOURNAL_ACCESS
+            .lock()
+            .map_err(|_| "Request journal access uncertain; restart and reconcile")?;
+        let snapshot = super::state::read(&dir.join("requests.json"), MAX_JOURNAL)?;
+        let journal: Journal = serde_json::from_slice(&snapshot)
+            .map_err(|_| "Request journal invalid; explicit recovery required")?;
         journal.validate()?;
         require(journal.enrollment_id == enrollment)?;
         Ok(Self {
             dir: dir.to_owned(),
             journal,
+            snapshot,
             poisoned: false,
             _lock: lock,
         })
     }
     fn change<T>(&mut self, apply: impl FnOnce(&mut Journal) -> Result<T>) -> Result<T> {
+        let _access = JOURNAL_ACCESS
+            .lock()
+            .map_err(|_| "Request journal access uncertain; restart and reconcile")?;
         if self.poisoned {
             return Err("Request journal persistence uncertain; reopen and reconcile".into());
+        }
+        if !super::state::read(&self.dir.join("requests.json"), MAX_JOURNAL)
+            .is_ok_and(|bytes| bytes == self.snapshot)
+        {
+            self.poisoned = true;
+            return Err("Request journal view stale or unavailable; reopen and reconcile".into());
         }
         let mut next = self.journal.clone();
         let result = apply(&mut next)?;
@@ -1057,6 +1075,7 @@ impl<'a> RequestJournal<'a> {
         self.poisoned = true;
         super::state::atomic(&self.dir.join("requests.json"), &bytes)?;
         self.journal = next;
+        self.snapshot = bytes;
         self.poisoned = false;
         Ok(result)
     }
@@ -1167,6 +1186,14 @@ impl<'a> RequestJournal<'a> {
         })
     }
     pub fn pending(&self, cap: Capability) -> Result<Option<StatusMessage>> {
+        let _access = JOURNAL_ACCESS
+            .lock()
+            .map_err(|_| "Request journal access uncertain; restart and reconcile")?;
+        if !super::state::read(&self.dir.join("requests.json"), MAX_JOURNAL)
+            .is_ok_and(|bytes| bytes == self.snapshot)
+        {
+            return Err("Request journal view stale or unavailable; reopen and reconcile".into());
+        }
         if self.poisoned {
             return Err("Request journal persistence uncertain".into());
         }
@@ -1480,7 +1507,23 @@ impl<'a> RequestJournal<'a> {
                     .ok_or("Terminal response did not match active request")?;
                 domain.last_terminal = Some(terminal);
             } else if r.operation_nonce.as_deref() == Some(entry.proof.nonce()) {
-                entry.acknowledged_nonce = r.operation_nonce.clone();
+                if r.status == CanonicalStatus::Delivered
+                    && entry.pending_status == ClientStatus::Received
+                    && !entry.submitted
+                {
+                    entry.acknowledged_nonce = r.operation_nonce.clone();
+                }
+                if matches!(
+                    r.status,
+                    CanonicalStatus::Running | CanonicalStatus::Unconfirmed
+                ) && !entry.submitted
+                    && entry.pending_status == ClientStatus::Received
+                {
+                    // The controller may know work that this local view cannot
+                    // prove. A later stale Delivered response cannot erase it.
+                    entry.pending_status = ClientStatus::Unconfirmed;
+                    entry.reason = Some("unavailable".into());
+                }
                 if r.status == CanonicalStatus::Deferred
                     && matches!(&entry.proof,Proof::Manual(p) if p.no_work())
                 {
@@ -2091,6 +2134,133 @@ mod tests {
                 .begin(Capability::Manual, &reboot, &session())
                 .is_err()
         );
+    }
+    #[test]
+    fn stale_cached_handle_cannot_rewind_burned_counters_or_delivery_highwater() {
+        let fixture = Fixture::new();
+        let mut first = fixture.open();
+        let mut stale = fixture.open();
+        assert_eq!(
+            first
+                .reserve_nonce(OperationDomain::Helper, "aaaaaaaaaaaaaaaa")
+                .unwrap(),
+            "0000000000000006aaaaaaaaaaaaaaaa"
+        );
+        first
+            .admit(delivery(1), 1, &clock(1000), "aaaaaaaaaaaaaaaa", &session())
+            .unwrap();
+        let committed = std::fs::read(fixture.dir.join("requests.json")).unwrap();
+        assert!(
+            stale
+                .reserve_nonce(OperationDomain::Helper, "bbbbbbbbbbbbbbbb")
+                .is_err()
+        );
+        assert!(
+            stale
+                .admit(delivery(2), 1, &clock(2000), "bbbbbbbbbbbbbbbb", &session())
+                .is_err()
+        );
+        assert!(stale.pending(Capability::Collection).is_err());
+        assert_eq!(
+            std::fs::read(fixture.dir.join("requests.json")).unwrap(),
+            committed
+        );
+        drop(first);
+        drop(stale);
+        let mut reopened = fixture.open();
+        assert_eq!(
+            reopened
+                .reserve_nonce(OperationDomain::Helper, "cccccccccccccccc")
+                .unwrap(),
+            "0000000000000007cccccccccccccccc"
+        );
+        assert_eq!(
+            reopened
+                .pending(Capability::Collection)
+                .unwrap()
+                .unwrap()
+                .request_id,
+            delivery(1).id()
+        );
+    }
+    #[test]
+    fn concurrent_cached_handles_have_one_durable_winner() {
+        let fixture = Fixture::new();
+        let mut first = fixture.open();
+        let mut second = fixture.open();
+        let barrier = std::sync::Barrier::new(2);
+        let winners = std::thread::scope(|scope| {
+            let barrier = &barrier;
+            let a = scope.spawn(move || {
+                barrier.wait();
+                first
+                    .reserve_nonce(OperationDomain::Helper, "aaaaaaaaaaaaaaaa")
+                    .is_ok()
+            });
+            let b = scope.spawn(move || {
+                barrier.wait();
+                second
+                    .reserve_nonce(OperationDomain::Helper, "bbbbbbbbbbbbbbbb")
+                    .is_ok()
+            });
+            usize::from(a.join().unwrap()) + usize::from(b.join().unwrap())
+        });
+        assert_eq!(winners, 1);
+        let mut reopened = fixture.open();
+        assert_eq!(
+            reopened
+                .reserve_nonce(OperationDomain::Helper, "cccccccccccccccc")
+                .unwrap(),
+            "0000000000000007cccccccccccccccc"
+        );
+    }
+    #[test]
+    fn canonical_running_or_uncertainty_never_authorizes_a_first_start() {
+        for outcome in [CanonicalStatus::Running, CanonicalStatus::Unconfirmed] {
+            for received_was_acknowledged in [false, true] {
+                let fixture = Fixture::new();
+                let mut journal = fixture.open();
+                journal
+                    .admit(delivery(1), 1, &clock(1000), "aaaaaaaaaaaaaaaa", &session())
+                    .unwrap();
+                let received = journal.pending(Capability::Collection).unwrap().unwrap();
+                if received_was_acknowledged {
+                    journal
+                        .canonical(
+                            Capability::Collection,
+                            &canonical(&received, CanonicalStatus::Delivered, None),
+                        )
+                        .unwrap();
+                }
+                journal
+                    .canonical(Capability::Collection, &canonical(&received, outcome, None))
+                    .unwrap();
+                assert!(
+                    journal
+                        .begin(Capability::Collection, &clock(1001), &session())
+                        .is_err()
+                );
+                // A delayed older Delivered response cannot erase known uncertainty.
+                journal
+                    .canonical(
+                        Capability::Collection,
+                        &canonical(&received, CanonicalStatus::Delivered, None),
+                    )
+                    .unwrap();
+                assert!(
+                    journal
+                        .begin(Capability::Collection, &clock(1002), &session())
+                        .is_err()
+                );
+                drop(journal);
+                let mut reopened = fixture.open();
+                assert!(
+                    reopened
+                        .begin(Capability::Collection, &clock(1003), &session())
+                        .is_err()
+                );
+            }
+        }
     }
     fn manual_delivery(sequence: u64) -> Delivery {
         Delivery::Manual(ManualDelivery {
