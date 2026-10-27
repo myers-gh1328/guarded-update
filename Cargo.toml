@@ -1,6 +1,6 @@
 [package]
 name = "guarded-update"
-version = "0.1.5"
+version = "0.1.6"
 edition = "2024"
 rust-version = "1.94"
 description = "Config-driven host updater: screens release notes, updates one group at a time, health-checks, rolls back, reports."
@@ -19,6 +19,12 @@ strip = true
 
 [features]
 default = []
+inventory-agent = []
 apt-agent = []
 apt-remote = ["apt-agent"]
 apt-executor = ["apt-remote"]
+
+[[bin]]
+name = "command-center-inventory"
+path = "src/inventory_main.rs"
+required-features = ["inventory-agent"]

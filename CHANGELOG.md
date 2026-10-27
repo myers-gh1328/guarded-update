@@ -2,6 +2,22 @@
 
 All notable changes are listed here. Versions follow semantic versioning.
 
+## [0.1.6] - Unreleased
+
+### Added
+
+- Separate opt-in `command-center-inventory` macOS reporting executable and
+  hosted archive. Read-only native application/Homebrew collection uses its own
+  purpose-bound P-256 identity, atomic single-latest report, burned sequence,
+  independent check-ins and bounded retry; existing updater binaries/keys remain
+  separate. No services activate on installation.
+- Read-only Homebrew selected/all-eligible preparation snapshots, pin exclusions,
+  native recipe/artifact metadata and bounded-expiry state/metadata drift checks.
+  Central execution stays unavailable until exact frozen native transactions and
+  privileges can be proven. macOS system updates remain report-only.
+- Native macOS inventory profile checks/artifacts and Windows provider-discovery
+  contract checks in hosted CI.
+
 ## [0.1.5] - Unreleased
 
 ### Fixed
