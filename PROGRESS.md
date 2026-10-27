@@ -1,0 +1,7 @@
+# Linux reporting inventory — PB-0994
+
+User authorized fixing stale inventory via the approved IN-0018 agent design. Linux six-host readiness verified read-only: all reachable/passwordless-sudo; reporting account absent. Architectures require aarch64, x86_64 and ARMv6 hardfloat (also ARMv7). Existing0.1.8 inventory sync is macOS-only and only macOS archive published.
+
+Plan: test-first native Linux dpkg/cachedAPT collector using existing bounded tools/state/signature/check-in code; no install/refresh authority. Cache candidates/holds/age are observations, update reliability stays Unknown until approved metadata helper evidence. Extend existing release workflow with static musl inventory artifacts (aarch64/x86_64/ARMv6), hosted native/QEMU proof, native version check on actual targets. Separate executable never overwrites guarded-update. Private host provisioning belongs in a separate private infra worktree; no host identities in this public repository.
+
+Current step: native Linux collector/platform dispatch, static packaging and exact-body digest admission header implemented after red tests. 36 inventory tests plus Clippy and189 legacy tests pass; native Linux adds a hosted dpkg comparison. Static ARMv6 development build succeeded. Packaging regression passed all3Linux targets. Hosted QEMU/native proof and independent final review remain before merge. No package scans/host changes or new dependencies. Root owns API/enrollment; Mac agent owns macOS profiles. Next: Linux collector regression vectors and platform dispatch.

@@ -59,6 +59,11 @@ jobs:
         run: cargo test --all --locked $FEATURE_ARGS
       - name: Clippy
         run: cargo clippy --all-targets --locked $FEATURE_ARGS -- -D warnings
+      - name: Compare native Linux inventory with dpkg without refresh
+        if: matrix.profile == 'inventory-agent' && matrix.platform.target == 'aarch64-unknown-linux-gnu'
+        env:
+          GUARDED_UPDATE_NATIVE_INVENTORY_TEST: '1'
+        run: cargo test --locked --no-default-features --features inventory-agent --bin command-center-inventory native_linux_inventory_matches_dpkg
       - name: Build co-installable macOS inventory archive
         if: matrix.profile == 'inventory-agent' && matrix.platform.target == 'aarch64-apple-darwin'
         run: bash scripts/package-inventory.sh aarch64-apple-darwin dist
@@ -124,7 +129,7 @@ jobs:
             -o 'APT::Update::Error-Mode=any'
           )
           sudo apt-get "${ci_apt_options[@]}" update
-          sudo apt-get "${ci_apt_options[@]}" install --yes --no-install-recommends gcc-arm-linux-gnueabihf libc6-dev-armhf-cross
+          sudo apt-get "${ci_apt_options[@]}" install --yes --no-install-recommends gcc-arm-linux-gnueabihf libc6-dev-armhf-cross qemu-user
       - name: Build Linux-only ARMv7 packages
         env:
           CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER: arm-linux-gnueabihf-gcc
@@ -133,6 +138,16 @@ jobs:
             bash scripts/package-apt.sh "$profile" armv7-unknown-linux-gnueabihf dist
           done
           bash scripts/test-packages.sh dist
+      - name: Build and emulate separate Linux reporting archives
+        run: |
+          python3 -m unittest discover -s tests -p test_inventory_packaging.py -v
+          bash scripts/build-inventory-linux.sh inventory-dist
+      - name: Preserve separate Linux inventory artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: command-center-inventory-linux
+          path: inventory-dist/*.tar.gz*
+          if-no-files-found: error
       - name: Upload explicit opt-in ARMv7 packages
         uses: actions/upload-artifact@v4
         with:

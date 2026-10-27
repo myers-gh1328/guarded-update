@@ -77,6 +77,15 @@ jobs:
           cargo clippy --locked --features inventory-agent --bin command-center-inventory -- -D warnings
           bash scripts/package-inventory.sh aarch64-apple-darwin dist
 
+      - name: Verify and package separate static Linux inventory binaries
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install --yes --no-install-recommends qemu-user
+          GUARDED_UPDATE_NATIVE_INVENTORY_TEST=1 cargo test --locked --no-default-features --features inventory-agent --bin command-center-inventory
+          cargo clippy --locked --no-default-features --features inventory-agent --bin command-center-inventory -- -D warnings
+          python3 -m unittest discover -s tests -p test_inventory_packaging.py -v
+          bash scripts/build-inventory-linux.sh dist
       - uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.target }}

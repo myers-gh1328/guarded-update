@@ -1,0 +1,31 @@
+[Unit]
+Description=Command Center reporting-only inventory
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ccinventory
+Group=ccinventory
+ExecStart=/usr/local/libexec/command-center-inventory sync --config /etc/command-center-inventory/reporting.toml
+StateDirectory=command-center-inventory
+StateDirectoryMode=0700
+Environment=HOME=/var/lib/command-center-inventory
+Environment=DO_NOT_TRACK=1
+UMask=0077
+NoNewPrivileges=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadWritePaths=/var/lib/command-center-inventory
+TimeoutStartSec=15min
+MemoryMax=256M
+TasksMax=64

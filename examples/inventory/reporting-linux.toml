@@ -1,0 +1,8 @@
+# Synthetic reporting-only identity; controller supplies enrollment generation.
+schema_version = 1
+server_url = "https://inventory.example.invalid"
+device_id = "example-linux"
+enrollment_id = "11111111-1111-4111-8111-111111111111"
+key_id = "inventory-reporting-1"
+reporting_private_key_file = "/etc/command-center-inventory/reporting-private.pem"
+state_dir = "/var/lib/command-center-inventory/state"

@@ -1,4 +1,8 @@
+#[cfg(any(target_os = "macos", test))]
 mod brew;
+#[cfg(any(target_os = "linux", test))]
+mod linux;
+#[cfg(any(target_os = "macos", test))]
 mod macos;
 mod process;
 mod state;
@@ -37,6 +41,15 @@ fn while_collecting(
             .join()
             .map_err(|_| "Inventory collection failed")?
     })
+}
+
+fn collect_native(tools: &impl Tools, id: &str, started: &str) -> Result<Value, String> {
+    #[cfg(target_os = "linux")]
+    return linux::collect(tools, id, started);
+    #[cfg(target_os = "macos")]
+    return macos::collect(tools, id, started);
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    Err("Native inventory collection requires Linux or macOS".into())
 }
 
 fn pass(
@@ -122,7 +135,7 @@ fn pass(
         let mut collecting_checkin = checkin.clone();
         collecting_checkin["collection_state"] = json!("collecting");
         let scan = while_collecting(
-            || macos::collect(tools, &id, &started),
+            || collect_native(tools, &id, &started),
             || {
                 let _ = network.post(
                     config,
@@ -210,7 +223,10 @@ fn run() -> Result<(), String> {
         .first()
         .is_some_and(|arg| matches!(arg.as_str(), "prepare" | "verify-preparation"))
     {
+        #[cfg(target_os = "macos")]
         return preparation_cli(&args);
+        #[cfg(not(target_os = "macos"))]
+        return Err("Local Homebrew preparation requires macOS".into());
     }
     if args.len() != 3
         || !matches!(args[0].as_str(), "sync" | "initialize")
@@ -223,8 +239,8 @@ fn run() -> Result<(), String> {
     if args[0] == "initialize" {
         return Store::initialize(&config.state_dir, &config.enrollment_id);
     }
-    if !cfg!(target_os = "macos") {
-        return Err("Native inventory collection currently requires macOS".into());
+    if !cfg!(any(target_os = "macos", target_os = "linux")) {
+        return Err("Native inventory collection requires Linux or macOS".into());
     }
     let mut store = Store::load(&config.state_dir, &config.enrollment_id)?;
     pass(
@@ -236,6 +252,7 @@ fn run() -> Result<(), String> {
     )
 }
 
+#[cfg(target_os = "macos")]
 fn preparation_cli(args: &[String]) -> Result<(), String> {
     if args.len() < 5 || args[1] != "--provider" || args[3] != "--selection" {
         return Err("Usage: command-center-inventory prepare|verify-preparation --provider homebrew_formula|homebrew_cask --selection all|comma,separated,packages [--snapshot PATH]".into());

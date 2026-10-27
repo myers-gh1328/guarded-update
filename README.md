@@ -481,3 +481,13 @@ A separate [WinGet discovery boundary](docs/WINGET-PROVIDER.md) emits structured
 native observations with explicit user/scope/pin gaps. It does not advertise remote
 preparation or execution. Homebrew's existing local policy engine is distinct from
 remote exact-manifest authority; OS updates remain reporting-only.
+
+## Reporting-only inventory distribution
+
+`command-center-inventory` is a separate opt-in executable; it never replaces
+the updater or grants package installation authority. Linux dpkg/cached-APT and
+macOS application/Homebrew inventory share signed check-ins, daily latest-only
+reports and independent five-minute liveness. Linux static musl artifacts cover
+ARM64, x86-64 and ARMv6 hard-float/ARMv7. No schedule activates automatically.
+See [inventory operation and coverage](docs/inventory-agent.md) for restricted
+identity, enrollment, missing coverage and disable/recovery requirements.

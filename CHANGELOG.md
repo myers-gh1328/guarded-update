@@ -2,6 +2,15 @@
 
 All notable changes are listed here. Versions follow semantic versioning.
 
+## 0.1.9 - 2026-10-27
+
+- Add a signed exact-body digest header for pre-body cryptographic admission.
+- Add reporting-only Linux dpkg inventory and cached APT candidate/hold observations.
+  Cached policy is not a verified refresh: update reliability remains Unknown.
+- Publish separate static inventory artifacts for ARMv6 hardfloat (also ARMv7),
+  ARM64 and x86-64, without replacing updater binaries or enabling services.
+- Exercise native dpkg comparison and ARM1176/static-artifact startup in hosted CI.
+
 ## Unreleased
 
 ### Added

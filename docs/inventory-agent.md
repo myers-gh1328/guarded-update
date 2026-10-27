@@ -1,4 +1,4 @@
-# Reporting-only macOS inventory agent
+# Reporting-only inventory agent
 
 `command-center-inventory` is a separate opt-in executable built with the
 `inventory-agent` feature. It links no updater, approval, root-executor or AI
@@ -140,3 +140,43 @@ recipe/artifact materialization, service impact and cask privilege constraints
 must be proven before central execution can be advertised. This executable has
 no install/execute operation and no central preparation polling capability.
 Command Center must not advertise remote Brew actions from inventory alone.
+
+## Linux reporting
+
+The same separate executable supports Linux from version0.1.9. Static musl
+archives cover ARM64, x86-64 and ARMv6 hard-float (also usable on ARMv7).
+No host C-library upgrade is required. Verify the published SHA-256 and the
+native executable version before provisioning. The hosted pipeline compares
+native Linux reports with dpkg and starts cross-builds under QEMU, including
+an ARM1176 CPU. Emulation is not a substitute for native device verification.
+
+Linux collection reads dpkg installed package identities/versions/architectures,
+APT cached repository-backed candidate observations and holds, and visible
+.desktop launcher ownership plus recognized server applications. It never
+refreshes APT, downloads packages, installs, restarts or reboots. APT cache-file
+write destinations are disabled. Repository URLs and tool stderr are discarded.
+The oldest readable cached binary-index timestamp is an observation only.
+Until a separately reviewed metadata-refresh helper supplies trusted evidence,
+all package currency remains Unknown even when a cached candidate is displayed.
+Missing policy/desktop evidence does not erase a successfully collected dpkg
+inventory; failed or malformed installed inventory is incomplete and preserves
+the previous complete server snapshot. Other ecosystems and user/portable
+installs remain explicit coverage gaps.
+
+Install the root-owned executable at a separate path such as
+`/usr/local/libexec/command-center-inventory`, never `/usr/bin/guarded-update`.
+Provision a dedicated non-login unprivileged reporting identity with no sudo,
+capabilities, updater-key access or package-manager write permissions. Use its
+own 0600 reporting key/config and 0700 state directory. Generate the key on the
+device; only its public half is registered centrally. The inactive Linux
+service/timer examples contain hardening and five-minute check-in scheduling;
+no archive or program enables them. First initialize the server-issued
+enrollment once, then verify one signed read-only report and its durable
+receipt before enabling the timer. Source comparison/review/switch remains a
+separate server operation, never implicit in successful delivery.
+
+Version0.1.9 sends x-device-body-sha256 for cryptographic admission before body
+upload. That advertised exact-byte digest is already the final line of the
+unchanged signed canonical message; the server verifies the header signature
+first and the uploaded bytes afterward. Older clients without this header must
+not activate against the reporting API that requires it.
