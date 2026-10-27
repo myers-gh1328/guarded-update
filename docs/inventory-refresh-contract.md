@@ -66,7 +66,15 @@ attempt: null | {
   finished_boottime_ms: safe integer | null
 }
 observation_lease: null | {
-  nonce: hex[32], boot_id: UUID, expires_boottime_ms: safe integer
+  nonce: hex[32], boot_id: UUID, cache_generation: hex[32],
+  policy_generation: lowercase sha256, expires_boottime_ms: safe integer
+}
+observation_receipt: null | {
+  nonce: hex[32], boot_id: UUID, cache_generation: hex[32],
+  policy_generation: lowercase sha256, started_boottime_ms: safe integer,
+  finished_boottime_ms: safe integer, outcome: released | expired | unconfirmed,
+  installed_before_sha256: lowercase sha256,
+  installed_after_sha256: lowercase sha256
 }
 ```
 
@@ -175,12 +183,23 @@ The root coordinator pins the published reference and holds its native read lock
 for at most 120 seconds, returning the nonce/boot/monotonic deadline in status.
 The reporter must already lease that exact completed generation, verify matching
 policy/head and compare installed-state fingerprints before/after collection.
-It releases the observation nonce when finished. Root releases on the fixed
+After the last read/fingerprint, the reporter submits the fixed release nonce
+and requires a matching root-owned observation_receipt with outcome `released`.
+The coordinator computes its fixed native-state fingerprints under the held read
+locks and acknowledges release before unlocking. The receipt binds the exact
+cache/policy generation, boot and native-lock-held start/end interval. Merely
+seeing an unexpired active status is insufficient. A deadline expiry or unknown
+cleanup cannot produce a successful observation receipt. Root releases on the fixed
 deadline even if the reporter disappears; no renewed/extended lock via nonce
 replay. A report whose observation lease expired or whose fingerprints changed
 keeps useful installed inventory only if coherent, with candidate reliability
 Unknown and `state_inconsistent`/`lease_expired`. There is no root caller-command
 execution or inventory signing in this coordinator.
+
+The actual-start record is fsynced before spawning any worker, even when a
+received record already exists. Before taking ownership, publishing or unlocking
+a helper guard, prove the fixed worker cgroup is empty; a process exit code alone
+is insufficient. Unknown descendant cleanup preserves the guard and old data.
 
 A refresh operation has a 600-second overall bound. Containment stops only its
 owned cgroup descendants. If descendant cleanup cannot be proved, retain the
@@ -214,3 +233,8 @@ The refresh helper cannot activate on devices until its independent review,
 hosted containment tests, per-device policy/repository fit and rollout dependency
 checks are complete. A passing transport mock or cache-size declaration does not
 satisfy those gates.
+
+Implementation references: [APT configuration loading order](https://manpages.debian.org/trixie/apt/apt.conf.5.en.html)
+requires parts/main overrides in APT_CONFIG itself; [systemd resource control](https://www.freedesktop.org/software/systemd/man/257/systemd.resource-control.html)
+defines slice-wide memory accounting and MemoryMax. Actual enforcement remains a
+native hosted test requirement.
