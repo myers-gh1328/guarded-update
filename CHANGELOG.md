@@ -13,6 +13,30 @@ All notable changes are listed here. Versions follow semantic versioning.
   without inherited secret environment values. Installer downloads, dependency
   freezing, signed remote jobs and installation remain unavailable.
 
+## [0.1.8] - Unreleased
+
+### Fixed
+
+- Native macOS reports preserve the existing collector's application-identification
+  evidence for System Information apps, Homebrew casks and recognized server
+  formulae, keeping those apps visible in Command Center's default inventory view.
+- Unavailable/failed Homebrew inventory is explicitly partial and incomplete, so
+  it cannot erase packages from the last complete central inventory.
+
+## [0.1.7] - Unreleased
+
+### Fixed
+
+- Inventory advisory locks explicitly unlock before closing. A concurrently
+  spawned child can briefly inherit the open file description until exec;
+  that inherited descriptor no longer delays normal lock release/reacquisition.
+  Hosted v0.1.6 release validation caught this case before publication.
+- The independent-heartbeat regression coordinates collection completion rather
+  than assuming how often a busy hosted runner schedules a thread in 90ms.
+- Interrupted or failed local collection persists an error flag for the next
+  independent check-in; a later successful report clears it without sequence
+  reuse or loss of the previous latest report.
+
 ## [0.1.6] - Unreleased
 
 ### Added

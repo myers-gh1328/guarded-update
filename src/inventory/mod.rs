@@ -54,7 +54,7 @@ fn pass(
         Ok(json!({"report_id":report["report_id"],"sequence":report["sequence"],"sha256":tools.sha256(&bytes)?,"collected_at":report["collected_at"]}))
     }).transpose()?;
     let checkin = json!({"schema_version":1,"enrollment_id":config.enrollment_id,"agent_version":env!("CARGO_PKG_VERSION"),
-        "latest_report":descriptor,"collection_state":if store.schedule.permanent_error || invalid_latest {"error"} else {"idle"},"refresh_result":null});
+        "latest_report":descriptor,"collection_state":if store.schedule.permanent_error || invalid_latest || store.schedule.collection_error {"error"} else {"idle"},"refresh_result":null});
     // Always check in before upload retry admission. A queued/invalid report never suppresses liveness.
     let response = network.post(
         config,
@@ -115,6 +115,8 @@ fn pass(
     };
     if latest.is_none() || source_changed || now >= next_collection {
         let sequence = store.reserve()?;
+        store.schedule.collection_error = true;
+        store.save()?;
         let id = transport::report_id()?;
         let started = crate::timefmt::rfc3339(now as i64);
         let mut collecting_checkin = checkin.clone();
@@ -307,6 +309,15 @@ mod tests {
         }
     }
     struct FakeTools;
+    struct FailedCollector;
+    impl Tools for FailedCollector {
+        fn text(&self, _: &str, _: &[&str], _: usize) -> Result<String, String> {
+            Err("synthetic collection failure".into())
+        }
+        fn sha256(&self, bytes: &[u8]) -> Result<String, String> {
+            SystemTools.sha256(bytes)
+        }
+    }
     impl Tools for FakeTools {
         fn text(&self, program: &str, _: &[&str], _: usize) -> Result<String, String> {
             match program {
@@ -360,6 +371,39 @@ mod tests {
         assert_eq!(store.schedule.sequence, 1);
     }
     #[test]
+    fn failed_collection_is_visible_on_next_independent_checkin() {
+        let (temp, mut store) = store();
+        let network = FakeNetwork {
+            offline: false,
+            calls: RefCell::new(vec![]),
+        };
+        assert!(
+            pass(
+                &config(&temp.0),
+                &mut store,
+                &FailedCollector,
+                &network,
+                100
+            )
+            .is_err()
+        );
+        assert!(
+            pass(
+                &config(&temp.0),
+                &mut store,
+                &FailedCollector,
+                &network,
+                400
+            )
+            .is_err()
+        );
+        assert_eq!(
+            network.calls.borrow()[1]["body"]["collection_state"],
+            "error"
+        );
+        assert_eq!(store.schedule.sequence, 2);
+    }
+    #[test]
     fn offline_controller_does_not_stop_due_daily_local_collection() {
         let (temp, mut store) = store();
         store.schedule.source_revision = 1;
@@ -392,13 +436,22 @@ mod tests {
     #[test]
     fn slow_collection_keeps_independent_heartbeat_deadlines() {
         let mut heartbeats = 0;
+        let (finished, wait) = std::sync::mpsc::sync_channel(1);
         let report = while_collecting(
-            || {
-                std::thread::sleep(std::time::Duration::from_millis(90));
+            move || {
+                // Collection may complete only after the observable heartbeat
+                // requirement, regardless of hosted-runner scheduling speed.
+                wait.recv_timeout(std::time::Duration::from_secs(10))
+                    .map_err(|_| "Independent heartbeats did not run")?;
                 Ok(json!({"complete":true}))
             },
-            || heartbeats += 1,
-            std::time::Duration::from_millis(20),
+            || {
+                heartbeats += 1;
+                if heartbeats == 2 {
+                    finished.send(()).unwrap();
+                }
+            },
+            std::time::Duration::from_millis(1),
         )
         .unwrap();
         assert!(heartbeats >= 2);

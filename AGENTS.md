@@ -58,7 +58,10 @@ No coverage tooling yet.
   no private keys are bundled. The device signs requests; the controller signs
   approvals. Pin public keys at provisioning. See ADR-0002 and synthetic protocol
   vectors. No installation/execution authority exists in these builds yet.
-- Verify default, apt-agent and apt-remote test/clippy profiles independently.
+- Verify default, apt-agent, apt-remote and apt-executor test/clippy profiles independently.
+- Verify the separate inventory binary with `cargo test --locked --features inventory-agent
+  --bin command-center-inventory` and matching clippy flags; reporting enrollment
+  does not grant preparation or installation authority.
 
 ## Explicit remote execution profile
 
