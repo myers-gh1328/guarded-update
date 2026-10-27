@@ -392,13 +392,22 @@ mod tests {
     #[test]
     fn slow_collection_keeps_independent_heartbeat_deadlines() {
         let mut heartbeats = 0;
+        let (finished, wait) = std::sync::mpsc::sync_channel(1);
         let report = while_collecting(
-            || {
-                std::thread::sleep(std::time::Duration::from_millis(90));
+            move || {
+                // Collection may complete only after the observable heartbeat
+                // requirement, regardless of hosted-runner scheduling speed.
+                wait.recv_timeout(std::time::Duration::from_secs(10))
+                    .map_err(|_| "Independent heartbeats did not run")?;
                 Ok(json!({"complete":true}))
             },
-            || heartbeats += 1,
-            std::time::Duration::from_millis(20),
+            || {
+                heartbeats += 1;
+                if heartbeats == 2 {
+                    finished.send(()).unwrap();
+                }
+            },
+            std::time::Duration::from_millis(1),
         )
         .unwrap();
         assert!(heartbeats >= 2);

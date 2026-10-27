@@ -10,6 +10,8 @@ All notable changes are listed here. Versions follow semantic versioning.
   spawned child can briefly inherit the open file description until exec;
   that inherited descriptor no longer delays normal lock release/reacquisition.
   Hosted v0.1.6 release validation caught this case before publication.
+- The independent-heartbeat regression coordinates collection completion rather
+  than assuming how often a busy hosted runner schedules a thread in 90ms.
 
 ## [0.1.6] - Unreleased
 
