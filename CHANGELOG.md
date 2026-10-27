@@ -2,6 +2,15 @@
 
 All notable changes are listed here. Versions follow semantic versioning.
 
+## [0.1.7] - Unreleased
+
+### Fixed
+
+- Inventory advisory locks explicitly unlock before closing. A concurrently
+  spawned child can briefly inherit the open file description until exec;
+  that inherited descriptor no longer delays normal lock release/reacquisition.
+  Hosted v0.1.6 release validation caught this case before publication.
+
 ## [0.1.6] - Unreleased
 
 ### Added

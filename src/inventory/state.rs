@@ -242,6 +242,14 @@ fn nofollow(options: &mut OpenOptions) {
 pub struct Lock {
     _file: File,
 }
+impl Drop for Lock {
+    fn drop(&mut self) {
+        // A concurrently spawned child can transiently retain the same open
+        // file description until exec. Close alone need not release flock;
+        // explicit unlock releases this owner's lock across inherited handles.
+        let _ = self._file.unlock();
+    }
+}
 impl Lock {
     pub fn acquire(dir: &Path) -> Result<Self, String> {
         protected(dir, true)?;
@@ -326,6 +334,17 @@ pub(super) mod tests {
         drop(lock);
         assert!(Lock::acquire(&temp.0).is_ok());
         assert!(temp.0.join("running.lock").exists());
+    }
+    #[test]
+    fn explicit_lock_release_survives_inherited_descriptor_during_child_spawn() {
+        let temp = TestDir::new();
+        let lock = Lock::acquire(&temp.0).unwrap();
+        // A concurrent fork can retain the open file description until exec
+        // applies close-on-exec. Reproduce that lifetime without a real fork.
+        let inherited = lock._file.try_clone().unwrap();
+        drop(lock);
+        assert!(Lock::acquire(&temp.0).is_ok());
+        drop(inherited);
     }
     #[test]
     #[cfg(unix)]
