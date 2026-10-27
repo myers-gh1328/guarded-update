@@ -167,6 +167,12 @@ pub fn snapshot(
         &tools.sha256(inventory.to_string().as_bytes())?,
         &tools.sha256(outdated.to_string().as_bytes())?,
     )?;
+    let uid = tools.text("/usr/bin/id", &["-u"], 64)?;
+    let uid = uid.trim();
+    if uid.is_empty() || !uid.bytes().all(|b| b.is_ascii_digit()) {
+        return Err("Homebrew account context unavailable".into());
+    }
+    prepared["context"]["user_id"] = json!(format!("uid:{uid}"));
     let now = crate::timefmt::now_secs();
     prepared["generated_at"] = json!(crate::timefmt::rfc3339(now));
     prepared["expires_at"] = json!(crate::timefmt::rfc3339(now + 900));

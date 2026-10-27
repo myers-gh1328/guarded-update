@@ -15,6 +15,10 @@ check-in established source authority. Initial collection waits for that first
 check-in. New authority revisions trigger a fresh report. The server determines
 fleet and active source; the client cannot select either.
 
+Daily collection includes up to 30 minutes of jitter. A long-running collector
+runs separately from its heartbeat loop, which keeps sending collecting-state
+check-ins every five minutes. Root execution of reporting commands is rejected.
+
 The collector reads `system_profiler SPApplicationsDataType -json`, `sw_vers`,
 and Homebrew installed/outdated state. It sets Homebrew no-auto-update and
 no-analytics controls. It never invokes `brew update`, installation, upgrades,

@@ -3,7 +3,7 @@ use std::io::{Read, Write};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-pub trait Tools {
+pub trait Tools: Sync {
     fn text(&self, program: &str, args: &[&str], limit: usize) -> Result<String, String>;
     fn sha256(&self, bytes: &[u8]) -> Result<String, String>;
 }

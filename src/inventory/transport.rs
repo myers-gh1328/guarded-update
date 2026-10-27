@@ -39,6 +39,11 @@ fn valid_origin(text: &str) -> bool {
 }
 impl Config {
     pub fn load(path: &Path) -> Result<Self, String> {
+        if SystemTools.text("/usr/bin/id", &["-u"], 64)?.trim() == "0" {
+            return Err(
+                "Inventory reporting must run as its unprivileged reporting identity".into(),
+            );
+        }
         let bytes = state::read(path, 65536)?;
         let config: Self = toml::from_str(
             std::str::from_utf8(&bytes).map_err(|_| "Invalid reporting configuration")?,

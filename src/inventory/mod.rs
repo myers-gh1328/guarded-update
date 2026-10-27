@@ -18,6 +18,27 @@ impl Network for Https {
     }
 }
 
+fn while_collecting(
+    collect: impl FnOnce() -> Result<Value, String> + Send,
+    mut heartbeat: impl FnMut(),
+    interval: std::time::Duration,
+) -> Result<Value, String> {
+    std::thread::scope(|scope| {
+        let collector = scope.spawn(collect);
+        let mut next = std::time::Instant::now() + interval;
+        while !collector.is_finished() {
+            if std::time::Instant::now() >= next {
+                heartbeat();
+                next += interval;
+            }
+            std::thread::sleep(interval.min(std::time::Duration::from_millis(50)));
+        }
+        collector
+            .join()
+            .map_err(|_| "Inventory collection failed")?
+    })
+}
+
 fn pass(
     config: &Config,
     store: &mut Store,
@@ -87,14 +108,29 @@ fn pass(
     let source_changed = latest
         .as_ref()
         .is_some_and(|report| report["source_revision"] != revision);
-    if latest.is_none()
-        || source_changed
-        || now.saturating_sub(store.schedule.collected_at_secs) >= 86400
-    {
+    let next_collection = if store.schedule.next_collection_at == 0 {
+        store.schedule.collected_at_secs.saturating_add(86400)
+    } else {
+        store.schedule.next_collection_at
+    };
+    if latest.is_none() || source_changed || now >= next_collection {
         let sequence = store.reserve()?;
         let id = transport::report_id()?;
         let started = crate::timefmt::rfc3339(now as i64);
-        let scan = macos::collect(tools, &id, &started)?;
+        let mut collecting_checkin = checkin.clone();
+        collecting_checkin["collection_state"] = json!("collecting");
+        let scan = while_collecting(
+            || macos::collect(tools, &id, &started),
+            || {
+                let _ = network.post(
+                    config,
+                    "/api/agent/v1/inventory/check-ins",
+                    &collecting_checkin.to_string(),
+                    crate::timefmt::now_secs().max(0) as u64,
+                );
+            },
+            std::time::Duration::from_secs(300),
+        )?;
         let collected = scan["completedAt"]
             .as_str()
             .ok_or("Collection timestamp missing")?;
@@ -352,5 +388,20 @@ mod tests {
         assert!(pass(&config(&temp.0), &mut store, &FakeTools, &network, 200).is_ok());
         assert_eq!(network.calls.borrow().len(), 1);
         assert_eq!(store.schedule.sequence, 1);
+    }
+    #[test]
+    fn slow_collection_keeps_independent_heartbeat_deadlines() {
+        let mut heartbeats = 0;
+        let report = while_collecting(
+            || {
+                std::thread::sleep(std::time::Duration::from_millis(90));
+                Ok(json!({"complete":true}))
+            },
+            || heartbeats += 1,
+            std::time::Duration::from_millis(20),
+        )
+        .unwrap();
+        assert!(heartbeats >= 2);
+        assert_eq!(report["complete"], true);
     }
 }

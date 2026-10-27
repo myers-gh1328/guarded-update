@@ -20,6 +20,8 @@ pub struct Schedule {
     pub permanent_error: bool,
     #[serde(default)]
     pub source_revision: u64,
+    #[serde(default)]
+    pub next_collection_at: u64,
 }
 
 pub fn matches_receipt(report: &Value, digest: &str, receipt: &Value) -> bool {
@@ -215,6 +217,10 @@ impl Store {
         }
         atomic(&self.dir.join("latest.json"), &bytes)?;
         self.schedule.collected_at_secs = now;
+        let jitter = u64::from_str_radix(&super::transport::random_hex(2)?, 16)
+            .map_err(|_| "Collection jitter unavailable")?
+            % 1801;
+        self.schedule.next_collection_at = now.saturating_add(86400 + jitter);
         self.schedule.acknowledged_sha256 = None;
         self.schedule.retry_at = 0;
         self.schedule.retry_delay = 0;
