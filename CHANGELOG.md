@@ -2,6 +2,17 @@
 
 All notable changes are listed here. Versions follow semantic versioning.
 
+## Unreleased
+
+### Added
+
+- Optional native WinGet read-only selected/all-eligible preparation snapshots
+  using public COM candidate, installed-scope and version evidence. Local policy,
+  account context, exclusions, fifteen-minute expiry and drift checks remain
+  explicit; source identifiers are hashed. Native calls use a bounded worker
+  without inherited secret environment values. Installer downloads, dependency
+  freezing, signed remote jobs and installation remain unavailable.
+
 ## [0.1.6] - Unreleased
 
 ### Added
