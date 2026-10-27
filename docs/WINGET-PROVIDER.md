@@ -19,7 +19,7 @@ Other users' profiles, portable software, manual packages and Windows OS updates
 are not established by this report. A user-context scheduled task would require
 separate provisioning; this script creates none.
 
-## Preparation and execution remain unavailable
+## Discovery wrapper and native preparation
 
 The documented installed-package PowerShell object exposes no installed scope
 or native pin state. Consequently every discovered package currently has an
@@ -27,7 +27,11 @@ explicit exclusion, and `prepare` and `execute` capabilities are false. Both
 selected and all-eligible preparation reject before any native change. Do not
 hide these gaps behind a generic “all apps” or “current” claim.
 
-Completing preparation requires structured native scope/pin evidence and a
+A separate [native COM snapshot adapter](WINGET-PREPARATION.md) now supplies
+selected/all-eligible read-only review evidence through the public native API.
+The discovery wrapper remains conservative and execution remains unavailable.
+
+Completing executable preparation requires structured native scope/pin evidence and a
 complete frozen installer/dependency record. WinGet's download command can
 select exact ID, version, source, architecture and scope, but downloading alone
 does not prove the approved installer closure. Microsoft Store offline license

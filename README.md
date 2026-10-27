@@ -307,10 +307,14 @@ cargo clippy --all-targets -- -D warnings
 cargo test --all
 ```
 
-CI (`.github/workflows/ci.yml`) runs these checks for default, `apt-agent`,
-and `apt-remote` builds natively on both targets. A separate job cross-builds
-`apt-remote` for ARMv7 without publishing it. Native ARMv7 runtime testing is
-still required. These checks run for every pull request and push to `main`. Docs-only changes skip it.
+CI (`.github/workflows/ci.yml`) verifies default, `apt-agent`, `apt-remote`,
+`apt-executor` and `inventory-agent` profiles natively on both targets. The separate
+inventory executable uses `--features inventory-agent --bin command-center-inventory`.
+Additional jobs verify disposable Linux APT behavior, opt-in ARMv7 packages,
+macOS inventory packaging and Windows PowerShell provider contracts. Synthetic
+Windows contracts do not prove enrolled App Installer activation or installer
+execution. Required checks run on every pull request; docs-only main pushes skip
+CI. Native fleet rollout and hosted release artifact verification remain separate.
 
 There is no coverage tooling yet and no numeric coverage gate. Tests use
 fake command runners and HTTP clients, so they need no network and change

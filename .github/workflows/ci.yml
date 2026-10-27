@@ -78,7 +78,7 @@ jobs:
         shell: pwsh
         run: |
           if (-not (Test-Path tests/test_winget_provider.py)) { throw 'WinGet contract test missing' }
-          python -B -m unittest discover -s tests -p test_winget_provider.py -v
+          python -B -m unittest discover -s tests -p 'test_winget*.py' -v
 
   armv7:
     name: ARMv7 remote build (not a release)
