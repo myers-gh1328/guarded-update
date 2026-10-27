@@ -1,4 +1,5 @@
 //! Native read-only preparation. Snapshot equality is a drift gate, never an execution grant.
+#[cfg(target_os = "macos")]
 use super::process::Tools;
 pub fn package_name(text: &str) -> bool {
     let parts = text.split('/').collect::<Vec<_>>();
@@ -136,6 +137,7 @@ pub fn prepare(
     )
 }
 
+#[cfg(target_os = "macos")]
 pub fn snapshot(
     tools: &impl Tools,
     provider: &str,
@@ -181,6 +183,7 @@ pub fn snapshot(
     Ok(prepared)
 }
 
+#[cfg(target_os = "macos")]
 pub fn verify(original: &Value, current: &Value) -> Result<(), String> {
     verify_at(original, current, crate::timefmt::now_secs().max(0) as u64)
 }

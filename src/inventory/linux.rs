@@ -188,10 +188,53 @@ fn desktop_owners(
     }
     result
 }
+fn desktop_evidence(path: &std::path::Path) -> (std::collections::BTreeSet<String>, bool) {
+    let mut visible = std::collections::BTreeSet::new();
+    let Ok(directory) = std::fs::read_dir(path) else {
+        return (visible, false);
+    };
+    let mut complete = true;
+    let mut bytes = 0;
+    for (index, entry) in directory.enumerate() {
+        if index >= 10000 {
+            complete = false;
+            break;
+        }
+        let Ok(entry) = entry else {
+            complete = false;
+            continue;
+        };
+        if entry.path().extension().is_none_or(|e| e != "desktop") {
+            continue;
+        }
+        let metadata = std::fs::symlink_metadata(entry.path());
+        if !metadata.is_ok_and(|m| m.is_file()) {
+            complete = false;
+            continue;
+        }
+        let Ok(text) = system_text(&entry.path(), 16384) else {
+            complete = false;
+            continue;
+        };
+        bytes += text.len();
+        if bytes > 16 * 1024 * 1024 {
+            complete = false;
+            break;
+        }
+        if visible_launcher(&text) {
+            visible.insert(entry.path().to_string_lossy().into_owned());
+        }
+    }
+    (visible, complete)
+}
 fn oldest_index() -> Option<String> {
     let directory = std::fs::read_dir("/var/lib/apt/lists").ok()?;
     let mut oldest = None;
-    for entry in directory.take(20001).flatten() {
+    for (index, entry) in directory.enumerate() {
+        if index >= 20000 {
+            return None;
+        }
+        let entry = entry.ok()?;
         if !entry.file_name().to_string_lossy().contains("_Packages") {
             continue;
         }
@@ -235,37 +278,21 @@ pub fn collect(tools: &impl Tools, report_id: &str, now: &str) -> Result<Value, 
         return Ok(scan);
     };
     scan["inventoryComplete"] = json!(true);
-    let mut visible = std::collections::BTreeSet::new();
+    let (visible, desktops_complete) =
+        desktop_evidence(std::path::Path::new("/usr/share/applications"));
     let owners = tools.text(
         "/usr/bin/dpkg-query",
         &["--search", "/usr/share/applications/*.desktop"],
         1024 * 1024,
     );
-    if let Ok(directory) = std::fs::read_dir("/usr/share/applications") {
-        let mut bytes = 0;
-        for entry in directory.take(10001).flatten() {
-            if entry.path().extension().is_none_or(|e| e != "desktop") {
-                continue;
-            }
-            if std::fs::symlink_metadata(entry.path()).is_ok_and(|m| m.is_file())
-                && let Ok(text) = system_text(&entry.path(), 16384)
-            {
-                bytes += text.len();
-                if bytes > 16 * 1024 * 1024 {
-                    break;
-                }
-                if visible_launcher(&text) {
-                    visible.insert(entry.path().to_string_lossy().into_owned());
-                }
-            }
-        }
-    }
     let launchers = owners
         .as_ref()
         .map(|text| desktop_owners(text, &visible))
         .unwrap_or_default();
-    if owners.is_ok() {
+    if owners.is_ok() && desktops_complete {
         scan["applicationIdentification"] = json!("available");
+    } else {
+        scan["coverage"].as_array_mut().unwrap().push(json!("Graphical application identification is partial: launcher files or ownership evidence were unavailable, unreadable or exceeded collection limits."));
     }
     let held = tools
         .text(
@@ -389,6 +416,21 @@ mod tests {
         fn sha256(&self, _: &[u8]) -> Result<String, String> {
             Ok("a".repeat(64))
         }
+    }
+    #[test]
+    fn application_coverage_is_partial_for_missing_or_oversized_desktop_evidence() {
+        let root = std::env::temp_dir().join(format!("inventory-desktop-{}", std::process::id()));
+        assert!(!desktop_evidence(&root).1);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("valid.desktop"),
+            "[Desktop Entry]\nType=Application\n",
+        )
+        .unwrap();
+        assert!(desktop_evidence(&root).1);
+        std::fs::write(root.join("oversized.desktop"), "x".repeat(16385)).unwrap();
+        assert!(!desktop_evidence(&root).1);
+        std::fs::remove_dir_all(root).unwrap();
     }
     #[test]
     fn collection_keeps_installed_inventory_and_reports_cached_hold_without_false_currency() {

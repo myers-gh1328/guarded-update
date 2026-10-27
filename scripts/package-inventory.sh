@@ -34,4 +34,4 @@ if command -v sha256sum >/dev/null; then
 else
   (cd "$output" && shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256")
 fi
-tar -tzf "$output/$name.tar.gz" | grep -q "/command-center-inventory$"
+tar -tzf "$output/$name.tar.gz" | grep "/command-center-inventory$" >/dev/null
