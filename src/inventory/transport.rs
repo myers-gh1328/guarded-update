@@ -142,6 +142,35 @@ pub struct Response {
     pub body: Value,
     pub retry_after: u64,
 }
+fn request_config(
+    config: &Config,
+    path: &str,
+    body: &str,
+    now: u64,
+    nonce: &str,
+    digest: &str,
+    signature: &str,
+) -> Result<String, String> {
+    let mut request = format!(
+        "url = {}\nrequest = \"POST\"\n",
+        quote(&format!("{}{path}", config.server_url))?
+    );
+    for header in [
+        "Content-Type: application/json".to_owned(),
+        "Expect:".to_owned(),
+        format!("x-device-id: {}", config.device_id),
+        format!("x-device-enrollment: {}", config.enrollment_id),
+        format!("x-device-key-id: {}", config.key_id),
+        format!("x-device-timestamp: {now}"),
+        format!("x-device-nonce: {nonce}"),
+        format!("x-device-signature: {signature}"),
+        format!("x-device-body-sha256: {digest}"),
+    ] {
+        request.push_str(&format!("header = {}\n", quote(&header)?));
+    }
+    request.push_str(&format!("data-binary = {}\n", quote(body)?));
+    Ok(request)
+}
 pub fn post(config: &Config, path: &str, body: &str, now: u64) -> Result<Response, String> {
     if !matches!(
         path,
@@ -174,23 +203,7 @@ pub fn post(config: &Config, path: &str, body: &str, now: u64) -> Result<Respons
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect::<String>();
-    let mut request = format!(
-        "url = {}\nrequest = \"POST\"\n",
-        quote(&format!("{}{path}", config.server_url))?
-    );
-    for header in [
-        "Content-Type: application/json".to_owned(),
-        "Expect:".to_owned(),
-        format!("x-device-id: {}", config.device_id),
-        format!("x-device-enrollment: {}", config.enrollment_id),
-        format!("x-device-key-id: {}", config.key_id),
-        format!("x-device-timestamp: {now}"),
-        format!("x-device-nonce: {nonce}"),
-        format!("x-device-signature: {signature}"),
-    ] {
-        request.push_str(&format!("header = {}\n", quote(&header)?));
-    }
-    request.push_str(&format!("data-binary = {}\n", quote(body)?));
+    let request = request_config(config, path, body, now, &nonce, &digest, &signature)?;
     let output = SystemTools.run(
         "/usr/bin/curl",
         &[
@@ -256,6 +269,43 @@ mod tests {
                 "digest"
             ),
             "command-center-inventory-v1\nhost\nepoch\nkey\nPOST\n/api/agent/v1/inventory/check-ins\n10\nnonce\ndigest"
+        );
+    }
+    #[test]
+    fn wire_admission_digest_matches_the_signed_exact_request_body() {
+        let body = "{\"a\":1}";
+        let digest = SystemTools.sha256(body.as_bytes()).unwrap();
+        let config = Config {
+            schema_version: 1,
+            server_url: "https://example.test".into(),
+            device_id: "device".into(),
+            enrollment_id: "epoch".into(),
+            key_id: "key".into(),
+            reporting_private_key_file: "/unused".into(),
+            state_dir: "/unused".into(),
+        };
+        let request = request_config(
+            &config,
+            "/api/agent/v1/inventory/check-ins",
+            body,
+            10,
+            "nonce",
+            &digest,
+            "signature",
+        )
+        .unwrap();
+        assert!(request.contains(&format!("header = \"x-device-body-sha256: {digest}\"\n")));
+        assert!(
+            canonical(
+                "device",
+                "epoch",
+                "key",
+                "/api/agent/v1/inventory/check-ins",
+                10,
+                "nonce",
+                &digest
+            )
+            .ends_with(&digest)
         );
     }
     #[test]

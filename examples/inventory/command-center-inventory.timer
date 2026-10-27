@@ -1,0 +1,13 @@
+# Inactive example: installation never enables the timer automatically.
+[Unit]
+Description=Check in and deliver latest inventory every five minutes
+
+[Timer]
+OnBootSec=30s
+OnUnitInactiveSec=300s
+RandomizedDelaySec=30s
+AccuracySec=15s
+Unit=command-center-inventory.service
+
+[Install]
+WantedBy=timers.target
