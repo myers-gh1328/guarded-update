@@ -606,3 +606,29 @@ The disposable native proof tests actual separate reporter UID permissions and
 inbox→journal→job→opened→root grant→released I/O with the real cache/native
 session. Observation process containment and independent guardian remain separate
 unactivated integration gates.
+
+### Fixed observation processes (not activated)
+
+The observation entry source is copied to two fixed root-owned entry scripts,
+`observation-guardian.py` and `observation-native.py`. The parent must admit the
+entry and its ancestry before PID1 executes it. The isolated bootstrap admits
+and compiles every fixed project module before executing any project bytes;
+project search paths, adjacent packages and bytecode caches are not used.
+Provisioning must drain helpers before replacing this root-owned source bundle.
+
+The guardian requires only KILL/SETPCAP capabilities and supervises the job's
+absolute BOOTTIME deadline independently of the native reader. Its fixed child
+retains numeric root identity with all five capability sets empty and
+NoNewPrivileges enabled. The native reader has a lease-only cache interface,
+performs no account lookups, and accepts release only through the root channel.
+It unwinds native/cache ownership before exposing failure metadata and does not
+contradict a possibly visible release following an uncertain write.
+
+The disposable process proof uses masked `/etc`, `/var/lib` and `/run`, with
+explicit native-state/private-channel bindings. It checks actual child identity,
+capabilities, masked policy/coordinator paths, release and whole-cgroup cleanup.
+A trusted root reader is not a malicious-code isolation boundary against other
+root processes. Full filesystem write-denial, stopped-reader deadline, durable
+parent restart, actual key-location coverage and target repository/resource fit
+remain separate gates. These source files install or enable no service, timer,
+account or reporting capability.
