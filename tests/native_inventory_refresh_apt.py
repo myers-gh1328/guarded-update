@@ -877,12 +877,13 @@ assert all(fields[key].split()==['60002']*4 for key in ('Uid','Gid'))
 assert fields['Groups'].split() in ([],['60002']) and fields['NoNewPrivs'].split()==['1']
 assert all(int(fields[key].strip(),16)==0 for key in ('CapInh','CapPrm','CapEff','CapBnd','CapAmb'))
 assert open('/proc/self/cgroup').read()=='0::/command.slice/command-center.slice/command-center-inventory.slice/command-center-inventory-reader-proof.service\n'
+stage='private_inputs'
 for path in ('/etc/command-center-inventory-refresh/policy.json','/etc/command-center-inventory-refresh/policy-commitment.key','/etc/command-center-inventory-refresh/apt/auth.conf'):
  try:fd=os.open(path,os.O_RDONLY|os.O_NOFOLLOW)
  except PermissionError:pass
  else:
   os.close(fd);raise ValueError('Root private reader boundary failed')
-fds=[];lease=None
+stage='generation';fds=[];lease=None
 try:
  fd=os.open('/',os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW);fds.append(fd)
  for part in ('var','cache','command-center-inventory-refresh','generation-'+sys.argv[1]):
@@ -903,19 +904,25 @@ try:
  lease=os.open('_inventory-lease',os.O_RDONLY|os.O_NOFOLLOW,dir_fd=generation)
  info=os.fstat(lease);assert stat.S_ISREG(info.st_mode) and info.st_uid==0 and not info.st_mode&0o022 and info.st_nlink==1 and info.st_dev==device
  fcntl.flock(lease,fcntl.LOCK_SH|fcntl.LOCK_NB)
+ stage='manifest'
  manifest=json.loads(read(generation,'_inventory-manifest.json',4*1024*1024))
  assert manifest['cache_generation']==sys.argv[1] and manifest['policy_generation']==sys.argv[2]
  reader=os.open('_inventory-reader',os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW,dir_fd=generation);fds.append(reader)
  info=os.fstat(reader);assert info.st_uid==0 and not info.st_mode&0o022 and info.st_dev==device
+ stage='config'
  for name in ('apt.conf','sources.sources','preferences','empty-main.conf','empty-trusted.gpg','empty-auth.conf'):
   raw=read(reader,name,4*1024*1024);rows=[row for row in manifest['files'] if row['path']=='_inventory-reader/'+name]
   assert len(rows)==1 and rows[0]['sha256']==hashlib.sha256(raw).hexdigest() and rows[0]['size']==len(raw)
   assert b'synthetic-proof-password' not in raw and b'password ' not in raw
  config='/var/cache/command-center-inventory-refresh/generation-'+sys.argv[1]+'/_inventory-reader/apt.conf'
  env={'PATH':'/usr/sbin:/usr/bin:/sbin:/bin','LC_ALL':'C','LANG':'C','APT_CONFIG':config}
+ stage='query'
  result=subprocess.run(['/usr/bin/apt-cache','policy','inventory-proof'],env=env,cwd='/',stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,timeout=10)
+ stage='query_result'
  assert result.returncode==0 and len(result.stdout)<=65536
+ stage='candidate'
  assert re.search(rb'(?m)^\s*Candidate: 1\.0\s*$',result.stdout)
+ stage='pin'
  assert re.search(rb'(?m)^\s*(?:\*\*\*\s+)?1\.0\s+123\s*$',result.stdout)
 finally:
  try:
@@ -923,6 +930,11 @@ finally:
  finally:
   for fd in reversed(fds):os.close(fd)
 """
+
+
+def projected_reader_program():
+    # Controlled stage/kind only: no exception text, APT output or policy bytes.
+    return "import json,sys\nstage='identity'\ntry:\n"+''.join(' '+line+'\n' for line in PROJECTED_READER_CODE.splitlines())+"except BaseException as error:\n allowed=('identity','private_inputs','generation','manifest','config','query','query_result','candidate','pin')\n kind=type(error).__name__\n print('projected_reader_failure='+json.dumps({'stage':stage if stage in allowed else 'unknown','kind':kind if kind in ('AssertionError','OSError','ValueError','PermissionError','FileNotFoundError','TimeoutExpired') else 'unclassified'},sort_keys=True),file=sys.stderr)\n raise SystemExit(74)\n"
 
 
 def prove_projected_reader_query(offer):
@@ -934,9 +946,11 @@ def prove_projected_reader_query(offer):
         'MemoryAccounting=yes','TasksMax=8','NoNewPrivileges=yes','CapabilityBoundingSet=','AmbientCapabilities=',
         'ProtectSystem=strict','ProtectHome=yes','ProtectControlGroups=yes','PrivateDevices=yes','PrivateTmp=yes','PrivateNetwork=yes'):
         args+=['-p',value]
-    args+=['/usr/bin/python3','-I','-B','-S','-c',PROJECTED_READER_CODE,offer['cache_generation'],offer['policy_generation']]
-    result=subprocess.run(args,env=ENV,stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=20)
-    assert result.returncode==0,'Projected native candidate/pin or private-policy boundary failed'
+    args+=['/usr/bin/python3','-I','-B','-S','-c',projected_reader_program(),offer['cache_generation'],offer['policy_generation']]
+    result=subprocess.run(args,env=ENV,stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.PIPE,timeout=20)
+    if result.returncode:
+        lines=[line.decode('ascii') for line in result.stderr.splitlines() if line.startswith(b'projected_reader_failure=') and len(line)<=256]
+        raise ValueError('Projected native reader failed: '+str(result.returncode)+' '+(' '.join(lines[:1])))
     return True
 
 def prove_actual_coordinator_entry_loop():

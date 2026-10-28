@@ -1,5 +1,6 @@
 """Run the native proof's actual synthetic actor without root or real writes."""
 import ast
+import contextlib
 import io
 import stat
 import re
@@ -94,6 +95,17 @@ class PublisherHarnessTests(unittest.TestCase):
             isinstance(node.test,ast.Compare) and isinstance(node.test.comparators[0],ast.Constant) and
             isinstance(node.test.comparators[0].value,str) and node.test.comparators[0].value.startswith('0::/')]
         self.assertEqual(len(cgroups),1);self.assertTrue(cgroups[0].value.endswith('\n'))
+
+    def test_native_reader_diagnostic_keeps_only_static_stage_and_kind(self):
+        tree=ast.parse((Path(__file__).parent/'native_inventory_refresh_apt.py').read_bytes())
+        factory=next(node for node in tree.body if isinstance(node,ast.FunctionDef) and node.name=='projected_reader_program')
+        scope={'PROJECTED_READER_CODE':"private='synthetic-private-value';raise ValueError(private)"}
+        exec(compile(ast.Module(body=[factory],type_ignores=[]),'<reader-diagnostics>','exec'),scope)
+        output=io.StringIO()
+        with contextlib.redirect_stderr(output):
+            with self.assertRaises(SystemExit) as result:exec(compile(scope['projected_reader_program'](),'<native-reader>','exec'),{})
+        self.assertEqual(result.exception.code,74);self.assertNotIn('synthetic-private-value',output.getvalue())
+        self.assertIn('"stage": "identity"',output.getvalue());self.assertIn('"kind": "ValueError"',output.getvalue())
 
 
 if __name__=='__main__':unittest.main()
