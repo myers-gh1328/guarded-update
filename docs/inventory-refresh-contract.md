@@ -38,11 +38,14 @@ starting. Re-delivery of the exact active/last-terminal correlator returns exist
 state. A correlator at/below the high-water mark that is no longer retained returns
 `state_inconsistent` without starting work. Thus bounded retention cannot reopen
 an old operation. A different correlator during started work returns `busy`; it never replaces
-started or uncertain work. A received/deferred operation that has durably never
-started may be explicitly abandoned by a higher correlator, retaining its failed
-not-started record; this lets an expired unstarted request stop blocking the next
-request. Retrying the same deferred operation preserves its original acceptance
-and identity. A deferred refresh does not block coherent cached observation.
+started or uncertain work. A received operation that has durably never started may be explicitly abandoned
+by a higher correlator, retaining its failed not-started record. A completed
+no-work deferral instead retains its entire original Deferred phase, reason,
+boot/acceptance/policy and decision endpoint unchanged when replaced. Duplicate
+redelivery returns that same decision and can never start that physical nonce.
+Retrying the same logical controller request requires a fresh higher local helper
+correlator after canonical no-work acknowledgement; its original logical expiry
+and request identity remain unchanged. A deferred refresh does not block coherent cached observation.
 Only a release with the exact running observation's nonce/boot/policy may join
 that observation to close its locks. Missing/reset durable helper counters require explicit
 operator recovery, not silent initialization. A 15-minute monotonic minimum interval applies to actual refresh
@@ -390,3 +393,37 @@ cannot claim the same observation nonce simultaneously.
 This builder validates public data; it does not infer lifecycle outcomes or
 attest OS/cache evidence. The root coordinator must still derive each value from
 its durable journal, pinned policy/cache, native handles and confirmed publication.
+
+## Durable no-work decisions
+
+The private bounded operation record includes `decision_boottime_ms`. Deferring
+known unstarted work persists an explicit same-boot decision endpoint before
+returning no-work evidence. The endpoint is separate from actual work finish:
+`started_boottime_ms` and `finished_boottime_ms` remain null. A minimum-interval
+decision follows the same rule. Repeated calls cannot change the reason, policy,
+identity or time, and that nonce is permanently barred from starting later.
+
+Only a fresh helper correlator can request a later physical attempt. Replacing a
+known no-work record preserves it as Deferred in last-terminal metadata; oldnonce
+replay returns its original decision, and replay after bounded pruning is stale.
+No timestamp is synthesized from status polling. The public coordinator can map a
+persisted Deferred decision endpoint to its no-work attempt endpoint, matching the
+agent's existing no-work acknowledgement/retry contract. This does not describe
+an actual native process finish.
+
+The private helper format remains staged and unactivated. Incompatible or missing
+state fails closed; this change does not reset, migrate or reseed device counters.
+
+A newly opened journal handle must pass an explicit durability reconciliation
+before snapshots, mutation or public status publication. Every private state save
+re-arms this guard before writing and clears it only after the file, replacement,
+directory sync and owned-temporary cleanup succeed. A failed sync can leave new
+bytes visible; visibility alone is not a durable no-work acknowledgement.
+
+Reconciliation holds the root control lock, validates the exact no-follow control
+file and epoch, checks descriptor/named metadata continuity, syncs that same file
+and its private directory, then closes the descriptor before clearing uncertainty.
+If prior started work exists, marking it Unconfirmed is another guarded durable
+save. Parse, sync or cleanup failure leaves snapshots/starts/publication blocked.
+This neither initializes missing state nor retries native work. Reporting and
+retained inventory uploads remain independent of helper availability.

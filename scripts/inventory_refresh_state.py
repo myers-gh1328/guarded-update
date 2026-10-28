@@ -23,11 +23,16 @@ REASONS = {'busy', 'package_manager_busy', 'executor_busy', 'minimum_interval',
            'state_inconsistent', 'invalid_request', 'lease_expired', 'internal_error'}
 OP_FIELDS = {'correlator', 'helper_sequence', 'boot_id', 'accepted_boottime_ms',
              'started_boottime_ms', 'finished_boottime_ms', 'policy_generation',
-             'cache_generation', 'phase', 'reason'}
+             'cache_generation', 'phase', 'reason', 'decision_boottime_ms'}
 
 
 def encoded(value):
     return json.dumps(value, sort_keys=True, separators=(',', ':')).encode('ascii')
+
+
+def metadata_identity(info):
+    return (info.st_dev,info.st_ino,info.st_mode,info.st_uid,info.st_gid,
+            info.st_nlink,info.st_size,info.st_mtime_ns,info.st_ctime_ns)
 
 
 def hexadecimal(value, size):
@@ -53,13 +58,15 @@ def operation(value):
     accepted = value['accepted_boottime_ms']
     started = value['started_boottime_ms']
     finished = value['finished_boottime_ms']
+    decision = value['decision_boottime_ms']
     if (not safe_integer(value['helper_sequence']) or value['helper_sequence'] != sequence or
             not boot(value['boot_id']) or not safe_integer(accepted) or
             not hexadecimal(value['policy_generation'], 64) or
             value['reason'] is not None and (type(value['reason']) is not str or value['reason'] not in REASONS) or
             value['cache_generation'] is not None and not hexadecimal(value['cache_generation'], 32) or
             started is not None and (not safe_integer(started) or started < accepted) or
-            finished is not None and (not safe_integer(finished) or finished < (started or accepted))):
+            finished is not None and (not safe_integer(finished) or finished < (started or accepted)) or
+            decision is not None and (not safe_integer(decision) or decision < accepted)):
         raise ValueError('Invalid helper operation values')
     if type(value['phase']) is not str or value['phase'] not in {'received', 'running', 'succeeded', 'deferred', 'failed', 'unconfirmed'}:
         raise ValueError('Invalid helper operation phase')
@@ -70,6 +77,8 @@ def operation(value):
         raise ValueError('Invalid running helper operation')
     if value['phase'] in ['received', 'deferred'] and (started is not None or finished is not None):
         raise ValueError('Unstarted helper phase contains execution evidence')
+    if (value['phase'] == 'deferred') != (decision is not None):
+        raise ValueError('No-work decision requires its immutable deferred phase')
     return value
 
 
@@ -82,12 +91,14 @@ class Journal:
         self.fd = directory_fd
         self.owner = owner
         self._held = False
+        self._needs_reconciliation = True
 
     def _check(self, fd):
         value = os.fstat(fd)
         if (not stat.S_ISREG(value.st_mode) or value.st_uid != self.owner or
                 value.st_mode & 0o077 or value.st_nlink != 1 or value.st_size > LIMIT):
             raise ValueError('Helper metadata requires a bounded private single-link file')
+        return value
 
     @contextmanager
     def exclusive(self):
@@ -107,9 +118,31 @@ class Journal:
             self._held = False
             os.close(fd)
 
-    def _locked(self):
+    def _held_lock(self):
         if not self._held:
             raise ValueError('Helper metadata changes require its fixed root lock')
+
+    def _ready(self):
+        if self._needs_reconciliation:
+            raise ValueError('Helper durable state requires explicit reconciliation')
+
+    def _locked(self):
+        self._held_lock()
+        self._ready()
+
+    def _read_descriptor(self, fd):
+        before=self._check(fd)
+        result=bytearray()
+        while len(result)<=LIMIT:
+            chunk=os.read(fd,min(65536,LIMIT+1-len(result)))
+            if not chunk:
+                break
+            result.extend(chunk)
+        after=self._check(fd)
+        if (len(result)>LIMIT or len(result)!=before.st_size or
+                metadata_identity(before)!=metadata_identity(after)):
+            raise ValueError('Helper metadata changed or exceeded bounds during read')
+        return bytes(result),after
 
     def _read(self, entry):
         try:
@@ -117,52 +150,63 @@ class Journal:
         except OSError:
             raise ValueError('Helper durable state missing or unsafe; explicit recovery required') from None
         try:
-            self._check(fd)
-            result = bytearray()
-            while len(result) <= LIMIT:
-                data = os.read(fd, min(65536, LIMIT+1-len(result)))
-                if not data:
-                    break
-                result.extend(data)
-            if len(result) > LIMIT:
-                raise ValueError('Helper metadata exceeds bounds')
-            return bytes(result)
+            return self._read_descriptor(fd)[0]
         finally:
             os.close(fd)
+
+    def _write_descriptor(self, fd, data):
+        offset=0
+        while offset<len(data):
+            written=os.write(fd,data[offset:])
+            if written<=0:
+                raise OSError('Helper metadata write made no progress')
+            offset+=written
+        os.fchown(fd,self.owner,-1)
+        os.fchmod(fd,0o600)
+        os.fsync(fd)
 
     def _new(self, entry, data):
         fd = os.open(entry, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
                      0o600, dir_fd=self.fd)
         try:
-            offset = 0
-            while offset < len(data):
-                offset += os.write(fd, data[offset:])
-            os.fchown(fd, self.owner, -1)
-            os.fchmod(fd, 0o600)
-            os.fsync(fd)
+            self._write_descriptor(fd,data)
         finally:
             os.close(fd)
 
     def _save(self, value):
-        self._locked()
+        self._held_lock()
         self._validate(value)
-        data = encoded(value)
-        if len(data) > LIMIT:
+        data=encoded(value)
+        if len(data)>LIMIT:
             raise ValueError('Helper journal exceeds bounds')
-        entry = '.control-'+secrets.token_hex(16)
+        self._needs_reconciliation=True
+        entry='.control-'+secrets.token_hex(16)
+        fd=None
+        created=False
         try:
-            self._new(entry, data)
-            os.replace(entry, 'control.json', src_dir_fd=self.fd, dst_dir_fd=self.fd)
+            fd=os.open(entry,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600,dir_fd=self.fd)
+            created=True
+            self._write_descriptor(fd,data)
+            closing,fd=fd,None
+            os.close(closing)
+            os.replace(entry,'control.json',src_dir_fd=self.fd,dst_dir_fd=self.fd)
             os.fsync(self.fd)
         finally:
             try:
-                os.unlink(entry, dir_fd=self.fd)
-            except FileNotFoundError:
-                pass
+                if fd is not None:
+                    closing,fd=fd,None
+                    os.close(closing)
+            finally:
+                if created:
+                    try:
+                        os.unlink(entry,dir_fd=self.fd)
+                    except FileNotFoundError:
+                        pass
+        self._needs_reconciliation=False
 
     def initialize(self, epoch):
         """Explicit inactive provisioning only. Runtime never calls this method."""
-        self._locked()
+        self._held_lock()
         if not hexadecimal(epoch, 32):
             raise ValueError('Invalid helper journal epoch')
         for entry in ['initialized-epoch', 'control.json']:
@@ -202,13 +246,16 @@ class Journal:
                     record = operation(state[key])
                     if record['helper_sequence'] > state['high_water']:
                         raise ValueError('Helper journal high-water mark is inconsistent')
-                    phases = ['succeeded', 'failed'] if key == 'terminal' else ['received', 'deferred', 'running', 'unconfirmed']
+                    phases = ['succeeded', 'failed', 'deferred'] if key == 'terminal' else ['received', 'deferred', 'running', 'unconfirmed']
                     if record['phase'] not in phases:
                         raise ValueError('Helper journal phase is inconsistent')
         return value
 
     def snapshot(self):
-        marker = self._read('initialized-epoch')
+        self._ready()
+        return self._decode_snapshot(self._read('initialized-epoch'),self._read('control.json'))
+
+    def _decode_snapshot(self, marker, raw):
         if len(marker) != 32:
             raise ValueError('Helper initialized marker is invalid')
         def unique(pairs):
@@ -219,7 +266,7 @@ class Journal:
                 result[key] = value
             return result
         try:
-            value = json.loads(self._read('control.json'), object_pairs_hook=unique)
+            value = json.loads(raw, object_pairs_hook=unique)
             self._validate(value)
             if value['epoch'].encode('ascii') != marker:
                 raise ValueError('Helper initialization identity mismatch')
@@ -228,8 +275,29 @@ class Journal:
             raise ValueError('Malformed helper journal requires explicit recovery') from None
 
     def startup_ready(self):
-        self._locked()
-        value = self.snapshot()
+        self._held_lock()
+        self._needs_reconciliation=True
+        fd=None
+        try:
+            marker=self._read('initialized-epoch')
+            fd=os.open('control.json',os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK,dir_fd=self.fd)
+            raw,before=self._read_descriptor(fd)
+            value=self._decode_snapshot(marker,raw)
+            named=os.stat('control.json',dir_fd=self.fd,follow_symlinks=False)
+            if metadata_identity(before)!=metadata_identity(named):
+                raise ValueError('Helper control reference changed before durability barrier')
+            os.fsync(fd)
+            os.fsync(self.fd)
+            after=self._check(fd)
+            named=os.stat('control.json',dir_fd=self.fd,follow_symlinks=False)
+            if (metadata_identity(before)!=metadata_identity(after) or
+                    metadata_identity(after)!=metadata_identity(named) or self._read('initialized-epoch')!=marker):
+                raise ValueError('Helper control reference changed during durability barrier')
+        finally:
+            if fd is not None:
+                closing,fd=fd,None
+                os.close(closing)
+        self._needs_reconciliation=False
         unresolved = any(state['active'] is not None and state['active']['started_boottime_ms'] is not None
                          for state in value['capabilities'].values())
         if unresolved and not value['unconfirmed']:
@@ -266,18 +334,21 @@ class Journal:
                for item in value['capabilities'].values()) and not releasing:
             return 'busy'
         if decision == 'busy':
-            if active is None or active['started_boottime_ms'] is not None or sequence <= state['high_water']:
+            if (active is None or active['started_boottime_ms'] is not None or
+                    active['phase'] not in ['received','deferred'] or sequence <= state['high_water']):
                 return 'busy'
-            # A higher correlator explicitly abandons only proven never-started work.
-            active['phase'] = 'failed'
-            active['reason'] = 'state_inconsistent'
-            active['finished_boottime_ms'] = now if boot_id == active['boot_id'] and now >= active['accepted_boottime_ms'] else None
+            # A completed no-work decision remains byte-for-byte immutable.
+            # Only an unacknowledged received record needs an abandonment outcome.
+            if active['phase'] != 'deferred':
+                active['phase'] = 'failed'
+                active['reason'] = 'state_inconsistent'
+                active['finished_boottime_ms'] = now if boot_id == active['boot_id'] and now >= active['accepted_boottime_ms'] else None
             state['terminal'] = active
         state['high_water'] = sequence
         state['active'] = {'correlator': incoming, 'helper_sequence': sequence,
             'boot_id': boot_id, 'accepted_boottime_ms': now, 'started_boottime_ms': None,
             'finished_boottime_ms': None, 'policy_generation': policy, 'cache_generation': None,
-            'phase': 'received', 'reason': None}
+            'phase': 'received', 'reason': None, 'decision_boottime_ms': None}
         self._save(value)
         return 'new'
 
@@ -290,8 +361,10 @@ class Journal:
         if (record is None or record['correlator'] != incoming or record['boot_id'] != boot_id or
                 record['policy_generation'] != policy or not safe_integer(now) or now < record['accepted_boottime_ms']):
             raise ValueError('Helper start does not match its accepted operation')
-        if record['started_boottime_ms'] is not None:
+        if record['started_boottime_ms'] is not None or record['decision_boottime_ms'] is not None:
             return False
+        if record['phase'] != 'received':
+            raise ValueError('Only a newly received helper attempt may start')
         for other, state in value['capabilities'].items():
             current = state['active']
             if other == capability or current is None or current['started_boottime_ms'] is None:
@@ -304,6 +377,7 @@ class Journal:
             if now < due:
                 record['phase'] = 'deferred'
                 record['reason'] = 'minimum_interval'
+                record['decision_boottime_ms'] = now
                 self._save(value)
                 return False
         record['started_boottime_ms'] = now
@@ -315,17 +389,21 @@ class Journal:
         self._save(value)
         return True
 
-    def defer(self, capability, incoming, boot_id, reason):
+    def defer(self, capability, incoming, boot_id, reason, *, now):
         self._locked()
         value = self.snapshot()
         if capability not in CAPABILITIES or type(reason) is not str or reason not in REASONS or value['unconfirmed']:
             raise ValueError('Invalid helper deferral')
         record = value['capabilities'][capability]['active']
         if (record is None or record['correlator'] != incoming or record['boot_id'] != boot_id or
-                record['started_boottime_ms'] is not None):
-            raise ValueError('Started work cannot be deferred and re-executed')
+                record['started_boottime_ms'] is not None or not safe_integer(now) or
+                now < record['accepted_boottime_ms'] or record['phase'] not in ['received','deferred']):
+            raise ValueError('Started or unknown work cannot be deferred and re-executed')
+        if record['decision_boottime_ms'] is not None:
+            return
         record['phase'] = 'deferred'
         record['reason'] = reason
+        record['decision_boottime_ms'] = now
         self._save(value)
 
     def finish(self, capability, incoming, boot_id, now, phase, reason=None, cache=None, policy=None):
@@ -347,7 +425,7 @@ class Journal:
                 return
             raise ValueError('Helper terminal outcome conflicts with durable metadata')
         if (record['correlator'] != incoming or record['boot_id'] != boot_id or
-                not safe_integer(now) or now < (record['started_boottime_ms'] or record['accepted_boottime_ms'])):
+                record['decision_boottime_ms'] is not None or not safe_integer(now) or now < (record['started_boottime_ms'] or record['accepted_boottime_ms'])):
             raise ValueError('Helper outcome does not match its accepted operation')
         if phase == 'succeeded' and record['policy_generation'] != policy:
             raise ValueError('Published generation policy does not match the accepted operation')
