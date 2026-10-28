@@ -13,6 +13,17 @@ SPEC.loader.exec_module(native)
 
 
 class NativeRefreshFixtureTests(unittest.TestCase):
+    def test_fault_probe_requires_a_live_matching_nonroot_kernel_identity(self):
+        valid=('Uid:\t60001\t60001\t60001\t60001\n'
+               'Gid:\t60001\t60001\t60001\t60001\nGroups:\t\n'
+               'CapInh:\t0000000000000000\nCapPrm:\t0000000000000000\n'
+               'CapEff:\t0000000000000000\nCapBnd:\t0000000000000000\n'
+               'CapAmb:\t0000000000000000\nNoNewPrivs:\t1\nState:\tS (sleeping)\n').encode()
+        self.assertTrue(native.is_live_worker(valid))
+        self.assertFalse(native.is_live_worker(valid.replace(b'60001\n',b'0\n',1)))
+        self.assertFalse(native.is_live_worker(valid.replace(b'S (sleeping)',b'Z (zombie)')))
+        self.assertFalse(native.is_live_worker(b'Uid: 60001'))
+
     def test_multiple_rejected_workers_do_not_reuse_a_retained_failed_unit(self):
         # systemd retains failed transient units by default. Stopping the unit and
         # proving an empty cgroup does not grant reuse of that retained name.

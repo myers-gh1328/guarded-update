@@ -30,6 +30,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT/'scripts'))
 from inventory_refresh_policy import parse_policy, render_policy, policy_generation, POLICY_ROOT, CACHE_ROOT, RUNTIME_ROOT
 from inventory_refresh_storage import Store
+from inventory_refresh_worker import validate_kernel_identity
+from inventory_refresh_guardian import worker_argv
 
 WORKER = 60001
 READER = 60002
@@ -146,6 +148,30 @@ def write_root(path, data, mode=0o640):
     os.chown(temporary, 0, WORKER)
     temporary.chmod(mode)
     temporary.replace(path)
+
+
+def is_live_worker(raw):
+    try:
+        validate_kernel_identity(raw,WORKER,WORKER)
+        states=[line.split(b':',1)[1].strip() for line in raw.splitlines() if line.startswith(b'State:')]
+        return len(states)==1 and not states[0].startswith((b'Z',b'X',b'x'))
+    except ValueError:
+        return False
+
+
+def prove_privilege_transition():
+    # Disposable CI ONLY. Read current-process credentials; no signals, service
+    # property changes, package operations or live-device invocation.
+    assert sys.platform=='linux' and os.geteuid()==0 and os.environ.get('GITHUB_ACTIONS')=='true'
+    code="import sys;sys.stdout.buffer.write(open('/proc/self/status','rb').read(65537))"
+    fixed=list(worker_argv(WORKER,WORKER)[:-1])+['-c',code]
+    args=['/usr/bin/systemd-run','--quiet','--wait','--collect','--pipe',
+        '--unit=command-center-inventory-privilege-proof','--slice='+WORKER_SLICE,
+        '-p','User=root','-p','Group=root','-p','NoNewPrivileges=yes',
+        '-p','CapabilityBoundingSet=CAP_KILL CAP_SETUID CAP_SETGID CAP_SETPCAP']+fixed
+    result=subprocess.run(args,env=ENV,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,timeout=10)
+    assert result.returncode==0, 'Fixed privilege transition failed (no native output published)'
+    assert is_live_worker(result.stdout), 'Kernel privilege state rejected after fixed transition'
 
 
 def run_worker(policy, number):
@@ -308,8 +334,9 @@ def main():
         marker = Path(CACHE_ROOT)/('staging-'+f'{1:032x}')/'host-hook-ran'
         hook.write_text('APT::Update::Pre-Invoke { "/usr/bin/touch '+str(marker)+'"; };\n')
         good = policy()
+        prove_privilege_transition()
         status, stage, generation = run_worker(good, 1)
-        assert status == 0, 'Valid signed TLS/authenticated repository refresh failed'
+        assert status == 0, f'Valid signed TLS/authenticated repository refresh failed (exit={status})'
         assert Handler.requests > 0 and not marker.exists(), 'Host APT configuration leaked'
         lists = Path(CACHE_ROOT)/('staging-'+stage)/'lists'
         assert any('_Packages' in path.name for path in lists.iterdir()), 'No binary package index was acquired'
