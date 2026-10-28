@@ -1121,3 +1121,20 @@ worker collision and resource bounds. Native candidate/pin and config-loading
 behavior must pass under the restricted reader identity before any freshness claim.
 The executable reporting client remains disconnected from this projection until
 its native scan/receipt and durable lifecycle integration passes.
+
+### Shared installed-state data fingerprint
+
+`installed_fingerprint` exposes the unchanged bounded v1 dpkg status/arch/updates
+hash for a borrowed admitted directory. It acquires no package/executor lock,
+changes no mutex and never closes the borrowed directory. A standalone hash can be
+computed without owning native locks; it is neither attestation nor coherence or
+freshness authority. The root `NativeReadLocks` wrapper still verifies its actual
+held descriptors before and after hashing and rechecks its deadline after final
+verification. Existing native lock ownership and exact digest framing remain
+unchanged.
+
+A future unprivileged collector must bracket the entire scan and both hashes with
+native boot-relative time, pin the exact generation, and require both hashes to
+match both final root receipt hashes with the entire interval inside confirmed
+lock coverage. No receipt, mismatch or uncertainty can become fresh evidence.
+This data seam alone does not enable a reporting capability.
