@@ -23,8 +23,38 @@ STAGES=frozenset(('admission','writers','native_probe','start','materialize','ma
     'publication_admission','failed_status','sealing','acceptance','final_status'))
 
 
+DIAGNOSTIC_MODULES=frozenset(name+'.py' for name in (
+    'inventory_refresh_transaction','inventory_refresh_worker_service','inventory_refresh_service',
+    'inventory_refresh_materializer','inventory_refresh_materialized_policy','inventory_refresh_policy_admission',
+    'inventory_refresh_policy','inventory_refresh_state','inventory_refresh_io','inventory_refresh_storage',
+    'inventory_refresh_resources','inventory_refresh_writer_exclusion','inventory_refresh_observation','worker'))
+DIAGNOSTIC_KINDS=frozenset(('ValueError','OSError','PermissionError','FileNotFoundError','NotADirectoryError',
+    'TimeoutExpired','PolicyError','ResourceError','ObservationError','IOErrorState','PublicationError'))
+
+
+def _diagnostics(error):
+    """Never inspect args, messages, locals or arbitrary source paths."""
+    result=[];seen=set()
+    for _ in range(4):
+        if not isinstance(error,BaseException) or id(error) in seen:break
+        seen.add(id(error));sites=[];frame=error.__traceback__
+        for _ in range(64):
+            if frame is None:break
+            name=os.path.basename(frame.tb_frame.f_code.co_filename)
+            if name in DIAGNOSTIC_MODULES and type(frame.tb_lineno) is int and 0<frame.tb_lineno<=65535:
+                sites.append({'module':name,'line':frame.tb_lineno})
+            frame=frame.tb_next
+        kind=type(error).__name__
+        number=getattr(error,'errno',None)
+        result.append({'kind':kind if kind in DIAGNOSTIC_KINDS else 'unclassified',
+            'errno':number if type(number) is int and 0<number<=4095 else None,'sites':sites[-4:]})
+        error=error.__cause__ if error.__cause__ is not None else error.__context__
+    return tuple(result)
+
+
 class TransactionError(ValueError):
-    def __init__(self,stage):
+    def __init__(self,stage,error=None):
+        self.diagnostics=_diagnostics(error)
         self.stage=stage if type(stage) is str and stage in STAGES else 'unknown'
         super().__init__('Inventory refresh transaction unconfirmed: '+self.stage)
 
@@ -109,7 +139,7 @@ class RefreshTransaction:
                 self._journal.finish('refresh',nonce,boot_id,finished,'succeeded',cache=manifest['cache_generation'],
                     policy=self._policy.generation,successful_checked_at=checked)
             stage='final_status';self._current(boot_id);return 'succeeded'
-        except BaseException:
+        except BaseException as error:
             # No error path regenerates a body, repeats work or infers rollback.
             try:
                 for owned in (native,prepared,service):
@@ -119,4 +149,4 @@ class RefreshTransaction:
             finally:
                 try:self._journal.fence_external()
                 except BaseException:pass
-            raise TransactionError(stage) from None
+            raise TransactionError(stage,error) from None

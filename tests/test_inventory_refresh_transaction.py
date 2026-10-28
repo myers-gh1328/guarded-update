@@ -13,7 +13,7 @@ from inventory_refresh_storage import Store
 from inventory_refresh_policy_admission import PolicyGuard
 from inventory_refresh_io import StatusPublisher
 from inventory_refresh_observation import ObservationError
-from inventory_refresh_transaction import RefreshTransaction
+from inventory_refresh_transaction import RefreshTransaction,TransactionError
 
 
 class RefreshTransactionTests(unittest.TestCase):
@@ -68,6 +68,61 @@ class RefreshTransactionTests(unittest.TestCase):
         self.assertIn('writers_empty',self.events[self.events.index('service_closed')+1:])
         self.assertEqual(self.transaction.refresh(self.nonce),'existing')
         self.service.launch.assert_called_once();self.preparer.prepare.assert_called_once()
+
+    def test_minimum_interval_retains_prior_cache_without_another_launch(self):
+        self.transaction.refresh(self.nonce)
+        success=self.journal.snapshot()['last_success']
+        second='0000000000000002'+'a'*16
+        self.assertEqual(self.transaction.refresh(second),'deferred')
+        decision=self.journal.snapshot()['capabilities']['refresh']['active']
+        self.assertEqual(decision['reason'],'minimum_interval')
+        self.assertIsNone(decision['started_boottime_ms'])
+        self.assertEqual(self.journal.snapshot()['last_success'],success)
+        public=json.loads((self.root/'status/status.json').read_bytes())
+        self.assertEqual(public['cache_generation'],success['attempt']['cache_generation'])
+        self.assertEqual(self.transaction.refresh(second),'existing')
+        self.assertEqual(self.journal.snapshot()['capabilities']['refresh']['active'],decision)
+        self.service.launch.assert_called_once();self.preparer.prepare.assert_called_once()
+
+    def test_visible_cache_pointer_without_durable_success_is_not_rolled_back_or_confirmed(self):
+        original=self.store.publish
+        def uncertain(*args):
+            original(*args)
+            raise OSError('synthetic post-promotion uncertainty')
+        self.store.publish=uncertain
+        with self.assertRaises(ValueError) as error:self.transaction.refresh(self.nonce)
+        self.assertEqual(error.exception.stage,'sealing')
+        self.assertTrue((self.root/'cache/current.json').exists())
+        value=self.journal.snapshot();self.assertTrue(value['unconfirmed']);self.assertIsNone(value['last_success'])
+        public=json.loads((self.root/'status/status.json').read_bytes())
+        self.assertNotEqual(public['phase'],'succeeded')
+        self.assertIsNone(public['cache_generation'])
+
+    def test_policy_change_after_service_exit_prevents_publication(self):
+        def change(*args,**kwargs):
+            (self.root/'policy/policy-commitment.key').write_bytes(b'x'*32)
+            return 0
+        self.service.wait.side_effect=change
+        with self.assertRaises(ValueError) as error:self.transaction.refresh(self.nonce)
+        self.assertEqual(error.exception.stage,'publication_admission')
+        self.assertTrue(self.journal.snapshot()['unconfirmed'])
+        self.assertFalse((self.root/'cache/current.json').exists())
+        self.assertIsNone(self.journal.snapshot()['last_success'])
+
+    def test_diagnostics_keep_only_fixed_source_sites_kinds_and_numeric_errno(self):
+        try:
+            try:
+                exec(compile("raise PermissionError(13,'synthetic-private-value')",'/synthetic-private-path/inventory_refresh_worker_service.py','exec'))
+            except PermissionError:
+                raise ValueError('another-synthetic-private-value') from None
+        except ValueError as error:
+            public=TransactionError('service_launch',error)
+        encoded=json.dumps(public.diagnostics)
+        self.assertIn('inventory_refresh_worker_service.py',encoded)
+        self.assertIn('PermissionError',encoded);self.assertIn('13',encoded)
+        for secret in ('synthetic-private-value','another-synthetic-private-value','synthetic-private-path'):
+            self.assertNotIn(secret,encoded);self.assertNotIn(secret,str(public))
+        self.assertLessEqual(len(public.diagnostics),4)
 
     def test_native_busy_defers_without_actual_start_or_worker(self):
         self.transaction._native_factory=Mock(side_effect=ObservationError('package_manager_busy'))
