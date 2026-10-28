@@ -262,3 +262,35 @@ Implementation references: [APT configuration loading order](https://manpages.de
 requires parts/main overrides in APT_CONFIG itself; [systemd resource control](https://www.freedesktop.org/software/systemd/man/257/systemd.resource-control.html)
 defines slice-wide memory accounting and MemoryMax. Actual enforcement remains a
 native hosted test requirement.
+
+## Hosted native evidence, 2026-10-28 UTC
+
+The native containment job succeeded for source
+`7942e88fc64386f9a00ac6bd392ac056e1bba5d2` in
+[CI run 40611107422](https://github.com/myers-gh1328/guarded-update/actions/runs/40611107422).
+The workflow later failed at the ARM artifact service upload after five request
+timeouts. Full CI remains a merge gate; the following evidence is scoped to the
+successful native job.
+
+The fixed worker acquired binary package indexes from a synthetic signed HTTPS
+repository with authentication. Wrong CA, signing key, authentication, expired
+metadata and any failed repository were rejected. Every rejection preserved the
+previous current generation. The host APT hook was excluded, host APT state stayed
+unchanged, and the owned worker cgroup was empty before publication.
+
+The separate storage proof enforced the 128 MiB tmpfs byte limit, 32,768 inode
+limit and 256 MiB cgroup memory limit. It covered separate-UID immutability,
+retained readers, open unlinked storage accounting and preservation of current
+state after resource failure. The synthetic APT workload's observed memory peak
+was 14,901,248 bytes. This does not establish actual target-repository capacity.
+
+Verified artifact SHA-256 values:
+
+| Artifact | SHA-256 |
+| --- | --- |
+| `native-refresh-apt-proof.json` | `d17bd61d7d61f3ca0e02e79b6ce81c0838d6bb1ea6e498b162846b51675d3c7b` |
+| `native-refresh-storage-proof.json` | `a1efc19c237fc27a1b09c98e23d618fda1e2298f24abf7bc176d378d40ce2045` |
+
+The proof does not exercise the root coordinator, observation lifecycle, reporter
+adapter or a real device's repositories. Those implementation and rollout gates
+remain open. No device capability was enabled by this evidence.
