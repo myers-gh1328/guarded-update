@@ -572,7 +572,14 @@ print(json.dumps({'publisher_cap3_sealing_and_scoped_filesystem_verified':True,'
     args=['/usr/bin/systemd-run','--quiet','--wait','--collect','--pipe','--unit='+UNIT,'--slice='+PARENT_SLICE]
     for property in publisher_properties():args+=['-p',property]
     args+=['-p','RuntimeMaxSec=30','/usr/bin/python3','-I','-B',str(probe)]
-    result=json.loads(command(args,timeout=40))
+    completed=subprocess.run(args,env=ENV,stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=40)
+    if completed.returncode:
+        diagnostics=[]
+        for line in (completed.stdout+b'\n'+completed.stderr).splitlines():
+            if line.startswith((b'publisher_profile_masks=',b'publisher_cache_mount_diagnostic=')):
+                diagnostics.append(line[:2048].decode('ascii',errors='replace'))
+        raise RuntimeError('Publisher probe exit='+str(completed.returncode)+' '+ ' '.join(diagnostics[:2]))
+    result=json.loads(completed.stdout)
     assert result['generation']==expected_generation and result['publisher_cap3_sealing_and_scoped_filesystem_verified']
     return {'publisher_cap3_sealing_and_scoped_filesystem_verified':True,'publisher_fixed_pid1_socket_query_verified':True,
             'publisher_profile_probe_metrics':result['metrics']}
