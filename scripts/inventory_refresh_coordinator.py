@@ -4,7 +4,7 @@ The fixed runtime must hold the root journal lock and supply current boot,
 current admitted policy and a manifest from an actual held Store lease. This
 module does not acquire native observation or manufacture physical evidence.
 """
-from inventory_refresh_state import boot, hexadecimal, checked_timestamp
+from inventory_refresh_state import boot, hexadecimal, checked_timestamp, REASONS
 from inventory_refresh_status import PublicStatus
 from inventory_refresh_storage import MAX_FILES
 from inventory_refresh_receipt import observation as validate_observation
@@ -25,7 +25,7 @@ def _cache_metadata(manifest):
 
 
 def publish_current_status(journal,publisher,*,boot_id,current_policy,manifest,
-                           observation_lease=None,observation_receipt=None):
+                           observation_lease=None,observation_receipt=None,operational_health=None):
     """Publish a fresh projection under the same held, reconciled root journal.
 
     Prior valid cache metadata is independent of the current refresh attempt.
@@ -38,6 +38,8 @@ def publish_current_status(journal,publisher,*,boot_id,current_policy,manifest,
         raise ValueError('Inventory status must share its coordination journal')
     if not boot(boot_id) or current_policy is not None and not hexadecimal(current_policy,64):
         raise ValueError('Invalid admitted inventory status context')
+    if operational_health is not None and (type(operational_health) is not str or operational_health not in REASONS):
+        raise ValueError('Invalid static inventory operational health')
     # Never accept a cached snapshot, particularly across a failed save/barrier.
     snapshot=journal.snapshot()
     accepted=snapshot['last_observation']
@@ -67,6 +69,7 @@ def publish_current_status(journal,publisher,*,boot_id,current_policy,manifest,
         health='policy_changed'
     elif record['phase']=='succeeded' and not available:
         health='cache_unavailable'
+    if health is None:health=operational_health
     if observation_lease is not None and (health is not None or not available or
             type(observation_lease) is not dict or observation_lease.get('boot_id')!=boot_id):
         raise ValueError('Unavailable inventory state cannot grant observation')

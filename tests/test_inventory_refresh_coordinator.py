@@ -71,6 +71,26 @@ class CoordinatorTests(unittest.TestCase):
             self.assertEqual(self.publish(observation_receipt=dict(receipt))['observation_receipt'],receipt)
             with self.assertRaises(ValueError):self.publish(observation_receipt=dict(receipt,released_boottime_ms=127))
 
+    def test_operational_health_is_uncorrelated_and_preserves_cache_and_accepted_history(self):
+        with self.journal.exclusive():
+            self.success();receipt=self.accept_observation();before=self.journal.snapshot()
+            value=self.publish(operational_health='package_manager_busy')
+            self.assertEqual(value['phase'],'unconfirmed');self.assertEqual(value['reason'],'package_manager_busy')
+            self.assertIsNone(value['operation_nonce']);self.assertIsNone(value['attempt'])
+            self.assertEqual(value['cache_generation'],'c'*32);self.assertEqual(value['observation_receipt'],receipt)
+            self.assertEqual(self.journal.snapshot(),before)
+            self.journal.fence_external()
+            self.assertEqual(self.publish(operational_health='package_manager_busy')['reason'],'cleanup_unconfirmed')
+
+    def test_operational_health_accepts_only_static_reasons_and_never_grants_a_lease(self):
+        with self.journal.exclusive():
+            self.success()
+            for reason in ('synthetic-private-value',True,{},17):
+                with self.subTest(reason=reason),self.assertRaises(ValueError):self.publish(operational_health=reason)
+            lease={'nonce':'0000000000000002'+'a'*16,'boot_id':BOOT,'cache_generation':'c'*32,
+                   'policy_generation':POLICY,'lock_open_boottime_ms':115,'expires_boottime_ms':1000}
+            with self.assertRaises(ValueError):self.publish(observation_lease=lease,operational_health='lease_expired')
+
     def test_unaccepted_child_receipt_cannot_be_projected(self):
         with self.journal.exclusive():
             self.success()
