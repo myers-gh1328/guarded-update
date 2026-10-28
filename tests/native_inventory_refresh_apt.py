@@ -175,7 +175,7 @@ def run_worker(policy, number):
            'accepted_boottime_ms': now, 'started_boottime_ms': now}
     write_root(Path(RUNTIME_ROOT)/'job.json', json.dumps(job).encode())
     # The real worker is UID-dropped by PID1; only its exact staging path is writable.
-    args = ['/usr/bin/systemd-run', '--quiet', '--wait', '--pipe', '--unit='+WORKER_UNIT,
+    args = ['/usr/bin/systemd-run', '--quiet', '--wait', '--collect', '--pipe', '--unit='+WORKER_UNIT,
         '--slice='+WORKER_SLICE, '-p', 'User=ccrefresh', '-p', 'Group=ccrefresh',
         '-p', 'NoNewPrivileges=yes', '-p', 'CapabilityBoundingSet=', '-p', 'ProtectSystem=strict',
         '-p', 'ProtectHome=yes', '-p', 'ProtectControlGroups=yes', '-p', 'RestrictNamespaces=yes',
