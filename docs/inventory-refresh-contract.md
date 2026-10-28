@@ -1060,3 +1060,34 @@ unit may then be acknowledged. The proof's
 `fixed_coordinator_entry_loop_and_controlled_policy_refusal_verified` flag covers
 actual main, polling and controlled refusal; it is not a successful normal-shutdown
 or complete provisioning/startup-allocation/target-fit readiness claim.
+
+### Inactive helper source artifact
+
+`scripts/package-inventory-helper.py OUTPUT_PARENT` builds a separate helper
+archive without installing or enabling anything. It pins one full Git commit,
+reads every regular source/doc/builder blob by that commit, rejects relevant dirty
+files, and derives the exact known root module closure from a strict literal AST
+without executing project code. Unrelated worktree changes are excluded.
+
+The archive contains fixed relative readonly regular files: root modules, the
+coordinator, worker, identical native/guardian observation entry copies and this
+public contract. It contains no account, service, policy, key, runtime state or
+installation hook. Sorted USTAR metadata and gzip filename/mtime are fixed;
+`manifest.json` records source commit, builder digest, file hashes/sizes/modes and
+literal install destinations. The Python 3.10 language floor is not proof of
+systemd, kernel, python-apt, architecture or real-device repository compatibility.
+
+Archive and SHA sidecar are fully staged before exclusive generation publication.
+Final hardlinks never overwrite existing files. Failed publication removes only
+matching owned inode references; foreign replacements are preserved. A generation
+is consumable only after the build succeeds and both files/checksum validate.
+Unknown descriptor cleanup is reported as failure. CI uploads this distinct source
+artifact only after native checks and successful build, with no permission or
+default reporter/executor package changes.
+
+Digests establish integrity, not authenticity. PR artifacts are for review; actual
+delivery must select a trusted main-pipeline source/artifact/digest and follow the
+disabled provisioning workflow. Initial namespaces/unit provenance, reserved
+identities, complete startup resource charging, real repository/headroom fit,
+client/helper integration, enrollment/pilot and explicit source handoff remain
+activation gates. Building this archive does not satisfy them.
