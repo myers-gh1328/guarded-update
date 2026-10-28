@@ -512,6 +512,12 @@ def prove_publisher_profile(base,expected_generation):
     from inventory_refresh_resources import UNIT
     prepare_fixed_executor_guard()
     Path(STATE_ROOT).chmod(0o700)
+    apt=Path(POLICY_ROOT)/'apt'
+    apt.mkdir(mode=0o750);os.chown(apt,0,WORKER)
+    for path in (CACHE_ROOT,STATE_ROOT,RUNTIME_ROOT,str(apt),POLICY_ROOT,
+                 '/etc/passwd','/etc/group','/etc/nsswitch.conf','/etc/hosts',
+                 '/run/systemd/private','/var/lib/dpkg','/run/guarded-update-executor.lock'):
+        Path(path).lstat()  # All fixed bind sources must exist before PID1 namespace setup.
     token='e'*32;stage=Path(CACHE_ROOT)/('staging-'+token)
     (stage/'lists').mkdir(parents=True,mode=0o700)
     for path in (stage,stage/'lists'):
