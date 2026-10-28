@@ -987,3 +987,27 @@ actual unprivileged reporter transport proof. A successful
 `fixed_publisher_inbox_dispatch_verified` flag proves this bounded source
 composition, not an enabled service, complete executable loop, initial namespace
 provenance, startup allocator accounting or target resource fit.
+
+### Fixed runtime ownership (source only)
+
+`FixedRuntime.fixed()` assembles the actual guards and dispatcher without caller
+paths, commands, account IDs or state initialization. Current resource admission
+precedes private policy/cache contents and account lookup. The existing startup
+durability barrier must return exactly true; unresolved started work refuses all
+dispatch, with no automatic recovery or replay. Fixed worker/reporter identities
+are retained and rechecked at every step.
+
+The runtime keeps one journal lock throughout operation. Dispatcher, observation,
+inboxes, channel, publisher, writer guard, policy and resources all close before
+that lock is released. Every cleanup callback is attempted; failures fence the
+journal while its original lock and state descriptor remain usable. Errors during
+final lock/state descriptor release permanently close the runtime with local
+shutdown uncertainty; no second lock is acquired to manufacture a durable fence.
+Before the journal is acquired, admission failure closes only acquired resources.
+
+Local tests retain real journal/cache/status fixtures while substituting factory
+origins and lock acquisition. The native proof uses the actual fixed factory,
+nonce dispatch and runtime close, then checks writer exclusion after shutdown.
+`fixed_publisher_runtime_verified` therefore covers bounded assembly and ownership,
+not a complete executable/bootstrap, trusted initial namespaces, all startup
+allocations, actual target repository fit or device rollout.

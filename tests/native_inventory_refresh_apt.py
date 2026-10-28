@@ -710,7 +710,7 @@ def prove_root_refresh_transaction(expected_generation):
         'inventory_refresh_policy','inventory_refresh_policy_admission','inventory_refresh_materialized_policy',
         'inventory_refresh_worker_service','inventory_refresh_resources','inventory_refresh_materializer',
         'inventory_refresh_writer_exclusion','inventory_refresh_io','inventory_refresh_coordinator','inventory_refresh_contention',
-        'inventory_refresh_transaction','inventory_refresh_observation_transaction','inventory_refresh_dispatch')
+        'inventory_refresh_transaction','inventory_refresh_observation_transaction','inventory_refresh_dispatch','inventory_refresh_runtime')
     for name in modules:
         filename='guardian.py' if name=='inventory_refresh_guardian' else name+'.py'
         shutil.copyfile(ROOT/'scripts'/(name+'.py'),LIB_ROOT/filename);(LIB_ROOT/filename).chmod(0o444)
@@ -736,134 +736,93 @@ def prove_root_refresh_transaction(expected_generation):
     bootstrap=re.sub(r'^names=.*$', 'names='+repr(modules),bootstrap,count=1,flags=re.MULTILINE)
     bootstrap=bootstrap.replace("filename=name+'.py'", "filename='guardian.py' if name=='inventory_refresh_guardian' else name+'.py'")
     bootstrap=bootstrap.replace('compiled={name:compile(', 'assert sum(map(len,sources.values()))<=512*1024\ncompiled={name:compile(')
-    body=r"""from inventory_refresh_resources import RuntimeResources
-from inventory_refresh_policy_admission import PolicyGuard
-from inventory_refresh_state import Journal
-from inventory_refresh_storage import Store
-from inventory_refresh_observation import _Ancestry
-from inventory_refresh_io import StatusPublisher
+    body=r"""from inventory_refresh_runtime import FixedRuntime
 from inventory_refresh_writer_exclusion import WriterExclusion
-from inventory_refresh_transaction import RefreshTransaction
-from inventory_refresh_observation_transaction import ObservationTransaction
-from inventory_refresh_channel import ObservationChannel
-from inventory_refresh_io import Inbox
-from inventory_refresh_dispatch import RootDispatcher
 import secrets
 import time
 fields=dict(line.split(':',1) for line in open('/proc/self/status').read().splitlines())
 assert {name:int(fields[name].strip(),16) for name in ('CapPrm','CapEff','CapBnd','CapInh','CapAmb')}=={'CapPrm':3,'CapEff':3,'CapBnd':3,'CapInh':0,'CapAmb':0}
 assert fields['NoNewPrivs'].split()==['1']
-stage='resources'
-with RuntimeResources.fixed() as resources:
- stage='policy'
- with PolicyGuard.fixed() as policy:
-  assert policy.generation==@GENERATION@
-  root=os.open('/',os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW);ancestry=None;publisher=None;writers=None;channel=None;observation=None;dispatcher=None;inboxes={}
+stage='runtime_admission';runtime=FixedRuntime.fixed()
+try:
+ journal=runtime._journal;store=runtime._store;resources=runtime._resources;policy=runtime._policy
+ assert policy.generation==@GENERATION@
+ nonce='0000000000000001'+'a'*16
+ stage='transaction'
+ assert runtime.step()['refresh']=='succeeded'
+ value=journal.snapshot();success=value['last_success']
+ assert not value['unconfirmed'] and success['attempt']['correlator']==nonce
+ assert value['capabilities']['refresh']['active'] is None
+ with store.lease_current() as lease:
+  assert lease.manifest['cache_generation']==success['attempt']['cache_generation']
+  assert lease.manifest['policy_generation']==policy.generation
+  indexes=[row for row in lease.manifest['files'] if '_Packages' in row['path']]
+  assert indexes
+  for index in indexes:lease.verify_index(index['path'])
+ status_path='/run/command-center-inventory-refresh/status/status.json'
+ status=open(status_path,'rb').read(65537);assert len(status)<=65536
+ public=json.loads(status)
+ assert public['phase']=='succeeded' and public['operation_nonce']==nonce
+ assert public['cache_generation']==success['attempt']['cache_generation']
+ assert public['successful_checked_at']==success['successful_checked_at']
+ assert runtime.step()['refresh']=='existing'
+ assert open(status_path,'rb').read(65537)==status
+ stage='observation_admission'
+ def synthetic_request(capability,nonce):
+  # Test-only actor: complete bounded bytes, chmod before transferring owner.
+  directory=os.open('/run/command-center-inventory-refresh/'+capability,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+  temporary='.fixture-'+secrets.token_hex(16)
   try:
-   ancestry=_Ancestry.open(root,('var','lib','command-center-inventory-refresh'))
-   journal=Journal(ancestry.fds[-1])
-   with journal.exclusive():
-    assert journal.startup_ready()
-    stage='writer_admission'
-    writers=WriterExclusion.fixed(60001)
-    publisher=StatusPublisher.fixed(journal)
-    store=Store(resources._cache.fds[-1],0,60002,60001)
-    transaction=RefreshTransaction(journal,policy,resources,store,publisher,writers)
-    nonce='0000000000000001'+'a'*16
-    channel=ObservationChannel.fixed(journal=journal)
-    observation=ObservationTransaction(journal,policy,resources,store,publisher,writers,channel)
-    inboxes={name:Inbox.fixed(name) for name in ('release','observation','refresh')}
-    dispatcher=RootDispatcher(journal,inboxes,transaction,observation)
-    stage='transaction'
-    assert dispatcher.step()['refresh']=='succeeded'
-    value=journal.snapshot();success=value['last_success']
-    assert not value['unconfirmed'] and success['attempt']['correlator']==nonce
-    assert value['capabilities']['refresh']['active'] is None
-    with store.lease_current() as lease:
-     assert lease.manifest['cache_generation']==success['attempt']['cache_generation']
-     assert lease.manifest['policy_generation']==policy.generation
-     indexes=[row for row in lease.manifest['files'] if '_Packages' in row['path']]
-     assert indexes
-     for index in indexes:lease.verify_index(index['path'])
-    status_path='/run/command-center-inventory-refresh/status/status.json'
-    status=open(status_path,'rb').read(65537);assert len(status)<=65536
-    public=json.loads(status)
-    assert public['phase']=='succeeded' and public['operation_nonce']==nonce
-    assert public['cache_generation']==success['attempt']['cache_generation']
-    assert public['successful_checked_at']==success['successful_checked_at']
-    assert dispatcher.step()['refresh']=='existing'
-    assert open(status_path,'rb').read(65537)==status
-    try:
-     stage='observation_admission'
-     def synthetic_request(capability,nonce):
-      # Test-only actor: complete bounded bytes, chmod before transferring owner.
-      directory=os.open('/run/command-center-inventory-refresh/'+capability,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
-      temporary='.fixture-'+secrets.token_hex(16)
-      try:
-       fd=os.open(temporary,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600,dir_fd=directory)
-       try:
-        raw=nonce.encode('ascii');assert os.write(fd,raw)==len(raw)
-        os.fchmod(fd,0o600);os.fchown(fd,60002,60002);os.fsync(fd)
-       finally:os.close(fd)
-       os.rename(temporary,'request',src_dir_fd=directory,dst_dir_fd=directory);os.fsync(directory)
-      finally:os.close(directory)
-     observed_nonce='0000000000000005'+'d'*16
-     synthetic_request('observation',observed_nonce)
-     assert dispatcher.step()['observation']=='dispatched'
-     stage='observation_opening';limit=time.monotonic()+10
-     while True:
-      phase=dispatcher.step()['poll']
-      if phase=='opened':break
-      assert phase=='opening' and time.monotonic()<limit
-      time.sleep(.02)
-     offer=json.loads(open(status_path,'rb').read(65537))['observation_lease']
-     assert offer['nonce']==observed_nonce and offer['cache_generation']==success['attempt']['cache_generation']
-     with store.lease_current() as lease:
-      for index in lease.manifest['files']:lease.verify_index(index['path'])
-     stage='observation_release'
-     synthetic_request('release',observed_nonce)
-     assert dispatcher.step()['release']=='releasing'
-     assert json.loads(open(status_path,'rb').read(65537))['observation_lease'] is None
-     assert dispatcher.step()['release']=='existing'
-     stage='observation_acceptance';limit=time.monotonic()+10
-     while True:
-      phase=dispatcher.step()['poll']
-      if phase=='succeeded':break
-      assert phase=='releasing' and time.monotonic()<limit
-      time.sleep(.02)
-     value=journal.snapshot();accepted=value['last_observation'];receipt=accepted['receipt']
-     assert not value['unconfirmed'] and value['last_success']==success
-     assert all(value['capabilities'][name]['active'] is None and accepted[name]['phase']=='succeeded' for name in ('observation','release'))
-     assert all(receipt[key]==item for key,item in offer.items())
-     assert receipt['installed_before_sha256']==receipt['installed_after_sha256']
-     public=json.loads(open(status_path,'rb').read(65537))
-     assert public['observation_receipt']==receipt and public['observation_lease'] is None
-     assert public['cache_generation']==success['attempt']['cache_generation']
-     frozen=journal.snapshot();assert dispatcher.step()['observation']=='existing' and journal.snapshot()==frozen
-    finally:
-     try:
-      if dispatcher is not None:dispatcher.close()
-      if observation is not None:observation.close()
-     finally:
-      try:
-       if channel is not None:channel.close()
-      finally:
-       for inbox in inboxes.values():inbox.close()
-     observation=None;channel=None
-    stage='final_checks'
-    writers.check();resources.sample();policy.recheck()
-    metrics=resources.sample()
-  finally:
+   fd=os.open(temporary,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600,dir_fd=directory)
    try:
-    if publisher is not None:publisher.close()
-   finally:
-    try:
-     if writers is not None:writers.close()
-    finally:
-     try:
-      if ancestry is not None:ancestry.close()
-     finally:os.close(root)
-print(json.dumps({'fixed_publisher_refresh_transaction_verified':True,'fixed_publisher_observation_transaction_verified':True,'fixed_publisher_inbox_dispatch_verified':True,'generation':@GENERATION@,'metrics':metrics,
+    raw=nonce.encode('ascii');assert os.write(fd,raw)==len(raw)
+    os.fchmod(fd,0o600);os.fchown(fd,60002,60002);os.fsync(fd)
+   finally:os.close(fd)
+   os.rename(temporary,'request',src_dir_fd=directory,dst_dir_fd=directory);os.fsync(directory)
+  finally:os.close(directory)
+ observed_nonce='0000000000000005'+'d'*16
+ synthetic_request('observation',observed_nonce)
+ assert runtime.step()['observation']=='dispatched'
+ stage='observation_opening';limit=time.monotonic()+10
+ while True:
+  phase=runtime.step()['poll']
+  if phase=='opened':break
+  assert phase=='opening' and time.monotonic()<limit
+  time.sleep(.02)
+ offer=json.loads(open(status_path,'rb').read(65537))['observation_lease']
+ assert offer['nonce']==observed_nonce and offer['cache_generation']==success['attempt']['cache_generation']
+ with store.lease_current() as lease:
+  for index in lease.manifest['files']:lease.verify_index(index['path'])
+ stage='observation_release'
+ synthetic_request('release',observed_nonce)
+ assert runtime.step()['release']=='releasing'
+ assert json.loads(open(status_path,'rb').read(65537))['observation_lease'] is None
+ assert runtime.step()['release']=='existing'
+ stage='observation_acceptance';limit=time.monotonic()+10
+ while True:
+  phase=runtime.step()['poll']
+  if phase=='succeeded':break
+  assert phase=='releasing' and time.monotonic()<limit
+  time.sleep(.02)
+ value=journal.snapshot();accepted=value['last_observation'];receipt=accepted['receipt']
+ assert not value['unconfirmed'] and value['last_success']==success
+ assert all(value['capabilities'][name]['active'] is None and accepted[name]['phase']=='succeeded' for name in ('observation','release'))
+ assert all(receipt[key]==item for key,item in offer.items())
+ assert receipt['installed_before_sha256']==receipt['installed_after_sha256']
+ public=json.loads(open(status_path,'rb').read(65537))
+ assert public['observation_receipt']==receipt and public['observation_lease'] is None
+ assert public['cache_generation']==success['attempt']['cache_generation']
+ frozen=journal.snapshot();assert runtime.step()['observation']=='existing' and journal.snapshot()==frozen
+ stage='final_checks'
+ runtime._writers.check();resources.sample();policy.recheck()
+ metrics=resources.sample()
+finally:runtime.close()
+assert not journal._held
+postclose=WriterExclusion.fixed(60001)
+try:postclose.check()
+finally:postclose.close()
+print(json.dumps({'fixed_publisher_refresh_transaction_verified':True,'fixed_publisher_observation_transaction_verified':True,
+ 'fixed_publisher_inbox_dispatch_verified':True,'fixed_publisher_runtime_verified':True,'generation':@GENERATION@,'metrics':metrics,
  'coordinator_exercised':False,'all_allocators_charged_from_startup_verified':False},sort_keys=True))
 """.replace('@GENERATION@',repr(expected_generation))
     body="stage='imports'\ntry:\n"+''.join(' '+line+'\n' for line in body.splitlines())+"except BaseException as error:\n print('publisher_transaction_failure='+json.dumps({'stage':stage,'operation_stage':getattr(error,'stage',None),'diagnostics':getattr(error,'diagnostics',None),'kind':type(error).__name__,'errno':getattr(error,'errno',None)},sort_keys=True),file=sys.stderr)\n raise SystemExit(74)\n"
@@ -880,8 +839,8 @@ print(json.dumps({'fixed_publisher_refresh_transaction_verified':True,'fixed_pub
     result=json.loads(completed.stdout)
     assert result['generation']==expected_generation and result['fixed_publisher_refresh_transaction_verified']
     assert not result['coordinator_exercised'] and not result['all_allocators_charged_from_startup_verified']
-    assert result['fixed_publisher_observation_transaction_verified'] and result['fixed_publisher_inbox_dispatch_verified']
-    return {'fixed_publisher_refresh_transaction_verified':True,'fixed_publisher_observation_transaction_verified':True,'fixed_publisher_inbox_dispatch_verified':True,'publisher_refresh_transaction_metrics':result['metrics']}
+    assert result['fixed_publisher_observation_transaction_verified'] and result['fixed_publisher_inbox_dispatch_verified'] and result['fixed_publisher_runtime_verified']
+    return {'fixed_publisher_refresh_transaction_verified':True,'fixed_publisher_observation_transaction_verified':True,'fixed_publisher_inbox_dispatch_verified':True,'fixed_publisher_runtime_verified':True,'publisher_refresh_transaction_metrics':result['metrics']}
 
 
 def is_live_worker(raw,*,parent=None):
