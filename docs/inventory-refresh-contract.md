@@ -1202,3 +1202,20 @@ The borrowed-directory constructor does not establish full named ancestry or
 process provenance. Its fixed factory and source bootstrap remain deferred until
 the restricted managed bridge is implemented and natively verified. It writes
 no inbox, starts no process and changes no reporting capability or artifact.
+
+Protected atomic replacement has a narrowly typed `publication_changed` result:
+the old opened file retains its protected metadata/content shape (allowing only
+unlink's link-count/ctime changes), while the final named file is a different,
+independently protected root inode. No old status is returned. A bounded poll may
+read a new file without re-pinning or replaying any native request. Malformed
+bytes, unsafe metadata, in-place changes and cleanup errors remain fatal.
+
+The additional disposable Linux roundtrip uses the actual status/session
+libraries in one persistent restricted reader. Its pinned-context phase precedes
+root observation submission; scan completion precedes root release. The final
+phase follows receipt matching and every reader-owned close, with bounded phase
+output, EOF and successful exit required by the parent. Its eight-module source
+subset and admission callback are trusted test fixtures, not a production
+bootstrap or durable reporting-journal proof. Native pipeline execution is
+required before treating this roundtrip as verified; broader activation gates
+remain unchanged.

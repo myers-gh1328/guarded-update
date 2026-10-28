@@ -91,7 +91,8 @@ class ReporterStatusTests(unittest.TestCase):
             os.replace(replacement,self.root/'status.json')
             return create(value)
         with patch.object(PublicStatus,'create',side_effect=replace):
-            with self.assertRaises(ValueError):self.reader.read()
+            with self.assertRaises(ReporterIOError) as caught:self.reader.read()
+        self.assertEqual(caught.exception.reason,'publication_changed')
         self.assertEqual(self.reader.read().encoded(),self.status.encoded())
     def test_in_place_mutation_during_schema_parse_rejected(self):
         self.write(self.status.encoded());create=PublicStatus.create

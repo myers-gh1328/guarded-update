@@ -1,5 +1,8 @@
 """Run the native proof's actual synthetic actor without root or real writes."""
 import ast
+import json
+import os
+import time
 import contextlib
 import io
 import stat
@@ -12,6 +15,91 @@ from unittest.mock import Mock,patch
 
 
 class PublisherHarnessTests(unittest.TestCase):
+    def test_restricted_reporter_phase_is_bounded_exact_and_duplicate_strict(self):
+        tree=ast.parse((Path(__file__).parent/'native_inventory_refresh_apt.py').read_bytes())
+        decoder=next(node for node in tree.body if isinstance(node,ast.FunctionDef) and node.name=='decode_reporter_phase')
+        scope={'json':json};exec(compile(ast.Module(body=[decoder],type_ignores=[]),'<reporter-phase>','exec'),scope)
+        decode=scope['decode_reporter_phase']
+        pinned={'phase':'pinned','cache_generation':'a'*32,'policy_generation':'b'*64,'boot_id':'11111111-1111-4111-8111-111111111111'}
+        self.assertEqual(decode((json.dumps(pinned)+'\n').encode(),'pinned'),pinned)
+        for raw in [b'{"phase":"pinned"}\nextra',b'{"phase":"pinned","phase":"pinned"}\n',
+                    b'{"phase":"complete"}\n',b'{"phase":"pinned","extra":null}\n',b'x'*4097,b'[]\n']:
+            with self.subTest(raw=raw[:80]),self.assertRaises(ValueError):decode(raw,'pinned')
+
+    def test_restricted_reporter_library_program_compiles_and_uses_fixed_sources(self):
+        tree=ast.parse((Path(__file__).parent/'native_inventory_refresh_apt.py').read_bytes())
+        factory=next(node for node in tree.body if isinstance(node,ast.FunctionDef) and node.name=='reporter_library_program')
+        scope={'ROOT':Path(__file__).resolve().parents[1]}
+        exec(compile(ast.Module(body=[factory],type_ignores=[]),'<reporter-factory>','exec'),scope)
+        code=scope['reporter_library_program']();compile(code,'<native-reporter>','exec')
+        body=ast.parse(code)
+        assignments=[node.value for node in body.body if isinstance(node,ast.Assign) and any(isinstance(t,ast.Name) and t.id=='SOURCES' for t in node.targets)]
+        sources=ast.literal_eval(assignments[-1])
+        self.assertEqual(len(sources),8)
+        self.assertEqual(sources[-2:],(('inventory_refresh_reader_session','inventory_refresh_reader_session.py'),('inventory_refresh_reporter_io','inventory_refresh_reporter_io.py')))
+        self.assertIn('Synthetic seam only',code)
+        prints=[node for node in ast.walk(body) if isinstance(node,ast.Call) and isinstance(node.func,ast.Name) and node.func.id=='print']
+        self.assertEqual(len(prints),3)
+        self.assertTrue(all(any(keyword.arg=='flush' and isinstance(keyword.value,ast.Constant) and keyword.value.value is True for keyword in node.keywords) for node in prints))
+
+    def test_restricted_reporter_rejects_nonzero_exit_surplus_and_missing_eof(self):
+        tree=ast.parse((Path(__file__).parent/'native_inventory_refresh_apt.py').read_bytes())
+        finish=next(node for node in tree.body if isinstance(node,ast.FunctionDef) and node.name=='finish_reporter_output')
+        scope={'os':os,'time':time};exec(compile(ast.Module(body=[finish],type_ignores=[]),'<reporter-eof>','exec'),scope)
+        for surplus,exit_status,keep_open in [(b'',0,False),(b'extra',0,False),(b'',74,False),(b'',0,True)]:
+            read,write=os.pipe()
+            try:
+                if surplus:os.write(write,surplus)
+                if not keep_open:os.close(write);write=None
+                with os.fdopen(read,'rb') as stream:
+                    process=SimpleNamespace(stdout=stream,wait=Mock(return_value=exit_status))
+                    if not surplus and exit_status==0 and not keep_open:scope['finish_reporter_output'](process,time.monotonic()+.1)
+                    else:
+                        with self.assertRaises(AssertionError):scope['finish_reporter_output'](process,time.monotonic()+.05)
+            finally:
+                if write is not None:os.close(write)
+
+    def test_parent_pipe_close_failure_still_closes_owned_cgroup_descriptor(self):
+        tree=ast.parse((Path(__file__).parent/'native_inventory_refresh_apt.py').read_bytes())
+        closer=next(node for node in tree.body if isinstance(node,ast.FunctionDef) and node.name=='close_reporter_parent')
+        close=Mock();scope={'os':SimpleNamespace(close=close)}
+        exec(compile(ast.Module(body=[closer],type_ignores=[]),'<reporter-parent-close>','exec'),scope)
+        stream=SimpleNamespace(close=Mock(side_effect=OSError('synthetic pipe close')))
+        with self.assertRaises(OSError):scope['close_reporter_parent'](stream,42)
+        close.assert_called_once_with(42)
+
+    def test_actual_child_poll_retries_only_publication_change_using_new_read(self):
+        tree=ast.parse((Path(__file__).parent/'native_inventory_refresh_apt.py').read_bytes())
+        factory=next(node for node in tree.body if isinstance(node,ast.FunctionDef) and node.name=='reporter_library_program')
+        scope={'ROOT':Path(__file__).resolve().parents[1]};exec(compile(ast.Module(body=[factory],type_ignores=[]),'<factory>','exec'),scope)
+        body=ast.parse(scope['reporter_library_program']())
+        public=next(node for node in ast.walk(body) if isinstance(node,ast.FunctionDef) and node.name=='public')
+        class Error(ValueError):
+            def __init__(self,reason):self.reason=reason
+        chain=Mock();fresh=object();reader=Mock();reader.read.side_effect=[Error('publication_changed'),fresh]
+        scope={'chains':[chain],'reader':reader,'loaded':{'inventory_refresh_reporter_io':SimpleNamespace(ReporterIOError=Error)}}
+        exec(compile(ast.Module(body=[public],type_ignores=[]),'<actual-child-public>','exec'),scope)
+        self.assertIsNone(scope['public']());self.assertIs(scope['public'](),fresh)
+        self.assertEqual(reader.read.call_count,2);self.assertEqual(chain.verify.call_count,4)
+        for reason in ('state_inconsistent','cleanup_unconfirmed'):
+            reader.read.side_effect=Error(reason)
+            with self.assertRaises(Error):scope['public']()
+    def test_actual_child_close_failure_withholds_final_evidence(self):
+        tree=ast.parse((Path(__file__).parent/'native_inventory_refresh_apt.py').read_bytes())
+        factory=next(node for node in tree.body if isinstance(node,ast.FunctionDef) and node.name=='reporter_library_program')
+        scope={'ROOT':Path(__file__).resolve().parents[1]};exec(compile(ast.Module(body=[factory],type_ignores=[]),'<factory>','exec'),scope)
+        body=ast.parse(scope['reporter_library_program']())
+        cleanup=next(node for node in body.body if isinstance(node,ast.Try) and node.finalbody)
+        output=body.body[-1]
+        owned=SimpleNamespace(close=Mock(side_effect=OSError('synthetic close failure')))
+        reader=Mock();chain=Mock();scope={'session':owned,'reader':reader,'sources':None,'chains':[chain],'root':None,
+            'evidence':{'synthetic':True},'json':json}
+        attempt=ast.Try(body=[ast.Pass()],handlers=[],orelse=[],finalbody=cleanup.finalbody)
+        code=ast.fix_missing_locations(ast.Module(body=[attempt,output],type_ignores=[]))
+        stdout=io.StringIO()
+        with contextlib.redirect_stdout(stdout),self.assertRaises(ValueError):exec(compile(code,'<actual-child-cleanup>','exec'),scope)
+        self.assertEqual(stdout.getvalue(),'');reader.close.assert_called_once();chain.close.assert_called_once()
+
     def test_synthetic_actor_has_own_imports_and_transfers_ownership_after_chmod(self):
         tree=ast.parse((Path(__file__).parent/'native_inventory_refresh_apt.py').read_bytes())
         outer=next(node for node in tree.body if isinstance(node,ast.FunctionDef) and node.name=='prove_root_refresh_transaction')

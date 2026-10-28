@@ -47,9 +47,9 @@ class StatusReader:
         _require(stat.S_ISDIR(info.st_mode) and info.st_uid==self._owner and info.st_gid==self._group and
             stat.S_IMODE(info.st_mode)==0o750 and _identity(info)==self._identity)
 
-    def _file(self,info):
+    def _file(self,info,*,unlinked=False):
         _require(stat.S_ISREG(info.st_mode) and info.st_uid==self._owner and info.st_gid==self._group and
-            stat.S_IMODE(info.st_mode)==0o640 and info.st_nlink==1 and 0<info.st_size<=LIMIT and
+            stat.S_IMODE(info.st_mode)==0o640 and (info.st_nlink==1 or unlinked and info.st_nlink==0) and 0<info.st_size<=LIMIT and
             info.st_dev==os.fstat(self._directory).st_dev)
 
     def read(self):
@@ -74,11 +74,19 @@ class StatusReader:
                     _require(key not in value);value[key]=item
                 return value
             status=PublicStatus.create(json.loads(raw,object_pairs_hook=unique))
-            after=os.fstat(fd);self._file(after)
+            after=os.fstat(fd);self._file(after,unlinked=True)
             named=os.stat('status.json',dir_fd=self._directory,follow_symlinks=False);self._file(named)
             self._verify()
+            # Atomic replacement unlinks the old opened inode (nlink/ctime
+            # change). Admit no old status: only signal a fresh-read retry when
+            # all its other protected metadata/content shape stayed unchanged.
+            stable=lambda info:(info.st_dev,info.st_ino,info.st_mode,info.st_uid,info.st_gid,info.st_size,info.st_mtime_ns)
+            unchanged=_stable(before)==_stable(after) or after.st_nlink==0 and stable(before)==stable(after)
+            if _identity(named)!=_identity(before) and unchanged:
+                raise ReporterIOError('publication_changed')
             _require(_stable(before)==_stable(after)==_stable(named))
             return status
+        except ReporterIOError:raise
         except (OSError,ValueError,TypeError,RecursionError):
             raise ReporterIOError() from None
         finally:

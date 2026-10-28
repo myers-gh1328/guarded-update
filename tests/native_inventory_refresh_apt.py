@@ -1017,6 +1017,207 @@ def match_projected_reader_receipt(offer,reader,receipt):
     return True
 
 
+def decode_reporter_phase(raw,expected):
+    def require(condition):
+        if not condition:raise ValueError('Invalid restricted reporter phase')
+    require(type(raw) is bytes and 0<len(raw)<=4096 and raw.endswith(b'\n') and raw.count(b'\n')==1)
+    def unique(pairs):
+        value={}
+        for key,item in pairs:require(key not in value);value[key]=item
+        return value
+    try:value=json.loads(raw,object_pairs_hook=unique)
+    except (ValueError,UnicodeError,RecursionError):raise ValueError('Invalid restricted reporter phase') from None
+    require(expected in ('pinned','scan_finished','complete') and type(value) is dict and value.get('phase')==expected)
+    required={'phase','evidence'} if expected=='complete' else {'phase','cache_generation','policy_generation','boot_id'} if expected=='pinned' else {'phase'}
+    require(set(value)==required)
+    if expected=='complete':require(type(value['evidence']) is dict)
+    return value
+
+
+def reporter_library_program():
+    # Trusted disposable fixture only: use the actual source-admission/compile
+    # implementation with a fixed reader-only closure, not a production entry.
+    prefix=(ROOT/'scripts/inventory_refresh_root_entry.py').read_text().split('\ndef main():',1)[0]
+    modules=('inventory_refresh_protocol','inventory_refresh_receipt','inventory_refresh_state','inventory_refresh_storage',
+        'inventory_refresh_status','inventory_refresh_observation','inventory_refresh_reader_session','inventory_refresh_reporter_io')
+    body=r'''
+import json,subprocess
+assert len(sys.argv)==2 and re.fullmatch('[0-9a-f]{32}',sys.argv[1])
+nonce=sys.argv[1]
+fields=dict(line.split(':',1) for line in open('/proc/self/status').read().splitlines())
+assert all(fields[key].split()==['60002']*4 for key in ('Uid','Gid'))
+assert fields['Groups'].split() in ([],['60002']) and fields['NoNewPrivs'].split()==['1']
+assert all(int(fields[key].strip(),16)==0 for key in ('CapInh','CapPrm','CapEff','CapBnd','CapAmb'))
+assert open('/proc/self/cgroup').read()=='0::/command.slice/command-center.slice/command-center-inventory.slice/command-center-inventory-session-proof.service\n'
+boot=open('/proc/sys/kernel/random/boot_id').read().strip()
+budget=time.clock_gettime_ns(time.CLOCK_BOOTTIME)//1000000+15000
+previous=None
+def clock():
+ global previous
+ current=time.clock_gettime_ns(time.CLOCK_BOOTTIME)//1000000
+ assert (previous is None or current>=previous) and current<budget
+ assert open('/proc/sys/kernel/random/boot_id').read().strip()==boot
+ previous=current;return boot,current
+sources=None;reader=None;session=None;root=None;chains=[]
+try:
+ sources=RootSources.fixed();loaded=sources.execute();closing,sources=sources,None;closing.close()
+ observation=loaded['inventory_refresh_observation'];root=os.open('/',os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+ for parts in (('run','command-center-inventory-refresh','status'),('var','cache','command-center-inventory-refresh'),('var','lib','dpkg')):
+  chains.append(observation._Ancestry.open(root,parts))
+ reader=loaded['inventory_refresh_reporter_io'].StatusReader(chains[0].fds[-1],60002)
+ def public():
+  chains[0].verify()
+  try:value=reader.read()
+  except loaded['inventory_refresh_reporter_io'].ReporterIOError as error:
+   if error.reason!='publication_changed':raise
+   value=None  # Next loop reads a NEW file, never reuses old status.
+  chains[0].verify();return value
+ def document(value):return json.loads(value.encoded()) if value is not None else None
+ while True:
+  clock();initial=document(public())
+  if initial is not None:break
+  time.sleep(.01)
+ session=loaded['inventory_refresh_reader_session'].ReaderSession.pin(
+  loaded['inventory_refresh_storage'].CacheReader(chains[1].fds[-1]),cache_generation=initial['cache_generation'],
+  policy_generation=initial['policy_generation'],successful_checked_at=initial['successful_checked_at'],boot_id=boot,clock=clock)
+ chains[1].verify()
+ print(json.dumps({'phase':'pinned','cache_generation':initial['cache_generation'],'policy_generation':initial['policy_generation'],'boot_id':boot}),flush=True)
+ while True:
+  clock();value=public();current=document(value)
+  if current is not None and current['observation_lease'] is not None and current['observation_lease']['nonce']==nonce:break
+  time.sleep(.01)
+ for chain in chains:chain.verify()
+ # Synthetic seam only: this is NOT a durable reporting RequestJournal proof.
+ session.begin_scan(value,observation_nonce=nonce,dpkg_fd=chains[2].fds[-1],owner=0,admit_scan=lambda _:True)
+ config='/var/cache/command-center-inventory-refresh/generation-'+initial['cache_generation']+'/_inventory-reader/apt.conf'
+ result=subprocess.run(['/usr/bin/apt-cache','policy','inventory-proof'],env={'PATH':'/usr/sbin:/usr/bin:/sbin:/bin','LC_ALL':'C','LANG':'C','APT_CONFIG':config},cwd='/',stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,timeout=5)
+ assert result.returncode==0 and len(result.stdout)<=65536
+ assert re.search(rb'(?m)^\s*Candidate: 1\.0\s*$',result.stdout)
+ assert re.search(rb'(?m)^\s*(?:\*\*\*\s+)?1\.0\s+123\s*$',result.stdout)
+ for chain in chains:chain.verify()
+ session.finish_scan()
+ print(json.dumps({'phase':'scan_finished'}),flush=True)
+ while True:
+  clock();value=public();current=document(value)
+  if current is not None and current['observation_receipt'] is not None and current['observation_receipt']['nonce']==nonce:break
+  time.sleep(.01)
+ for chain in chains:chain.verify()
+ evidence=json.loads(session.finish(value));session=None
+finally:
+ failed=False
+ for owned in (session,reader,sources,*reversed(chains)):
+  if owned is not None:
+   try:owned.close()
+   except BaseException:failed=True
+ if root is not None:
+  try:os.close(root)
+  except OSError:failed=True
+ if failed:raise ValueError('Restricted reader cleanup unconfirmed')
+print(json.dumps({'phase':'complete','evidence':evidence}),flush=True)
+'''
+    return prefix+'\nSOURCES='+repr(tuple((name,name+'.py') for name in modules))+'\n'+body
+
+
+def read_reporter_phase(stream,expected,deadline):
+    import select
+    raw=bytearray();poll=select.poll();poll.register(stream.fileno(),select.POLLIN|select.POLLHUP|select.POLLERR)
+    while not raw.endswith(b'\n'):
+        remaining=deadline-time.monotonic()
+        assert remaining>0 and poll.poll(max(1,int(remaining*1000)))
+        byte=os.read(stream.fileno(),1)
+        assert byte and len(raw)<4096
+        raw.extend(byte)
+    return decode_reporter_phase(bytes(raw),expected)
+
+
+def finish_reporter_output(process,deadline):
+    import select
+    remaining=deadline-time.monotonic()
+    assert remaining>0 and process.wait(timeout=remaining)==0
+    remaining=deadline-time.monotonic()
+    poll=select.poll();poll.register(process.stdout.fileno(),select.POLLIN|select.POLLHUP|select.POLLERR)
+    assert remaining>0 and poll.poll(max(1,int(remaining*1000)))
+    assert os.read(process.stdout.fileno(),1)==b''
+
+
+def close_reporter_parent(stream,group):
+    try:stream.close()
+    finally:
+        if group is not None:os.close(group)
+
+
+def prove_reporter_library_roundtrip(actor,public):
+    """Native library seam; synthetic admission, not executable-client readiness."""
+    from inventory_refresh_unit_status import PROPERTIES
+    for name in ('inventory_refresh_reader_session','inventory_refresh_reporter_io'):
+        target=LIB_ROOT/(name+'.py');shutil.copyfile(ROOT/'scripts'/(name+'.py'),target);target.chmod(0o444)
+    unit='command-center-inventory-session-proof.service';description='Disposable reporter session '+secrets.token_hex(16)
+    nonce='0000000000000007'+'e'*16
+    def properties():
+        result=subprocess.run(['/bin/systemctl','show','--property='+','.join(PROPERTIES),unit],env=ENV,
+            stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,timeout=2)
+        assert result.returncode in (0,4) and len(result.stdout)<=4096
+        value={}
+        for line in result.stdout.decode('ascii').splitlines():
+            key,separator,item=line.partition('=');assert separator and key in PROPERTIES and key not in value;value[key]=item
+        assert set(value)==set(PROPERTIES);return value
+    assert properties()['LoadState']=='not-found'
+    args=['/usr/bin/systemd-run','--quiet','--wait','--collect','--pipe','--unit='+unit,'--slice='+PARENT_SLICE,'--description='+description]
+    for item in ('User=60002','Group=60002','Type=exec','ExitType=main','Restart=no','RemainAfterExit=no',
+        'KillMode=control-group','KillSignal=SIGKILL','TimeoutStopSec=1','RuntimeMaxSec=20','OOMPolicy=kill',
+        'MemoryAccounting=yes','TasksMax=8','NoNewPrivileges=yes','CapabilityBoundingSet=','AmbientCapabilities=',
+        'ProtectSystem=strict','ProtectHome=yes','ProtectControlGroups=yes','PrivateDevices=yes','PrivateTmp=yes','PrivateNetwork=yes'):
+        args+=['-p',item]
+    args+=['/usr/bin/python3','-I','-B','-S','-c',reporter_library_program(),nonce]
+    process=subprocess.Popen(args,env=ENV,stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL)
+    group=None;invocation=None;group_identity=None
+    try:
+        deadline=time.monotonic()+25
+        pinned=read_reporter_phase(process.stdout,'pinned',deadline)
+        before=public()
+        assert pinned['cache_generation']==before['cache_generation'] and pinned['policy_generation']==before['policy_generation']
+        assert pinned['boot_id']==Path('/proc/sys/kernel/random/boot_id').read_text().strip()
+        value=properties()
+        assert value['LoadState']=='loaded' and value['Description']==description and re.fullmatch('[0-9a-f]{32}',value['InvocationID'])
+        expected='/command.slice/command-center.slice/command-center-inventory.slice/'+unit
+        assert value['ControlGroup']==expected
+        invocation=value['InvocationID'];group=os.open('/sys/fs/cgroup'+expected,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+        info=os.fstat(group);group_identity=(info.st_dev,info.st_ino)
+        actor('observation',nonce)
+        read_reporter_phase(process.stdout,'scan_finished',deadline)
+        actor('release',nonce)
+        final=read_reporter_phase(process.stdout,'complete',deadline)['evidence']
+        finish_reporter_output(process,deadline)  # Bounded EOF: no valid-prefix surplus.
+        value=properties()
+        if value['LoadState']!='not-found':
+            assert value['Description']==description and value['InvocationID']==invocation and value['ActiveState'] in ('inactive','failed')
+        try:named=os.stat('/sys/fs/cgroup'+expected,follow_symlinks=False)
+        except FileNotFoundError:pass
+        else:
+            assert (named.st_dev,named.st_ino)==group_identity
+            fd=os.open('cgroup.events',os.O_RDONLY|os.O_NOFOLLOW,dir_fd=group)
+            try:assert b'populated 0' in os.read(fd,4096).splitlines()
+            finally:os.close(fd)
+        receipt=public()['observation_receipt']
+        assert set(final)=={'schema_version','scan_started_boottime_ms','scan_finished_boottime_ms','successful_checked_at','observation_receipt'}
+        assert type(final['schema_version']) is int and final['schema_version']==1 and final['observation_receipt']==receipt and receipt['nonce']==nonce
+        assert final['successful_checked_at']==before['successful_checked_at']
+        for key in ('cache_generation','policy_generation','boot_id'):assert receipt[key]==pinned[key]
+        offer={key:receipt[key] for key in ('nonce','boot_id','cache_generation','policy_generation','lock_open_boottime_ms','expires_boottime_ms')}
+        reader={'schema_version':1,'observation_nonce':nonce,**{key:receipt[key] for key in ('boot_id','cache_generation','policy_generation','installed_before_sha256','installed_after_sha256')},
+            'scan_started_boottime_ms':final['scan_started_boottime_ms'],'scan_finished_boottime_ms':final['scan_finished_boottime_ms']}
+        assert match_projected_reader_receipt(offer,reader,receipt)
+        return receipt
+    finally:
+        try:
+            # The known transient has its own kernel/PID1 deadline. Never let
+            # coordinator cleanup stand in for reporter termination or pin close.
+            process.wait(timeout=25)
+        finally:
+            closing,group=group,None
+            close_reporter_parent(process.stdout,closing)
+
+
 def prove_actual_coordinator_entry_loop():
     """GHA-only actual entry, restricted inbox actor and controlled policy refusal."""
     from inventory_refresh_publisher_profile import publisher_properties
@@ -1059,8 +1260,8 @@ def prove_actual_coordinator_entry_loop():
     def public():
         with status_path.open('rb') as status:raw=status.read(65537)
         assert len(raw)<=65536;return json.loads(raw)
-    def actor(capability):
-        result=subprocess.run(list(worker_argv(READER,READER)[:-1])+['-S','-c',REPORTER_INBOX_CODE,capability,nonce],
+    def actor(capability,operation=nonce):
+        result=subprocess.run(list(worker_argv(READER,READER)[:-1])+['-S','-c',REPORTER_INBOX_CODE,capability,operation],
             env=ENV,stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=5)
         assert result.returncode==0,'Restricted synthetic inbox actor failed'
     def write_policy(data):
@@ -1153,6 +1354,7 @@ def prove_actual_coordinator_entry_loop():
             receipt=None;assert launcher.poll() is None and time.monotonic()<limit;time.sleep(.02)
         assert value['observation_lease'] is None and all(receipt[key]==item for key,item in offer.items())
         assert match_projected_reader_receipt(offer,reader_proof,receipt)
+        receipt=prove_reporter_library_roundtrip(actor,public)
         invalidate_policy()
         assert launcher.wait(timeout=35)==74
         final=confirm_inert();assert final['ExecMainCode']=='1' and final['ExecMainStatus']=='74' and final['Result']=='exit-code'
@@ -1174,7 +1376,8 @@ def prove_actual_coordinator_entry_loop():
     return {'fixed_coordinator_entry_loop_and_controlled_policy_refusal_verified':True,
         'restricted_reporter_actual_entry_observation_receipt_verified':True,
         'projected_reader_policy_native_query_verified':True,
-        'restricted_reporter_fingerprint_matches_root_receipt_verified':True}
+        'restricted_reporter_fingerprint_matches_root_receipt_verified':True,
+        'restricted_reporter_session_root_status_roundtrip_verified':True}
 
 def is_live_worker(raw,*,parent=None):
     try:
