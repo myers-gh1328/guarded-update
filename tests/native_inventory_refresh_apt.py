@@ -187,7 +187,7 @@ def prove_privilege_transition():
             'print("guardian_kernel_masks="+":".join(str(int(state[key],16)) for key in ["CapPrm","CapEff","CapBnd","CapInh","CapAmb"])+":"+state["NoNewPrivs"].strip(),file=sys.stderr)\n'
             'assert all(state[key].split()==["0"]*4 for key in ["Uid","Gid"])\n'
             'assert all(int(state[key],16)==480 for key in ["CapPrm","CapEff","CapBnd"])\n'
-            'assert all(int(state[key],16)==128 for key in ["CapInh","CapAmb"])\n'
+            'assert int(state["CapInh"],16)==384 and int(state["CapAmb"],16)==128\n'
             'assert state["NoNewPrivs"].strip()=="1"\n'
             'result=subprocess.run('+repr(fixed)+',env='+repr(ENV)+',stdin=subprocess.DEVNULL,'
             'stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,timeout=5)\n'

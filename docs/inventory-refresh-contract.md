@@ -487,6 +487,13 @@ RestrictNamespaces exercise this path. A disposable read-only property matrix
 reproduced missing effective SETUID and setresuid EPERM. See the
 [systemd implementation](https://github.com/systemd/systemd/blob/v255/src/core/exec-invoke.c#L4484-L4490).
 The full-sandbox preflight verifies actual root UID/GID, effective/permitted/
-bounding masks exactly those four capabilities, inherited/ambient SETUID only,
-and NNP=1. After setpriv, all five worker capability masks must be zero. The
+bounding masks exactly those four capabilities, inherited SETUID/SETPCAP,
+ambient SETUID only, and NNP=1. After setpriv, all five worker capability masks must be zero. The
 namespace and device restrictions remain part of the service profile.
+
+The native root profile records inheritable SETUID plus SETPCAP (mask384):
+systemd's seccomp setup retains SETPCAP in that set while applying its filters.
+The same run verifies permitted/effective/bounding mask480, ambient mask128,
+and NNP=1. This is parent supervision authority; setpriv must still clear every
+worker capability set. See the
+[capability helper](https://github.com/systemd/systemd/blob/v255/src/basic/capability-util.c#L337-L359).
