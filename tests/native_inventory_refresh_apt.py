@@ -184,6 +184,7 @@ def prove_privilege_transition():
     # boundary and exact sandbox. Its child only reads /proc/self/status.
     source=('import subprocess,sys\n'
             'state=dict(line.split(":",1) for line in open("/proc/self/status") if ":" in line)\n'
+            'print("guardian_kernel_masks="+":".join(str(int(state[key],16)) for key in ["CapPrm","CapEff","CapBnd","CapInh","CapAmb"])+":"+state["NoNewPrivs"].strip(),file=sys.stderr)\n'
             'assert all(state[key].split()==["0"]*4 for key in ["Uid","Gid"])\n'
             'assert all(int(state[key],16)==480 for key in ["CapPrm","CapEff","CapBnd"])\n'
             'assert all(int(state[key],16)==128 for key in ["CapInh","CapAmb"])\n'
@@ -203,8 +204,9 @@ def prove_privilege_transition():
         '-p','RestrictNamespaces=yes','-p','PrivateDevices=yes','-p','PrivateTmp=yes',
         '-p','InaccessiblePaths=/tmp /var/tmp /dev/shm',
         '/usr/bin/python3','-I','-B',str(probe)]
-    result=subprocess.run(args,env=ENV,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,timeout=10)
-    assert result.returncode==0, 'Exact guardian capability profile or fixed transition rejected'
+    result=subprocess.run(args,env=ENV,stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=10)
+    masks=re.findall(rb'guardian_kernel_masks=[0-9:]{1,140}',result.stderr)
+    assert result.returncode==0, 'Exact guardian capability profile or fixed transition rejected: '+repr(masks[:1])
     assert is_live_worker(result.stdout), 'Kernel privilege state rejected after fixed transition'
 
 
