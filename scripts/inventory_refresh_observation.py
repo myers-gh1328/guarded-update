@@ -25,6 +25,21 @@ def _deadline(deadline, now):
     return current
 
 
+def _before_deadline(deadline, now):
+    if deadline is None:
+        return
+    if not callable(now):
+        raise ObservationError('state_inconsistent')
+    try:
+        current=_deadline(deadline,now)
+    except ObservationError:
+        raise
+    except Exception:
+        raise ObservationError('state_inconsistent') from None
+    if current>=deadline:
+        raise ObservationError('lease_expired')
+
+
 def _stable(info):
     return (info.st_dev, info.st_ino, info.st_mode, info.st_uid, info.st_gid,
             info.st_nlink, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
@@ -77,17 +92,18 @@ class NativeReadLocks:
         self._cleanup_uncertain = False
 
     @classmethod
-    def fixed(cls):
+    def fixed(cls, *, deadline_ms=None, now=None):
         """Root coordinator only: exact Linux native paths, no caller options."""
         if sys.platform != 'linux' or os.geteuid() != 0:
             raise ObservationError('policy_unsupported')
+        _before_deadline(deadline_ms,now)
         root = os.open('/',os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
         ancestries=[]
         guard=None
         try:
             ancestries.append(_Ancestry.open(root,('var','lib','dpkg')))
             ancestries.append(_Ancestry.open(root,('run',)))
-            guard=cls.acquire(ancestries[0].fds[-1],ancestries[1].fds[-1])
+            guard=cls.acquire(ancestries[0].fds[-1],ancestries[1].fds[-1],deadline_ms=deadline_ms,now=now)
             guard._ancestries=ancestries
             ancestries=[]
             guard.verify()
@@ -102,7 +118,8 @@ class NativeReadLocks:
                 ancestry.close()
 
     @classmethod
-    def acquire(cls, dpkg_directory, runtime_directory, *, owner=0):
+    def acquire(cls, dpkg_directory, runtime_directory, *, owner=0, deadline_ms=None, now=None):
+        _before_deadline(deadline_ms,now)
         guard = cls()
         guard.owner = owner
         if not _NATIVE_OWNER.acquire(blocking=False):
@@ -116,11 +133,13 @@ class NativeReadLocks:
             for directory, entry, native in [
                     (runtime, 'guarded-update-executor.lock', False),
                     (dpkg, 'lock-frontend', True), (dpkg, 'lock', True)]:
-                flags = os.O_RDONLY if native else os.O_RDWR | os.O_CREAT
+                _before_deadline(deadline_ms,now)
+                flags = os.O_RDONLY
                 fd = os.open(entry, flags | os.O_NOFOLLOW | os.O_NONBLOCK,
                              0o600, dir_fd=directory)
                 guard._files.append((directory, entry, fd, native, _identity(os.fstat(fd))))
                 _file(fd, owner)
+                _before_deadline(deadline_ms,now)
                 try:
                     if native:
                         fcntl.lockf(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
@@ -130,6 +149,7 @@ class NativeReadLocks:
                     raise ObservationError('package_manager_busy' if native else 'executor_busy') from None
             guard._closed = False
             guard.verify()
+            _before_deadline(deadline_ms,now)
             return guard
         except BaseException as error:
             guard.close()
@@ -330,7 +350,7 @@ class Observation:
     independently enforce the 120s deadline even if this process stops responding.
     """
     @classmethod
-    def begin(cls, guard, nonce, boot_id, cache, policy, accepted_ms, clock):
+    def begin(cls, guard, nonce, boot_id, cache, policy, accepted_ms, clock, *, deadline_ms=None):
         value=cls()
         value._guard=guard
         value._clock=clock
@@ -347,6 +367,12 @@ class Observation:
             guard.verify()
             opened=value._time()
             expiry=opened+120000
+            if deadline_ms is not None:
+                if type(deadline_ms) is not int or not 0<=deadline_ms<=MAX_SAFE:
+                    raise ObservationError('invalid_request')
+                expiry=min(expiry,deadline_ms)
+            if expiry<=opened:
+                raise ObservationError('lease_expired')
             if accepted_ms>opened or expiry>MAX_SAFE:
                 raise ObservationError('state_inconsistent')
             before=guard.fingerprint(expiry,value._time)
@@ -411,3 +437,51 @@ class Observation:
     def abort(self):
         self._used=True
         self._guard.close()
+
+
+def prepare_executor_guard(runtime_directory, *, owner=0):
+    """Trusted parent only; never truncate, repair or remove an existing guard."""
+    fd=None
+    created=False
+    try:
+        _directory(runtime_directory,owner)
+        try:
+            fd=os.open('guarded-update-executor.lock',os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK,dir_fd=runtime_directory)
+        except FileNotFoundError:
+            fd=os.open('guarded-update-executor.lock',os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW|os.O_NONBLOCK,0o600,dir_fd=runtime_directory)
+            created=True
+        info=_file(fd,owner)
+        if stat.S_IMODE(info.st_mode)!=0o600:
+            raise ObservationError('state_inconsistent')
+        named=os.stat('guarded-update-executor.lock',dir_fd=runtime_directory,follow_symlinks=False)
+        if _stable(info)!=_stable(named):
+            raise ObservationError('state_inconsistent')
+        if created:
+            os.fsync(fd)
+            os.fsync(runtime_directory)
+        after=_file(fd,owner)
+        named=os.stat('guarded-update-executor.lock',dir_fd=runtime_directory,follow_symlinks=False)
+        if _stable(info)!=_stable(after) or _stable(after)!=_stable(named):
+            raise ObservationError('state_inconsistent')
+        return created
+    except OSError:
+        raise ObservationError('state_inconsistent') from None
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
+def prepare_fixed_executor_guard():
+    if sys.platform!='linux' or os.geteuid()!=0:
+        raise ObservationError('policy_unsupported')
+    root=os.open('/',os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+    ancestry=None
+    try:
+        ancestry=_Ancestry.open(root,('run',))
+        created=prepare_executor_guard(ancestry.fds[-1])
+        ancestry.verify()
+        return created
+    finally:
+        if ancestry is not None:
+            ancestry.close()
+        os.close(root)

@@ -427,3 +427,18 @@ If prior started work exists, marking it Unconfirmed is another guarded durable
 save. Parse, sync or cleanup failure leaves snapshots/starts/publication blocked.
 This neither initializes missing state nor retries native work. Reporting and
 retained inventory uploads remain independent of helper availability.
+
+The observer now opens the existing executor guard read-only without creation.
+Only trusted parent/provisioning code prepares the one fixed guard beforehand;
+it preserves existing bytes and rejects unsafe objects or permissions without
+repair. This lets shared native/executor locks work within a read-only observer
+filesystem sandbox. A separate hosted read-only proof verifies actual writable
+access denial plus successful shared acquisition/fingerprinting/release. It does
+not claim writer contention inside that namespace; the ordinary host proof tests
+actual writers independently.
+
+An admitted root job's absolute deadline is checked before native guard attempts
+and caps the actual observation identity to the earlier of that deadline and
+`lock_open + 120 seconds`. Active lease and release receipt carry this same bound.
+This prevents a delayed launch from advertising a fresh full interval. Independent
+guardian/process containment remains a separate required integration proof.

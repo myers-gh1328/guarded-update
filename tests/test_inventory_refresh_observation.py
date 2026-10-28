@@ -257,6 +257,76 @@ class NativeObservationTests(unittest.TestCase):
         finally:
             observation.abort()
 
+    def test_observation_uses_existing_executor_guard_under_read_only_filesystem_policy(self):
+        original_open=p.os.open
+        def read_only(entry,flags,*args,**kwargs):
+            if entry=='guarded-update-executor.lock' and (flags&os.O_ACCMODE)!=os.O_RDONLY:
+                raise OSError('synthetic read-only filesystem')
+            if entry=='guarded-update-executor.lock' and flags&os.O_CREAT:
+                raise OSError('synthetic forbidden creation')
+            return original_open(entry,flags,*args,**kwargs)
+        with patch.object(p.os,'open',side_effect=read_only):
+            guard=p.NativeReadLocks.acquire(self.dpkg_fd,self.runtime_fd,owner=os.getuid())
+        try:
+            self.assertEqual(self.attempt(self.runtime/'guarded-update-executor.lock','executor'),75)
+        finally:
+            guard.close()
+
+    def test_observation_never_creates_a_missing_executor_guard(self):
+        path=self.runtime/'guarded-update-executor.lock'
+        path.unlink()
+        guard=None
+        try:
+            with self.assertRaises(p.ObservationError):
+                guard=p.NativeReadLocks.acquire(self.dpkg_fd,self.runtime_fd,owner=os.getuid())
+            self.assertFalse(path.exists())
+        finally:
+            if guard is not None:
+                guard.close()
+
+    def test_privileged_parent_prepares_exact_guard_without_repairing_or_truncating_existing_data(self):
+        path=self.runtime/'guarded-update-executor.lock'
+        path.unlink()
+        self.assertTrue(p.prepare_executor_guard(self.runtime_fd,owner=os.getuid()))
+        self.assertEqual(path.read_bytes(),b'')
+        self.assertEqual(path.stat().st_mode&0o7777,0o600)
+        path.write_bytes(b'synthetic existing lock marker')
+        self.assertFalse(p.prepare_executor_guard(self.runtime_fd,owner=os.getuid()))
+        self.assertEqual(path.read_bytes(),b'synthetic existing lock marker')
+        path.chmod(0o644)
+        with self.assertRaises(p.ObservationError):
+            p.prepare_executor_guard(self.runtime_fd,owner=os.getuid())
+        self.assertEqual(path.stat().st_mode&0o7777,0o644)
+        self.assertEqual(path.read_bytes(),b'synthetic existing lock marker')
+
+    def test_root_job_deadline_caps_actual_observation_identity_and_receipt(self):
+        nonce='0000000000000001'+'a'*16
+        boot='11111111-1111-4111-8111-111111111111'
+        guard=p.NativeReadLocks.acquire(self.dpkg_fd,self.runtime_fd,owner=os.getuid())
+        observation=p.Observation.begin(guard,nonce,boot,'b'*32,'c'*64,99,lambda:(boot,100),deadline_ms=120)
+        try:
+            self.assertEqual(observation.lease()['lock_open_boottime_ms'],100)
+            self.assertEqual(observation.lease()['expires_boottime_ms'],120)
+            self.assertEqual(observation.finish(nonce)['expires_boottime_ms'],120)
+        finally:
+            observation.abort()
+
+    def test_expired_root_job_is_rejected_before_any_native_guard_open(self):
+        original_open=p.os.open
+        opened=[]
+        def tracked(entry,*args,**kwargs):
+            opened.append(entry)
+            return original_open(entry,*args,**kwargs)
+        guard=None
+        try:
+            with patch.object(p.os,'open',side_effect=tracked):
+                with self.assertRaises(p.ObservationError):
+                    guard=p.NativeReadLocks.acquire(self.dpkg_fd,self.runtime_fd,owner=os.getuid(),deadline_ms=100,now=lambda:100)
+            self.assertEqual(opened,[])
+        finally:
+            if guard is not None:
+                guard.close()
+
     def test_installed_fingerprint_is_stable_and_distinguishes_missing_empty_and_changed_state(self):
         guard = p.NativeReadLocks.acquire(self.dpkg_fd, self.runtime_fd, owner=os.getuid())
         try:

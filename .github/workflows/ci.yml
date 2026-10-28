@@ -94,6 +94,14 @@ jobs:
       - name: Prove actual native package locks and exact observation release on disposable runner
         run: |
           sudo --preserve-env=GITHUB_ACTIONS python3 -B tests/native_inventory_refresh_observation.py > native-refresh-observation-proof.json
+      - name: Verify actual read-only native observation sandbox
+        run: |
+          sudo /usr/bin/systemd-run --quiet --wait --collect --pipe --unit=command-center-inventory-readonly-proof --property=ProtectSystem=strict --property=RuntimeMaxSec=30 --property=Restart=no --setenv=GITHUB_ACTIONS=true --setenv=GUARDED_UPDATE_NATIVE_READONLY_PROOF=1 /usr/bin/python3 -B "$GITHUB_WORKSPACE/tests/native_inventory_refresh_observation.py" > native-refresh-readonly-observation-proof.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-inventory-refresh-readonly-observation-proof
+          path: native-refresh-readonly-observation-proof.json
+          if-no-files-found: error
       - uses: actions/upload-artifact@v4
         with:
           name: native-inventory-refresh-observation-proof
