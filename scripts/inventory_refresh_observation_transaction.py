@@ -55,8 +55,16 @@ class ObservationTransaction:
         except BaseException:
             if lease is not None:raise
             current_policy=None
+        manifest=None
+        if self._manifest is not None:
+            try:
+                with self._store.lease_current() as current:
+                    if current.manifest!=self._manifest:raise ValueError('Inventory observation cache changed')
+                    manifest=current.manifest
+            except BaseException:
+                if lease is not None:raise
         publish_current_status(self._journal,self._publisher,boot_id=self._previous[0],
-            current_policy=current_policy,manifest=self._manifest,
+            current_policy=current_policy,manifest=manifest,
             observation_lease=lease,operational_health=reason)
 
     def _unpin(self):
@@ -165,6 +173,7 @@ class ObservationTransaction:
             self._fatal();raise ValueError('Inventory observation release unconfirmed') from None
 
     def _fail(self,reason):
+        if reason=='cleanup_unconfirmed':raise ValueError('Native observation cleanup unconfirmed')
         self._cleanup();identity,now=self._context()
         for capability in ('release','observation'):
             record=self._journal.snapshot()['capabilities'][capability]['active']

@@ -137,6 +137,7 @@ class ObservationTransactionTests(unittest.TestCase):
         self.assertTrue(self.journal.snapshot()['unconfirmed'])
         self.assertIsNone(self.journal.snapshot()['last_observation'])
         self.assertIsNone(self.status()['observation_lease'])
+        self.assertIsNone(self.status()['cache_generation'])
 
     def test_changed_policy_withdraws_offer_and_cannot_accept(self):
         self.transaction.begin(self.nonce);self.opened();self.transaction.poll()
@@ -177,6 +178,13 @@ class ObservationTransactionTests(unittest.TestCase):
         value=self.journal.snapshot();self.assertEqual(value['last_success'],frozen)
         self.assertFalse(value['unconfirmed']);self.assertIsNone(value['last_observation'])
         self.assertIsNone(self.status()['operation_nonce'])
+
+    def test_child_cleanup_uncertainty_fences_even_after_owned_service_close(self):
+        self.transaction.begin(self.nonce)
+        self.child.write_result(ObservationResult.create(self.channel.read_job(),'failed',reason='cleanup_unconfirmed'))
+        with self.assertRaises(ValueError):self.transaction.poll()
+        self.assertTrue(self.journal.snapshot()['unconfirmed'])
+        self.assertIsNone(self.status()['observation_lease'])
 
     def test_terminal_metadata_is_not_sufficient_without_owned_service_success(self):
         self.transaction.begin(self.nonce);lease=self.opened();self.transaction.poll()
