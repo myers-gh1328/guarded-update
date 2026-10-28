@@ -295,6 +295,14 @@ Dir::Cache::archives "/dev/null";
 Dir::Cache::pkgcache "";
 Dir::Cache::srcpkgcache "";
 Dir::Log "/dev/null";
+Acquire::IndexTargets::deb::Packages::MetaKey "$(COMPONENT)/binary-$(ARCHITECTURE)/Packages";
+Acquire::IndexTargets::deb::Packages::flatMetaKey "Packages";
+Acquire::IndexTargets::deb::Packages::ShortDescription "Packages";
+Acquire::IndexTargets::deb::Packages::Description "$(RELEASE)/$(COMPONENT) $(ARCHITECTURE) Packages";
+Acquire::IndexTargets::deb::Packages::flatDescription "$(RELEASE) Packages";
+Acquire::IndexTargets::deb::Packages::Optional "false";
+Acquire::IndexTargets::deb::Packages::KeepCompressed "true";
+Acquire::Languages "none";
 """
 
 

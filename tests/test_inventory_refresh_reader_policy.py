@@ -36,6 +36,15 @@ class ReaderPolicyTests(unittest.TestCase):
             self.assertNotIn(secret,b''.join(files.values()))
         self.assertNotIn('synthetic-private-value',repr(projection))
         with self.assertRaises(AttributeError):projection.cache_generation='c'*32
+    def test_reader_restores_fixed_package_index_targets_after_clearing_acquire(self):
+        config=dict(self.projection().files)['apt.conf'].decode()
+        required=('MetaKey','flatMetaKey','ShortDescription','Description','flatDescription','Optional','KeepCompressed')
+        for field in required:
+            lines=[line for line in config.splitlines() if line.startswith('Acquire::IndexTargets::deb::Packages::'+field+' ')]
+            self.assertEqual(len(lines),1,field)
+        self.assertIn('Acquire::IndexTargets::deb::Packages::MetaKey "$(COMPONENT)/binary-$(ARCHITECTURE)/Packages";',config)
+        self.assertIn('Acquire::IndexTargets::deb::Packages::KeepCompressed "true";',config)
+
     def test_auth_and_proxy_change_private_commitment_without_disclosing_values(self):
         baseline=dict(self.projection().files)
         for field in ('auth','proxy'):
