@@ -1,6 +1,8 @@
 // Disconnected request foundation; runtime integration is separately gated.
 #[cfg(any(target_os = "macos", test))]
 mod brew;
+#[cfg(test)]
+mod clock;
 #[cfg(any(target_os = "linux", test))]
 mod linux;
 #[cfg(any(target_os = "macos", test))]

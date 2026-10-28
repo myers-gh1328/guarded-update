@@ -180,3 +180,19 @@ upload. That advertised exact-byte digest is already the final line of the
 unchanged signed canonical message; the server verifies the header signature
 first and the uploaded bytes afterward. Older clients without this header must
 not activate against the reporting API that requires it.
+
+## Staged request timing
+
+Request journals and native timing remain disconnected from runtime capability
+advertisement until lifecycle and native observation integration pass. No request
+capability is enabled by installing this source.
+
+macOS samples its boot-session UUID and
+[CLOCK_MONOTONIC_RAW](https://github.com/apple-oss-distributions/Libc/blob/main/include/_time.h)
+through the fixed native nanosecond API. Apple documents this as continuous timing
+including sleep. Linux uses the approved helper profile's system Python3 in
+isolated mode to sample the kernel boot ID and native CLOCK_BOOTTIME, avoiding
+32-bit libc time_t/time64 ABI assumptions in static ARM builds. The fixed probe
+has a five-second timeout and 256-byte output bound. Neither platform derives
+proof timing from wall-clock subtraction or logs actual clock/boot values.
+Linux-native clock execution must also pass hosted Linux CI before activation.

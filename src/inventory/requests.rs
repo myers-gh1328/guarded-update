@@ -625,7 +625,7 @@ pub struct Clock {
     pub unix_ms: u64,
 }
 impl Clock {
-    fn validate(&self) -> Result<()> {
+    pub(super) fn validate(&self) -> Result<()> {
         require(uuid(&self.boot_id) && safe(self.boottime_ms) && safe(self.unix_ms))
     }
 }
