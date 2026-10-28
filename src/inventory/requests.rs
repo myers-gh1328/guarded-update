@@ -119,6 +119,70 @@ impl Negotiated {
         self.enabled && self.agreed.contains(&capability)
     }
 }
+/// Exact negotiated controller response; parse retained response bytes, not Value reserialization.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CheckIn {
+    pub schema_version: u32,
+    pub server_time: String,
+    pub source_revision: u64,
+    pub reporting_enabled: bool,
+    #[serde(deserialize_with = "nullable")]
+    pub receipt: Option<Receipt>,
+    #[serde(deserialize_with = "nullable")]
+    pub refresh_request: Option<ManualDelivery>,
+    pub capabilities: Vec<Capability>,
+    pub requests_enabled: bool,
+    #[serde(deserialize_with = "nullable")]
+    pub collection_request: Option<CollectionDelivery>,
+    #[serde(deserialize_with = "nullable")]
+    pub refresh_status: Option<Canonical>,
+    #[serde(deserialize_with = "nullable")]
+    pub collection_status: Option<Canonical>,
+}
+impl CheckIn {
+    pub fn parse(bytes: &[u8]) -> Result<Self> {
+        require(bytes.len() <= MAX_JOURNAL)?;
+        let value: Self =
+            serde_json::from_slice(bytes).map_err(|_| "Invalid inventory check-in response")?;
+        require(
+            value.schema_version == 1 && value.reporting_enabled && positive(value.source_revision),
+        )?;
+        utc_millis(&value.server_time)?;
+        Negotiated::new(&[], &value.capabilities, value.requests_enabled)?;
+        if let Some(delivery) = &value.refresh_request {
+            Delivery::Manual(delivery.clone()).validate()?;
+            require(value.requests_enabled && value.capabilities.contains(&Capability::Manual))?;
+        }
+        if let Some(delivery) = &value.collection_request {
+            Delivery::Collection(delivery.clone()).validate()?;
+            require(
+                value.requests_enabled
+                    && value.capabilities.contains(&Capability::Collection)
+                    && delivery.source_revision == value.source_revision,
+            )?;
+        }
+        if let Some(receipt) = &value.receipt {
+            require(
+                receipt.schema_version == 1
+                    && uuid(&receipt.enrollment_id)
+                    && uuid(&receipt.report_id)
+                    && positive(receipt.sequence)
+                    && hex(&receipt.sha256, 64)
+                    && ["current", "comparison", "history"].contains(&receipt.disposition.as_str()),
+            )?;
+            utc_millis(&receipt.accepted_at)?;
+        }
+        for status in [&value.refresh_status, &value.collection_status]
+            .into_iter()
+            .flatten()
+        {
+            status.validate()?;
+        }
+        Ok(value)
+    }
+}
+
 /// This permits only a fresh legacy check-in, never request work or rewriting a report.
 pub fn legacy_fallback(status: u16, response: &[u8]) -> bool {
     #[derive(Deserialize)]
@@ -863,7 +927,10 @@ impl Entry {
                     .as_ref()
                     .is_none_or(|v| v == self.proof.nonce())
                 && self.terminal.is_none_or(|s| s.terminal())
-                && (!self.submitted || self.acknowledged_nonce.is_some()),
+                && (!self.submitted || self.acknowledged_nonce.is_some())
+                && !(matches!(self.proof, Proof::Collection(_))
+                    && self.proof.ready()
+                    && self.report.is_none()),
         )?;
         if let Delivery::Collection(d) = &self.delivery {
             require(d.source_revision == self.source_revision)?;
@@ -1071,6 +1138,32 @@ impl<'a> RequestJournal<'a> {
         }
         let mut next = self.journal.clone();
         let result = apply(&mut next)?;
+        // Supersession is absorbing across every local mutator, including
+        // generic error handling. Only canonical reconciliation may move the
+        // unchanged entry into last-terminal metadata.
+        for cap in [Capability::Manual, Capability::Collection] {
+            if let Some(before) = self.journal.domain(cap).active.as_ref()
+                && before.pending_status == ClientStatus::ResultSuperseded
+            {
+                let domain = next.domain(cap);
+                let after = domain
+                    .active
+                    .as_ref()
+                    .into_iter()
+                    .chain(domain.last_terminal.as_ref())
+                    .find(|entry| entry.delivery.id() == before.delivery.id())
+                    .ok_or(
+                        "Superseded request cannot be discarded before canonical reconciliation",
+                    )?;
+                let mut frozen = after.clone();
+                frozen.terminal = before.terminal;
+                require(
+                    serde_json::to_vec(&frozen).map_err(|_| "Cannot encode superseded request")?
+                        == serde_json::to_vec(before)
+                            .map_err(|_| "Cannot encode superseded request")?,
+                )?;
+            }
+        }
         let bytes = next.encode()?;
         self.poisoned = true;
         super::state::atomic(&self.dir.join("requests.json"), &bytes)?;
@@ -1253,7 +1346,10 @@ impl<'a> RequestJournal<'a> {
                 .as_mut()
                 .ok_or("No active inventory request")?;
             require(entry.submitted)?;
-            entry.proof = entry.proof.merge(proof)?;
+            require(entry.pending_status != ClientStatus::ResultSuperseded)?;
+            let merged = entry.proof.merge(proof)?;
+            require(cap != Capability::Collection || !merged.ready() || entry.report.is_some())?;
+            entry.proof = merged;
             if let Proof::Manual(p) = &entry.proof {
                 if p.no_work() {
                     require(safe_reason.is_some())?;
@@ -1288,13 +1384,17 @@ impl<'a> RequestJournal<'a> {
             Ok(())
         })
     }
-    pub fn bind_report(
+    /// Persist finished proof and exact report binding in one journal commit.
+    pub fn bind_ready_report(
         &mut self,
         cap: Capability,
+        proof: &Proof,
         id: &str,
         sequence: u64,
         sha256: &str,
     ) -> Result<()> {
+        proof.validate()?;
+        require(proof.capability() == cap)?;
         require(uuid(id) && positive(sequence) && hex(sha256, 64))?;
         self.change(|j| {
             let entry = j
@@ -1302,10 +1402,12 @@ impl<'a> RequestJournal<'a> {
                 .active
                 .as_mut()
                 .ok_or("No active inventory request")?;
+            let merged = entry.proof.merge(proof)?;
             require(
                 entry.submitted
-                    && entry.proof.ready()
-                    && entry.proof.scan().is_some_and(|s| {
+                    && entry.pending_status != ClientStatus::ResultSuperseded
+                    && merged.ready()
+                    && merged.scan().is_some_and(|s| {
                         s.report_id == id
                             && s.sequence == sequence
                             && s.source_revision == entry.source_revision
@@ -1314,6 +1416,7 @@ impl<'a> RequestJournal<'a> {
             if let Some(old) = &entry.report {
                 require(old.id == id && old.sequence == sequence && old.sha256 == sha256)?;
             }
+            entry.proof = merged;
             entry.report = Some(ReportRef {
                 id: id.into(),
                 sequence,
@@ -1537,6 +1640,158 @@ impl<'a> RequestJournal<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn supersession_is_absorbing_even_through_generic_error_handlers() {
+        for intermediate in ["failed", "unconfirmed"] {
+            let fixture = Fixture::new();
+            let mut journal = fixture.open();
+            let ready = ready_collection(&mut journal, 1);
+            let proof = Proof::parse(
+                Capability::Collection,
+                &serde_json::to_vec(ready.attempt.as_ref().unwrap()).unwrap(),
+            )
+            .unwrap();
+            journal
+                .superseded(Capability::Collection, REPORT, &"c".repeat(64))
+                .unwrap();
+            let mutation = if intermediate == "failed" {
+                journal.fail(Capability::Collection, "unavailable")
+            } else {
+                journal.unconfirmed(Capability::Collection)
+            };
+            assert!(mutation.is_err());
+            assert!(
+                journal
+                    .bind_ready_report(Capability::Collection, &proof, REPORT, 1, &"c".repeat(64))
+                    .is_err()
+            );
+            drop(journal);
+            let journal = fixture.open();
+            assert_eq!(
+                journal
+                    .pending(Capability::Collection)
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                ClientStatus::ResultSuperseded
+            );
+        }
+    }
+    #[test]
+    fn superseded_report_binding_cannot_revive_local_running_state() {
+        let fixture = Fixture::new();
+        let mut journal = fixture.open();
+        let ready = ready_collection(&mut journal, 1);
+        let proof = Proof::parse(
+            Capability::Collection,
+            &serde_json::to_vec(ready.attempt.as_ref().unwrap()).unwrap(),
+        )
+        .unwrap();
+        journal
+            .superseded(Capability::Collection, REPORT, &"c".repeat(64))
+            .unwrap();
+        assert!(
+            journal
+                .bind_ready_report(Capability::Collection, &proof, REPORT, 1, &"c".repeat(64))
+                .is_err()
+        );
+        assert_eq!(
+            journal
+                .pending(Capability::Collection)
+                .unwrap()
+                .unwrap()
+                .status,
+            ClientStatus::ResultSuperseded
+        );
+    }
+    #[test]
+    fn finished_proof_and_report_binding_commit_together_or_leave_no_ready_evidence() {
+        let fixture = Fixture::new();
+        let mut journal = fixture.open();
+        journal
+            .admit(delivery(1), 1, &clock(1000), "aaaaaaaaaaaaaaaa", &session())
+            .unwrap();
+        let accepted = journal.pending(Capability::Collection).unwrap().unwrap();
+        journal
+            .canonical(
+                Capability::Collection,
+                &canonical(&accepted, CanonicalStatus::Delivered, None),
+            )
+            .unwrap();
+        journal
+            .begin(Capability::Collection, &clock(1001), &session())
+            .unwrap();
+        let before =
+            serde_json::to_value(journal.pending(Capability::Collection).unwrap().unwrap())
+                .unwrap();
+        let mut ready = collection_proof();
+        ready.scan = Some(ScanProof {
+            report_id: REPORT.into(),
+            sequence: 1,
+            source_revision: 1,
+            started_boottime_ms: 1100,
+            finished_boottime_ms: Some(1200),
+        });
+        let proof = Proof::Collection(ready);
+        assert!(
+            journal
+                .progress(Capability::Collection, &proof, None)
+                .is_err()
+        );
+        assert_eq!(
+            serde_json::to_value(journal.pending(Capability::Collection).unwrap().unwrap())
+                .unwrap(),
+            before
+        );
+        assert!(
+            journal
+                .bind_ready_report(Capability::Collection, &proof, REPORT, 1, "not-a-hash")
+                .is_err()
+        );
+        assert_eq!(
+            serde_json::to_value(journal.pending(Capability::Collection).unwrap().unwrap())
+                .unwrap(),
+            before
+        );
+        journal
+            .bind_ready_report(Capability::Collection, &proof, REPORT, 1, &"c".repeat(64))
+            .unwrap();
+        drop(journal);
+        let reopened = fixture.open();
+        let pending = reopened.pending(Capability::Collection).unwrap().unwrap();
+        assert_eq!(pending.report_id.as_deref(), Some(REPORT));
+        assert_eq!(
+            pending.attempt.unwrap()["scan"]["finished_boottime_ms"],
+            1200
+        );
+    }
+    #[test]
+    fn negotiated_checkin_is_strict_and_never_offers_paused_or_unsupported_delivery() {
+        let body = serde_json::json!({"schema_version":1,"server_time":"2026-10-28T00:00:00Z","source_revision":2,"reporting_enabled":true,"receipt":null,"refresh_request":null,"capabilities":["inventory_collection_v1"],"requests_enabled":true,"collection_request":{"request_id":"00000000-0000-4000-8000-000000000001","delivery_sequence":1,"not_before":"2026-10-28T00:00:00Z","source_revision":2},"refresh_status":null,"collection_status":null});
+        assert_eq!(
+            CheckIn::parse(&serde_json::to_vec(&body).unwrap())
+                .unwrap()
+                .source_revision,
+            2
+        );
+        for (key, value) in [
+            ("requests_enabled", serde_json::json!(false)),
+            ("capabilities", serde_json::json!([])),
+            ("source_revision", serde_json::json!(3)),
+        ] {
+            let mut altered = body.clone();
+            altered[key] = value;
+            assert!(CheckIn::parse(&serde_json::to_vec(&altered).unwrap()).is_err());
+        }
+        let mut unknown = body.clone();
+        unknown["unexpected"] = serde_json::json!(true);
+        assert!(CheckIn::parse(&serde_json::to_vec(&unknown).unwrap()).is_err());
+        let duplicate =
+            serde_json::to_string(&body)
+                .unwrap()
+                .replacen("{", "{\"capabilities\":[],", 1);
+        assert!(CheckIn::parse(duplicate.as_bytes()).is_err());
+    }
     #[test]
     fn negotiation_is_per_capability_and_fallback_is_only_explicit_old_checkin() {
         let mac = capabilities(Platform::Macos, true, true);
@@ -2307,10 +2562,13 @@ mod tests {
             finished_boottime_ms: Some(1200),
         });
         journal
-            .progress(Capability::Collection, &Proof::Collection(proof), None)
-            .unwrap();
-        journal
-            .bind_report(Capability::Collection, REPORT, 1, &"c".repeat(64))
+            .bind_ready_report(
+                Capability::Collection,
+                &Proof::Collection(proof),
+                REPORT,
+                1,
+                &"c".repeat(64),
+            )
             .unwrap();
         journal.pending(Capability::Collection).unwrap().unwrap()
     }

@@ -150,6 +150,14 @@ pub fn atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
         .map_err(|_| "Cannot persist state directory".into())
 }
 
+pub fn encode_report(report: &Value) -> Result<Vec<u8>, String> {
+    let bytes = serde_json::to_vec(report).map_err(|_| "Cannot encode inventory")?;
+    if bytes.len() > MAX_REPORT {
+        return Err("Inventory report exceeds 8 MiB encoded limit".into());
+    }
+    Ok(bytes)
+}
+
 pub struct Store {
     pub dir: PathBuf,
     pub schedule: Schedule,
@@ -213,11 +221,36 @@ impl Store {
         Ok(Some(report))
     }
     pub fn replace(&mut self, report: &Value, now: u64) -> Result<(), String> {
-        let bytes = serde_json::to_vec(report).map_err(|_| "Cannot encode inventory")?;
+        let bytes = encode_report(report)?;
+        self.replace_encoded(&bytes, now)
+    }
+    pub fn replace_encoded(&mut self, bytes: &[u8], now: u64) -> Result<(), String> {
         if bytes.len() > MAX_REPORT {
             return Err("Inventory report exceeds 8 MiB encoded limit".into());
         }
-        atomic(&self.dir.join("latest.json"), &bytes)?;
+        let report: Value =
+            serde_json::from_slice(bytes).map_err(|_| "Invalid encoded inventory")?;
+        let sequence = report["sequence"]
+            .as_u64()
+            .filter(|value| *value > 0 && *value <= self.schedule.sequence)
+            .ok_or("Report sequence was not durably reserved")?;
+        if report["enrollment_id"] != self.schedule.enrollment_id {
+            return Err("Report enrollment does not match retained state".into());
+        }
+        if let Some(prior) = self.latest()? {
+            let prior_sequence = prior["sequence"]
+                .as_u64()
+                .ok_or("Latest report sequence invalid")?;
+            if sequence < prior_sequence
+                || sequence == prior_sequence
+                    && read(&self.dir.join("latest.json"), MAX_REPORT)? != bytes
+            {
+                return Err(
+                    "Retained report identity or bytes cannot be replaced by stale content".into(),
+                );
+            }
+        }
+        atomic(&self.dir.join("latest.json"), bytes)?;
         self.schedule.collected_at_secs = now;
         let jitter = u64::from_str_radix(&super::transport::random_hex(2)?, 16)
             .map_err(|_| "Collection jitter unavailable")?
@@ -301,6 +334,55 @@ pub(super) mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+    #[test]
+    fn encoded_publication_never_rewinds_sequence_changes_scope_or_mutates_bound_bytes() {
+        let temp = TestDir::new();
+        Store::initialize(&temp.0, "epoch").unwrap();
+        let mut store = Store::load(&temp.0, "epoch").unwrap();
+        let first = br#"{"enrollment_id":"epoch","sequence":1,"report_id":"one"}"#;
+        assert!(store.replace_encoded(first, 1).is_err());
+        store.reserve().unwrap();
+        store.replace_encoded(first, 1).unwrap();
+        store.reserve().unwrap();
+        let second = br#"{"enrollment_id":"epoch","sequence":2,"report_id":"two"}"#;
+        store.replace_encoded(second, 2).unwrap();
+        for invalid in [
+            first.as_slice(),
+            br#"{"enrollment_id":"other","sequence":2,"report_id":"two"}"#,
+            br#"{"enrollment_id":"epoch","sequence":3,"report_id":"three"}"#,
+            br#"{"enrollment_id":"epoch","sequence":2,"report_id":"changed"}"#,
+        ] {
+            assert!(store.replace_encoded(invalid, 3).is_err());
+            assert_eq!(
+                read(&temp.0.join("latest.json"), MAX_REPORT).unwrap(),
+                second
+            );
+        }
+        assert_eq!(
+            store
+                .replace_encoded(&vec![b' '; MAX_REPORT + 1], 3)
+                .unwrap_err(),
+            "Inventory report exceeds 8 MiB encoded limit"
+        );
+    }
+    #[test]
+    fn exact_encoded_report_replaces_the_single_latest_body_without_reserialization() {
+        let temp = TestDir::new();
+        Store::initialize(&temp.0, "epoch").unwrap();
+        let mut store = Store::load(&temp.0, "epoch").unwrap();
+        store.reserve().unwrap();
+        let bytes=b"{ \"enrollment_id\": \"epoch\", \"sequence\":1, \"report_id\":\"synthetic-report\", \"collection_request_id\":\"00000000-0000-4000-8000-000000000001\" }";
+        store.replace_encoded(bytes, 100).unwrap();
+        assert_eq!(
+            read(&temp.0.join("latest.json"), MAX_REPORT).unwrap(),
+            bytes
+        );
+        assert_eq!(
+            store.latest().unwrap().unwrap()["report_id"],
+            "synthetic-report"
+        );
+        assert_eq!(fs::read_dir(&temp.0).unwrap().count(), 2);
     }
     #[test]
     fn sequence_reservation_survives_interrupted_collection_and_latest_replaces() {

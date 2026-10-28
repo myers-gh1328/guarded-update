@@ -203,3 +203,6 @@ and responses at 64KiB before interpretation. Exact response bytes and an
 unambiguous JSON content type are retained for strict request negotiation and
 canonical parsing; HTML and duplicate-field normalization cannot authorize
 legacy fallback. Existing signed package report bytes remain unchanged.
+
+See [the staged request client contract](inventory-requests.md) for journal,
+canonical acknowledgement and exact report publication invariants.

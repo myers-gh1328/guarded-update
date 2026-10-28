@@ -97,7 +97,10 @@ mod tests {
     fn native_clock_retains_boot_identity_and_monotonic_order() {
         let first = snapshot().unwrap();
         let second = snapshot().unwrap();
-        assert_eq!(first.boot_id, second.boot_id);
+        assert!(
+            first.boot_id == second.boot_id,
+            "Native boot identity changed"
+        );
         assert!(second.boottime_ms >= first.boottime_ms);
         assert!(first.unix_ms > 0);
         assert_eq!(first.boot_id.len(), 36);
