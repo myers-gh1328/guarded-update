@@ -613,6 +613,116 @@ print(json.dumps({'publisher_cap3_sealing_and_scoped_filesystem_verified':True,'
             'publisher_profile_probe_metrics':result['metrics']}
 
 
+def prove_root_refresh_transaction(expected_generation):
+    """Actual fixed production components in one CAP3 publisher, synthetic only."""
+    from inventory_refresh_publisher_profile import publisher_properties
+    from inventory_refresh_resources import UNIT
+    modules=('inventory_refresh_protocol','inventory_refresh_receipt','inventory_refresh_state',
+        'inventory_refresh_storage','inventory_refresh_status','inventory_refresh_observation',
+        'inventory_refresh_cached_observation','inventory_refresh_channel','inventory_refresh_guardian',
+        'inventory_refresh_observer','inventory_refresh_entry','inventory_refresh_service',
+        'inventory_refresh_policy','inventory_refresh_policy_admission','inventory_refresh_materialized_policy',
+        'inventory_refresh_worker_service','inventory_refresh_resources','inventory_refresh_materializer',
+        'inventory_refresh_writer_exclusion','inventory_refresh_io','inventory_refresh_coordinator',
+        'inventory_refresh_transaction')
+    for name in modules:
+        filename='guardian.py' if name=='inventory_refresh_guardian' else name+'.py'
+        shutil.copyfile(ROOT/'scripts'/(name+'.py'),LIB_ROOT/filename);(LIB_ROOT/filename).chmod(0o444)
+    # All earlier observation scopes have been independently confirmed empty.
+    for filename in ('observation-native.py','observation-guardian.py'):
+        shutil.copyfile(ROOT/'scripts/inventory_refresh_entry.py',LIB_ROOT/filename);(LIB_ROOT/filename).chmod(0o444)
+    status=Path(RUNTIME_ROOT)/'status';status.mkdir(mode=0o750);os.chown(status,0,READER);status.chmod(0o750)
+    state=os.open(STATE_ROOT,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+    try:
+        journal=Journal(state)
+        with journal.exclusive():journal.initialize(secrets.token_hex(16))
+    finally:os.close(state)
+    original=(LIB_ROOT/'resource-admission-proof.py').read_text()
+    bootstrap,marker,_=original.partition('from inventory_refresh_resources import RuntimeResources')
+    assert marker
+    bootstrap=re.sub(r'^names=.*$', 'names='+repr(modules),bootstrap,count=1,flags=re.MULTILINE)
+    bootstrap=bootstrap.replace("filename=name+'.py'", "filename='guardian.py' if name=='inventory_refresh_guardian' else name+'.py'")
+    bootstrap=bootstrap.replace('compiled={name:compile(', 'assert sum(map(len,sources.values()))<=512*1024\ncompiled={name:compile(')
+    body=r"""from inventory_refresh_resources import RuntimeResources
+from inventory_refresh_policy_admission import PolicyGuard
+from inventory_refresh_state import Journal
+from inventory_refresh_storage import Store
+from inventory_refresh_observation import _Ancestry
+from inventory_refresh_io import StatusPublisher
+from inventory_refresh_writer_exclusion import WriterExclusion
+from inventory_refresh_transaction import RefreshTransaction
+fields=dict(line.split(':',1) for line in open('/proc/self/status').read().splitlines())
+assert {name:int(fields[name].strip(),16) for name in ('CapPrm','CapEff','CapBnd','CapInh','CapAmb')}=={'CapPrm':3,'CapEff':3,'CapBnd':3,'CapInh':0,'CapAmb':0}
+assert fields['NoNewPrivs'].split()==['1']
+stage='resources'
+with RuntimeResources.fixed() as resources:
+ stage='policy'
+ with PolicyGuard.fixed() as policy:
+  assert policy.generation==@GENERATION@
+  root=os.open('/',os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW);ancestry=None;publisher=None;writers=None
+  try:
+   ancestry=_Ancestry.open(root,('var','lib','command-center-inventory-refresh'))
+   journal=Journal(ancestry.fds[-1])
+   with journal.exclusive():
+    assert journal.startup_ready()
+    stage='writer_admission'
+    writers=WriterExclusion.fixed(60001)
+    publisher=StatusPublisher.fixed(journal)
+    store=Store(resources._cache.fds[-1],0,60002,60001)
+    transaction=RefreshTransaction(journal,policy,resources,store,publisher,writers)
+    nonce='0000000000000001'+'a'*16
+    stage='transaction'
+    assert transaction.refresh(nonce)=='succeeded'
+    value=journal.snapshot();success=value['last_success']
+    assert not value['unconfirmed'] and success['attempt']['correlator']==nonce
+    assert value['capabilities']['refresh']['active'] is None
+    with store.lease_current() as lease:
+     assert lease.manifest['cache_generation']==success['attempt']['cache_generation']
+     assert lease.manifest['policy_generation']==policy.generation
+     indexes=[row for row in lease.manifest['files'] if '_Packages' in row['path']]
+     assert indexes
+     for index in indexes:lease.verify_index(index['path'])
+    status_path='/run/command-center-inventory-refresh/status/status.json'
+    status=open(status_path,'rb').read(65537);assert len(status)<=65536
+    public=json.loads(status)
+    assert public['phase']=='succeeded' and public['operation_nonce']==nonce
+    assert public['cache_generation']==success['attempt']['cache_generation']
+    assert public['successful_checked_at']==success['successful_checked_at']
+    assert transaction.refresh(nonce)=='existing'
+    assert open(status_path,'rb').read(65537)==status
+    stage='final_checks'
+    writers.check();resources.sample();policy.recheck()
+    metrics=resources.sample()
+  finally:
+   try:
+    if publisher is not None:publisher.close()
+   finally:
+    try:
+     if writers is not None:writers.close()
+    finally:
+     try:
+      if ancestry is not None:ancestry.close()
+     finally:os.close(root)
+print(json.dumps({'fixed_publisher_refresh_transaction_verified':True,'generation':@GENERATION@,'metrics':metrics,
+ 'coordinator_exercised':False,'all_allocators_charged_from_startup_verified':False},sort_keys=True))
+""".replace('@GENERATION@',repr(expected_generation))
+    body="stage='imports'\ntry:\n"+''.join(' '+line+'\n' for line in body.splitlines())+"except BaseException as error:\n print('publisher_transaction_failure='+json.dumps({'stage':stage,'kind':type(error).__name__,'errno':getattr(error,'errno',None)},sort_keys=True),file=sys.stderr)\n raise SystemExit(74)\n"
+    probe=LIB_ROOT/'publisher-transaction-proof.py'
+    compile(bootstrap+body,str(probe),'exec',dont_inherit=True)
+    probe.write_text(bootstrap+body);probe.chmod(0o444)
+    args=['/usr/bin/systemd-run','--quiet','--wait','--collect','--pipe','--unit='+UNIT,'--slice='+PARENT_SLICE]
+    for property in publisher_properties():args+=['-p',property]
+    args+=['-p','RuntimeMaxSec=120','/usr/bin/python3','-I','-B',str(probe)]
+    completed=subprocess.run(args,env=ENV,stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=130)
+    if completed.returncode:
+        lines=[line[:2048].decode('ascii',errors='replace') for line in (completed.stdout+b'\n'+completed.stderr).splitlines() if line.startswith(b'publisher_transaction_failure=')]
+        raise RuntimeError('Publisher transaction exit='+str(completed.returncode)+' '+' '.join(lines[:1]))
+    result=json.loads(completed.stdout)
+    assert result['generation']==expected_generation and result['fixed_publisher_refresh_transaction_verified']
+    assert not result['coordinator_exercised'] and not result['all_allocators_charged_from_startup_verified']
+    return {'fixed_publisher_refresh_transaction_verified':True,'publisher_refresh_transaction_metrics':result['metrics']}
+
+
 def is_live_worker(raw,*,parent=None):
     try:
         validate_kernel_identity(raw,WORKER,WORKER)
@@ -1004,6 +1114,7 @@ for path in sys.argv[2:]:
                 observation.update(prove_observation_process(store,base,stopped_child=True))
                 private_policy_guard.recheck()
                 publication_binding.recheck()
+            resource_proof.update(prove_root_refresh_transaction(generation))
             previous = (Path(CACHE_ROOT)/'current.json').read_bytes()
             for number, candidate in [(2, policy(certificate_path=wrong_ca)),
                                       (3, policy(signing_key=wrong_public)),
