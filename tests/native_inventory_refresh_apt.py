@@ -706,7 +706,7 @@ with RuntimeResources.fixed() as resources:
 print(json.dumps({'fixed_publisher_refresh_transaction_verified':True,'generation':@GENERATION@,'metrics':metrics,
  'coordinator_exercised':False,'all_allocators_charged_from_startup_verified':False},sort_keys=True))
 """.replace('@GENERATION@',repr(expected_generation))
-    body="stage='imports'\ntry:\n"+''.join(' '+line+'\n' for line in body.splitlines())+"except BaseException as error:\n print('publisher_transaction_failure='+json.dumps({'stage':stage,'kind':type(error).__name__,'errno':getattr(error,'errno',None)},sort_keys=True),file=sys.stderr)\n raise SystemExit(74)\n"
+    body="stage='imports'\ntry:\n"+''.join(' '+line+'\n' for line in body.splitlines())+"except BaseException as error:\n print('publisher_transaction_failure='+json.dumps({'stage':stage,'operation_stage':getattr(error,'stage',None),'kind':type(error).__name__,'errno':getattr(error,'errno',None)},sort_keys=True),file=sys.stderr)\n raise SystemExit(74)\n"
     probe=LIB_ROOT/'publisher-transaction-proof.py'
     compile(bootstrap+body,str(probe),'exec',dont_inherit=True)
     probe.write_text(bootstrap+body);probe.chmod(0o444)

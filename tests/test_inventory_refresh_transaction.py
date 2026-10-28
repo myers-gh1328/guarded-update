@@ -106,6 +106,7 @@ class RefreshTransactionTests(unittest.TestCase):
         self.service.close.side_effect=OSError('synthetic private detail')
         with self.assertRaises(ValueError) as error:self.transaction.refresh(self.nonce)
         self.assertNotIn('synthetic private detail',str(error.exception))
+        self.assertEqual(error.exception.stage,'service_cleanup')
         self.assertTrue(self.journal.snapshot()['unconfirmed'])
         self.assertIsNone(self.journal.snapshot()['last_success']);self.assertFalse((self.root/'cache/current.json').exists())
 
