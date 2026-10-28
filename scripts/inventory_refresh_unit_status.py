@@ -23,6 +23,14 @@ def inert(value):
         value.get('Result') in RESULTS)
 
 
+def teardown(value):
+    return (value.get('ActiveState')=='deactivating' and value.get('MainPID')=='0' and
+        value.get('ExecMainCode')=='1' and value.get('ExecMainStatus') in ('90','74','75','76') and
+        value.get('Result')=='exit-code' and value.get('SubState') in (
+            'stop','stop-watchdog','stop-sigterm','stop-sigkill','stop-post',
+            'final-watchdog','final-sigterm','final-sigkill'))
+
+
 def terminal_status(value):
     if value.get('ActiveState') in ('active','activating','deactivating'):return None
     _require(inert(value) and value['ExecMainCode']=='1' and value['Result']=='exit-code')

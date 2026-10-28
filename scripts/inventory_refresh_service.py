@@ -21,7 +21,7 @@ SLICE='command-center-inventory-worker.slice'
 CGROUP='/command.slice/command-center.slice/command-center-inventory.slice/'+SLICE+'/'+UNIT
 PRIVATE='/run/command-center-inventory-refresh/observation-private'
 ENV={'PATH':'/usr/sbin:/usr/bin:/sbin:/bin','LC_ALL':'C','LANG':'C'}
-from inventory_refresh_unit_status import PROPERTIES,terminal_status,inert
+from inventory_refresh_unit_status import PROPERTIES,terminal_status,inert,teardown
 
 
 def _require(condition):
@@ -247,6 +247,7 @@ class ObservationService:
         _require(properties['ControlGroup']==CGROUP or terminal and properties['ControlGroup']=='')
         try:actual=cgroup_identity()
         except FileNotFoundError:
+            if not terminal:raise
             # Same retained FAILED incarnation is bookkeeping data only. Its
             # missing name is never kernel-empty or publication authority.
             _require(terminal and self._cgroup_fd is not None)
@@ -335,7 +336,18 @@ class ObservationService:
     def poll(self):
         _require(self._wrapper is not None and self._invocation is not None)
         properties=show_unit();result=terminal_status(properties)
-        self._same_invocation(properties,allow_trimmed=result is not None)
+        try:self._same_invocation(properties,allow_trimmed=result is not None)
+        except FileNotFoundError:
+            # The unit can finish between GetAll and the named cgroup lookup.
+            # Refresh only this ENOENT; no stale active snapshot grants authority.
+            properties=show_unit()
+            _require(properties['LoadState']=='loaded' and properties['Transient']=='yes' and
+                     properties['Description']==self._marker and properties['InvocationID']==self._invocation and
+                     properties['ControlGroup'] in (CGROUP,'') and self._cgroup_fd is not None)
+            info=os.fstat(self._cgroup_fd);_require((info.st_dev,info.st_ino)==self._cgroup)
+            if teardown(properties):return None
+            result=terminal_status(properties);_require(result is not None)
+            self._same_invocation(properties,allow_trimmed=True)
         if result is not None:
             final=show_unit();self._same_invocation(final,allow_trimmed=True)
             _require(terminal_status(final)==result)

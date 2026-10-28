@@ -144,6 +144,26 @@ class ServiceTests(unittest.TestCase):
                     with self.assertRaises(ValueError):value.poll()
             finally:os.close(value._cgroup_fd);value._cgroup_fd=None
 
+    def test_poll_rechecks_vanished_group_only_for_same_owned_teardown_or_terminal(self):
+        value=self.owned();value._wrapper.poll.return_value=0
+        active=self.properties(value)
+        failed=self.properties(value,ActiveState='failed',SubState='failed',MainPID='0',ExecMainCode='1',ExecMainStatus='90',Result='exit-code',ControlGroup='')
+        stopping=dict(failed,ActiveState='deactivating',SubState='stop-sigterm')
+        with tempfile.TemporaryDirectory() as directory:
+            value._cgroup_fd=os.open(directory,os.O_RDONLY|os.O_DIRECTORY)
+            info=os.fstat(value._cgroup_fd);value._cgroup=(info.st_dev,info.st_ino)
+            try:
+                with patch.object(service,'show_unit',side_effect=[active,stopping]),patch.object(service,'cgroup_identity',side_effect=FileNotFoundError):
+                    self.assertIsNone(value.poll())
+                with patch.object(service,'show_unit',side_effect=[active,failed,failed]),patch.object(service,'cgroup_identity',side_effect=FileNotFoundError):
+                    self.assertEqual(value.poll(),90)
+                for fresh in (active,dict(failed,InvocationID='c'*32),dict(stopping,MainPID='100'),dict(stopping,ControlGroup='/foreign')):
+                    with self.subTest(fresh=fresh),patch.object(service,'show_unit',side_effect=[active,fresh]),patch.object(service,'cgroup_identity',side_effect=FileNotFoundError):
+                        with self.assertRaises(ValueError):value.poll()
+                with patch.object(service,'show_unit',return_value=active),patch.object(service,'cgroup_identity',side_effect=PermissionError):
+                    with self.assertRaises(PermissionError):value.poll()
+            finally:os.close(value._cgroup_fd);value._cgroup_fd=None
+
     def test_owned_retained_failed_unit_is_acknowledged_without_stopping_replacement(self):
         value=self.owned();value._wrapper.poll.return_value=0
         terminal=self.properties(value,ActiveState='failed',SubState='failed',MainPID='0',ExecMainCode='1',ExecMainStatus='76',Result='exit-code')
