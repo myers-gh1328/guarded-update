@@ -914,3 +914,24 @@ or replacement never grants reset/stop authority. Native tests require a failed
 attempt followed by a new job under each fixed unit name. Legacy negative-policy
 fixture wrappers may use the disposable host's system bus; production adapter
 proofs use the private-manager path and retain all activation/fit limitations.
+
+### Read-only metadata contention precheck
+
+The refresh parent takes no native package or executor locks. Its advisory
+prestart check pins the three fixed lock-file identities with O_PATH and reads
+a bounded kernel lock table through the admitted full-host proc view. POSIX/OFD
+write ranges on dpkg locks and FLOCK writes on the executor guard cause a frozen
+no-start deferral. Partial, malformed, unsupported or unverifiable views never
+mean clear; cleanup uncertainty still fences the process/lifecycle.
+
+Exact device/inode matching is initially supported on ext4 and tmpfs. Other
+filesystem layouts remain unavailable rather than assuming matching semantics.
+The proc file must share its root mount identity; trusted initial PID/proc
+namespace provenance remains a provisioning requirement. Descriptor rechecks
+establish identity, not an atomic snapshot or a future absence guarantee.
+
+A process-local mutex prevents descriptor closure from disturbing an existing
+same-process POSIX owner. It takes no kernel lock and cannot block external
+package operations if this parent stops. Coherent collection still acquires
+actual native/executor shared locks in the independently supervised reader;
+this precheck does not replace that receipt or grant installation authority.

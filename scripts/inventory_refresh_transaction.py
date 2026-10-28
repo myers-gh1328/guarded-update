@@ -15,7 +15,8 @@ from inventory_refresh_state import boot
 from inventory_refresh_coordinator import publish_current_status
 from inventory_refresh_materializer import RefreshMaterializer
 from inventory_refresh_worker_service import RefreshService
-from inventory_refresh_observation import NativeReadLocks,ObservationError
+from inventory_refresh_observation import ObservationError
+from inventory_refresh_contention import ContentionProbe
 from inventory_refresh_observer import kernel_clock
 
 
@@ -28,7 +29,8 @@ DIAGNOSTIC_MODULES=frozenset(name+'.py' for name in (
     'inventory_refresh_transaction','inventory_refresh_worker_service','inventory_refresh_service',
     'inventory_refresh_materializer','inventory_refresh_materialized_policy','inventory_refresh_policy_admission',
     'inventory_refresh_policy','inventory_refresh_state','inventory_refresh_io','inventory_refresh_storage',
-    'inventory_refresh_resources','inventory_refresh_writer_exclusion','inventory_refresh_observation','worker'))
+    'inventory_refresh_resources','inventory_refresh_writer_exclusion','inventory_refresh_observation',
+    'inventory_refresh_contention','worker'))
 DIAGNOSTIC_KINDS=frozenset(('ValueError','OSError','PermissionError','FileNotFoundError','NotADirectoryError',
     'TimeoutExpired','PolicyError','ResourceError','ObservationError','IOErrorState','PublicationError'))
 
@@ -63,10 +65,10 @@ class TransactionError(ValueError):
 class RefreshTransaction:
     def __init__(self,journal,policy,resources,store,publisher,writers,*,
                  materializer_factory=RefreshMaterializer.fixed,service_factory=RefreshService,
-                 native_factory=NativeReadLocks.fixed,clock=kernel_clock):
+                 contention_factory=ContentionProbe.fixed,clock=kernel_clock):
         self._journal=journal;self._policy=policy;self._resources=resources;self._store=store
         self._publisher=publisher;self._writers=writers;self._materializer_factory=materializer_factory
-        self._service_factory=service_factory;self._native_factory=native_factory;self._clock=clock
+        self._service_factory=service_factory;self._contention_factory=contention_factory;self._clock=clock
         self._previous=None
 
     def _time(self,expected=None):
@@ -99,12 +101,12 @@ class RefreshTransaction:
             decision=self._journal.receive('refresh',nonce,boot_id,now,self._policy.generation)
             if decision!='new':return decision
             stage='writers';self._writers.check()
-            # Probe actual package/executor contention before counting a start.
+            # Observe kernel contention without taking package/executor locks.
             stage='native_probe'
             try:
-                native=self._native_factory(deadline_ms=now+5000,now=lambda:self._time(boot_id)[1])
+                native=self._contention_factory(deadline_ms=now+5000,now=lambda:self._time(boot_id)[1])
             except ObservationError as error:
-                if error.reason not in ('busy','package_manager_busy','executor_busy'):raise
+                if error.reason not in ('busy','package_manager_busy','executor_busy','policy_unsupported','state_inconsistent','lease_expired'):raise
                 self._journal.defer('refresh',nonce,boot_id,error.reason,now=self._time(boot_id)[1])
                 self._current(boot_id);return 'deferred'
             native.close();native=None

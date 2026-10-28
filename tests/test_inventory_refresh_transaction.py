@@ -38,7 +38,7 @@ class RefreshTransactionTests(unittest.TestCase):
         self.preparer=Mock();self.preparer.prepare.side_effect=self.prepare;self.preparer.close.side_effect=lambda:self.event('preparer_closed')
         self.transaction=RefreshTransaction(self.journal,self.policy,self.resources,self.store,self.publisher,self.writers,
             materializer_factory=lambda:self.preparer,service_factory=lambda *_:self.service,
-            native_factory=lambda **_:self.native,clock=self.clock)
+            contention_factory=lambda **_:self.native,clock=self.clock)
         self.nonce='0000000000000001'+'a'*16
 
     def event(self,name,value=None):self.events.append(name);return value
@@ -124,8 +124,16 @@ class RefreshTransactionTests(unittest.TestCase):
             self.assertNotIn(secret,encoded);self.assertNotIn(secret,str(public))
         self.assertLessEqual(len(public.diagnostics),4)
 
+    def test_unsupported_readonly_precheck_defers_without_start_or_global_uncertainty(self):
+        self.transaction._contention_factory=Mock(side_effect=ObservationError('policy_unsupported'))
+        self.assertEqual(self.transaction.refresh(self.nonce),'deferred')
+        value=self.journal.snapshot();record=value['capabilities']['refresh']['active']
+        self.assertFalse(value['unconfirmed']);self.assertIsNone(record['started_boottime_ms'])
+        self.assertEqual(record['reason'],'policy_unsupported')
+        self.preparer.prepare.assert_not_called();self.service.launch.assert_not_called()
+
     def test_native_busy_defers_without_actual_start_or_worker(self):
-        self.transaction._native_factory=Mock(side_effect=ObservationError('package_manager_busy'))
+        self.transaction._contention_factory=Mock(side_effect=ObservationError('package_manager_busy'))
         self.assertEqual(self.transaction.refresh(self.nonce),'deferred')
         record=self.journal.snapshot()['capabilities']['refresh']['active']
         self.assertEqual(record['phase'],'deferred');self.assertIsNone(record['started_boottime_ms'])

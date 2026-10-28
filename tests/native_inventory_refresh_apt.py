@@ -20,6 +20,7 @@ from pathlib import Path
 import pwd
 import re
 import secrets
+import select
 import shutil
 import signal
 import ssl
@@ -619,6 +620,85 @@ print(json.dumps({'publisher_cap3_sealing_and_scoped_filesystem_verified':True,'
             'publisher_profile_probe_metrics':result['metrics']}
 
 
+def prove_readonly_contention():
+    """Disposable actual kernel writers only; no parent package lock taken."""
+    from inventory_refresh_contention import ContentionProbe
+    from inventory_refresh_observation import ObservationError
+    assert sys.platform=='linux' and os.geteuid()==0 and os.environ.get('GITHUB_ACTIONS')=='true'
+    assert pwd.getpwnam('ccrefresh').pw_uid==WORKER and pwd.getpwnam('ccinventory').pw_uid==READER
+    assert os.path.ismount(CACHE_ROOT), 'Fresh disposable helper fixture required'
+    now=lambda:time.clock_gettime_ns(time.CLOCK_BOOTTIME)//1_000_000
+    prefix=['/usr/bin/setpriv','--clear-groups','--inh-caps=-all','--ambient-caps=-all',
+            '--bounding-set=-all','--no-new-privs','/usr/bin/python3','-I','-B','-c']
+    identity=r"""import os,sys,fcntl,ctypes,select
+fields=dict(line.split(':',1) for line in open('/proc/self/status').read().splitlines())
+assert fields['Uid'].split()==['0']*4 and fields['Gid'].split()==['0']*4
+assert not fields['Groups'].split() and fields['NoNewPrivs'].split()==['1']
+assert all(int(fields[key].strip(),16)==0 for key in ('CapPrm','CapEff','CapBnd','CapInh','CapAmb'))
+"""
+    for kind,expected in (('posix','package_manager_busy'),('ofd','package_manager_busy'),('flock','executor_busy')):
+        source=identity+r"""
+kind=@KIND@
+path='/run/guarded-update-executor.lock' if kind=='flock' else '/var/lib/dpkg/lock-frontend'
+fd=os.open(path,os.O_RDWR|os.O_NOFOLLOW|os.O_NONBLOCK)
+try:
+ if kind=='flock':fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)
+ elif kind=='posix':fcntl.lockf(fd,fcntl.LOCK_EX|fcntl.LOCK_NB,1,17)
+ else:
+  class Flock(ctypes.Structure):
+   _fields_=[('kind',ctypes.c_short),('whence',ctypes.c_short),('start',ctypes.c_longlong),('length',ctypes.c_longlong),('pid',ctypes.c_int)]
+  assert ctypes.sizeof(ctypes.c_void_p)==8 and ctypes.sizeof(Flock)==32
+  assert (Flock.start.offset,Flock.length.offset,Flock.pid.offset)==(8,16,24)
+  lock=Flock(fcntl.F_WRLCK,os.SEEK_SET,64,64,0)
+  fcntl.fcntl(fd,fcntl.F_OFD_SETLK,bytes(lock))
+ print('ready',flush=True)
+ poller=select.poll();poller.register(sys.stdin.fileno(),select.POLLIN|select.POLLHUP|select.POLLERR)
+ assert poller.poll(5000), 'Synthetic writer release deadline expired'
+ assert os.read(sys.stdin.fileno(),1)==b'x'
+finally:os.close(fd)
+""".replace('@KIND@',repr(kind))
+        writer=subprocess.Popen(prefix+[source],stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,
+            env=ENV,close_fds=True)
+        try:
+            poller=select.poll();poller.register(writer.stdout.fileno(),select.POLLIN|select.POLLHUP|select.POLLERR)
+            assert poller.poll(5000), 'Synthetic writer readiness timed out'
+            assert os.read(writer.stdout.fileno(),32)==b'ready\n', 'Synthetic kernel writer failed to acquire its fixed lock'
+            try:owned=ContentionProbe.fixed(deadline_ms=now()+5000,now=now)
+            except ObservationError as error:assert error.reason==expected, 'Kernel write contention was not classified'
+            else:
+                owned.close();raise AssertionError('Observed kernel writer incorrectly reported clear')
+        finally:
+            try:
+                if writer.stdin is not None:
+                    try:writer.stdin.write(b'x');writer.stdin.flush()
+                    except BrokenPipeError:pass
+                    finally:writer.stdin.close()
+            finally:
+                try:status=writer.wait(timeout=6)
+                finally:
+                    if writer.stdout is not None:writer.stdout.close()
+        assert status==0
+    # While every parent O_PATH pin remains open, a separate caps-empty root
+    # writer must still take the exact exclusive package/executor locks.
+    owned=ContentionProbe.fixed(deadline_ms=now()+5000,now=now)
+    try:
+        source=identity+r"""
+fds=[]
+try:
+ for path,native in [('/run/guarded-update-executor.lock',False),('/var/lib/dpkg/lock-frontend',True),('/var/lib/dpkg/lock',True)]:
+  fd=os.open(path,os.O_RDWR|os.O_NOFOLLOW|os.O_NONBLOCK);fds.append(fd)
+  if native:fcntl.lockf(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)
+  else:fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)
+finally:
+ for fd in fds:os.close(fd)
+"""
+        command(prefix+[source],timeout=5)
+    finally:owned.close()
+    return {'readonly_kernel_posix_and_ofd_package_contention_verified':True,
+        'readonly_kernel_executor_flock_contention_verified':True,
+        'parent_probe_holds_no_package_or_executor_locks_verified':True}
+
+
 def prove_root_refresh_transaction(expected_generation):
     """Actual fixed production components in one CAP3 publisher, synthetic only."""
     from inventory_refresh_publisher_profile import publisher_properties
@@ -629,7 +709,7 @@ def prove_root_refresh_transaction(expected_generation):
         'inventory_refresh_observer','inventory_refresh_entry','inventory_refresh_unit_status','inventory_refresh_service',
         'inventory_refresh_policy','inventory_refresh_policy_admission','inventory_refresh_materialized_policy',
         'inventory_refresh_worker_service','inventory_refresh_resources','inventory_refresh_materializer',
-        'inventory_refresh_writer_exclusion','inventory_refresh_io','inventory_refresh_coordinator',
+        'inventory_refresh_writer_exclusion','inventory_refresh_io','inventory_refresh_coordinator','inventory_refresh_contention',
         'inventory_refresh_transaction')
     for name in modules:
         filename='guardian.py' if name=='inventory_refresh_guardian' else name+'.py'
@@ -1107,6 +1187,7 @@ for path in sys.argv[2:]:
                 str(Path(POLICY_ROOT)/'policy.json'),str(Path(POLICY_ROOT)/'policy-commitment.key')],
                 env=ENV,stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=5)
             assert result.returncode==0, 'Private root input UID/capability exclusion failed'
+        resource_proof.update(prove_readonly_contention())
         prove_privilege_transition()
         status, stage, generation = run_worker(good, 1,policy_guard=private_policy_guard)
         assert status == 0, f'Valid signed TLS/authenticated repository refresh failed (exit={status})'
