@@ -196,3 +196,10 @@ isolated mode to sample the kernel boot ID and native CLOCK_BOOTTIME, avoiding
 has a five-second timeout and 256-byte output bound. Neither platform derives
 proof timing from wall-clock subtraction or logs actual clock/boot values.
 Linux-native clock execution must also pass hosted Linux CI before activation.
+
+The reporting transport admits only the fixed inventory check-in/report and
+manual/collection status paths. Controls are bounded at 64KiB, reports at 8MiB,
+and responses at 64KiB before interpretation. Exact response bytes and an
+unambiguous JSON content type are retained for strict request negotiation and
+canonical parsing; HTML and duplicate-field normalization cannot authorize
+legacy fallback. Existing signed package report bytes remain unchanged.

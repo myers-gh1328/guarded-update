@@ -141,6 +141,8 @@ pub struct Response {
     pub status: u16,
     pub body: Value,
     pub retry_after: u64,
+    pub raw_body: Vec<u8>,
+    pub json_content_type: bool,
 }
 fn request_config(
     config: &Config,
@@ -171,13 +173,28 @@ fn request_config(
     request.push_str(&format!("data-binary = {}\n", quote(body)?));
     Ok(request)
 }
-pub fn post(config: &Config, path: &str, body: &str, now: u64) -> Result<Response, String> {
+fn admit_request(path: &str, body: &str) -> Result<(), String> {
     if !matches!(
         path,
-        "/api/agent/v1/inventory/check-ins" | "/api/agent/v1/inventory/reports"
+        "/api/agent/v1/inventory/check-ins"
+            | "/api/agent/v1/inventory/reports"
+            | "/api/agent/v1/inventory/refresh-status"
+            | "/api/agent/v1/inventory/collection-status"
     ) {
         return Err("Unknown reporting endpoint".into());
     }
+    let limit = if path.ends_with("/reports") {
+        state::MAX_REPORT
+    } else {
+        65_536
+    };
+    if body.len() > limit {
+        return Err("Reporting request exceeds its encoded limit".into());
+    }
+    Ok(())
+}
+pub fn post(config: &Config, path: &str, body: &str, now: u64) -> Result<Response, String> {
+    admit_request(path, body)?;
     let nonce = random_hex(16)?;
     let digest = SystemTools.sha256(body.as_bytes())?;
     let message = canonical(
@@ -231,6 +248,9 @@ pub fn post(config: &Config, path: &str, body: &str, now: u64) -> Result<Respons
         128 * 1024,
     )?;
     let text = String::from_utf8(output).map_err(|_| "Invalid reporting response")?;
+    parse_response(&text)
+}
+fn parse_response(text: &str) -> Result<Response, String> {
     let (response, status) = text.rsplit_once('\n').ok_or("Invalid reporting response")?;
     let status = status
         .parse::<u16>()
@@ -245,17 +265,74 @@ pub fn post(config: &Config, path: &str, body: &str, now: u64) -> Result<Respons
         .and_then(|(_, value)| value.trim().parse::<u64>().ok())
         .unwrap_or(0)
         .min(86400);
+    if body.len() > 65_536 {
+        return Err("Reporting response exceeds control limit".into());
+    }
+    let raw_body = body.as_bytes().to_vec();
+    let content_types = headers
+        .lines()
+        .filter_map(|line| line.split_once(':'))
+        .filter(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+        .map(|(_, value)| value.trim())
+        .collect::<Vec<_>>();
+    let json_content_type = content_types.len() == 1
+        && content_types[0]
+            .split(';')
+            .next()
+            .is_some_and(|value| value.trim().eq_ignore_ascii_case("application/json"));
     let body = serde_json::from_str(body).unwrap_or(Value::Null);
     Ok(Response {
         status,
         body,
         retry_after,
+        raw_body,
+        json_content_type,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn response_keeps_exact_json_for_strict_canonical_and_legacy_fallback_validation() {
+        let bytes = r#"{"error":{"code":"invalid_check_in","code":"invalid_check_in","message":"Request could not be accepted.","request_id":"00000000-0000-4000-8000-000000000001"}}"#;
+        let response=parse_response(&format!("HTTP/1.1 422 Unprocessable Entity\r\nContent-Type: application/json\r\n\r\n{bytes}\n422")).unwrap();
+        assert_eq!(response.raw_body, bytes.as_bytes());
+        assert!(response.json_content_type);
+        assert!(!super::super::requests::legacy_fallback(
+            response.status,
+            &response.raw_body
+        ));
+        let html = parse_response(
+            "HTTP/1.1 422 Unprocessable Entity\r\nContent-Type: text/html\r\n\r\n{}\n422",
+        )
+        .unwrap();
+        assert!(!html.json_content_type);
+        assert!(
+            parse_response(&format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{}\n200",
+                "x".repeat(65_537)
+            ))
+            .is_err()
+        );
+    }
+    #[test]
+    fn request_admission_is_exact_and_status_controls_are_bounded() {
+        for endpoint in ["check-ins", "refresh-status", "collection-status"] {
+            let path = format!("/api/agent/v1/inventory/{endpoint}");
+            assert!(admit_request(&path, "{}").is_ok());
+            assert!(admit_request(&path, &"x".repeat(65_537)).is_err());
+            assert!(admit_request(&format!("{path}?query=1"), "{}").is_err());
+        }
+        assert!(
+            admit_request(
+                "/api/agent/v1/inventory/reports",
+                &"x".repeat(8 * 1024 * 1024)
+            )
+            .is_ok()
+        );
+        assert!(admit_request("/api/agent/v1/inventory/commands", "{}").is_err());
+    }
     #[test]
     fn purpose_bound_canonical_request_has_no_trailing_newline() {
         assert_eq!(
