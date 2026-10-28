@@ -7,6 +7,7 @@ an isolated CI VM. It does not prove real-device repository fit or a coordinator
 import base64
 from datetime import datetime, timedelta, timezone
 import email.utils
+import errno
 import functools
 import gzip
 import hashlib
@@ -339,6 +340,17 @@ def prove_observation_process(store,base,*,stopped_child=False):
                 # do not exist there. No host secret is read by this proof.
                 assert not Path('/proc',str(native),'root'+POLICY_ROOT).exists()
                 assert not Path('/proc',str(native),'root'+str(state)).exists()
+                # Follow the actual child's mount namespace through procfs.
+                # Opening without truncation cannot alter file contents even if
+                # the expected read-only mount is accidentally missing.
+                for path in (private/'control/job.json',Path('/var/lib/dpkg/status'),
+                             Path('/run/guarded-update-executor.lock'),Path(CACHE_ROOT)/'current.json'):
+                    try:
+                        check=os.open(Path('/proc',str(native),'root'+str(path)),os.O_WRONLY|os.O_NOFOLLOW|os.O_NONBLOCK)
+                    except OSError as exc:assert exc.errno==errno.EROFS, 'Native fixed input did not fail read-only'
+                    else:
+                        os.close(check)
+                        raise AssertionError('Native fixed input is writable through actual child mount')
                 if stopped_child:
                     # Only this disposable CI-created transient unit's own
                     # direct native reader, root identity but all capabilities
@@ -396,6 +408,7 @@ finally:
                 return {'observation_separate_native_process_verified':True,
                     'observation_native_zero_capabilities_verified':True,
                     'observation_masked_policy_and_parent_state_verified':True,
+                    'observation_actual_input_write_denial_verified':True,
                     'separate_process_observation_receipt':receipt}
     finally:
         try:
