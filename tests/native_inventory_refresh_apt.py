@@ -710,7 +710,7 @@ def prove_root_refresh_transaction(expected_generation):
         'inventory_refresh_policy','inventory_refresh_policy_admission','inventory_refresh_materialized_policy',
         'inventory_refresh_worker_service','inventory_refresh_resources','inventory_refresh_materializer',
         'inventory_refresh_writer_exclusion','inventory_refresh_io','inventory_refresh_coordinator','inventory_refresh_contention',
-        'inventory_refresh_transaction')
+        'inventory_refresh_transaction','inventory_refresh_observation_transaction')
     for name in modules:
         filename='guardian.py' if name=='inventory_refresh_guardian' else name+'.py'
         shutil.copyfile(ROOT/'scripts'/(name+'.py'),LIB_ROOT/filename);(LIB_ROOT/filename).chmod(0o444)
@@ -737,6 +737,9 @@ from inventory_refresh_observation import _Ancestry
 from inventory_refresh_io import StatusPublisher
 from inventory_refresh_writer_exclusion import WriterExclusion
 from inventory_refresh_transaction import RefreshTransaction
+from inventory_refresh_observation_transaction import ObservationTransaction
+from inventory_refresh_channel import ObservationChannel
+import time
 fields=dict(line.split(':',1) for line in open('/proc/self/status').read().splitlines())
 assert {name:int(fields[name].strip(),16) for name in ('CapPrm','CapEff','CapBnd','CapInh','CapAmb')}=={'CapPrm':3,'CapEff':3,'CapBnd':3,'CapInh':0,'CapAmb':0}
 assert fields['NoNewPrivs'].split()==['1']
@@ -745,7 +748,7 @@ with RuntimeResources.fixed() as resources:
  stage='policy'
  with PolicyGuard.fixed() as policy:
   assert policy.generation==@GENERATION@
-  root=os.open('/',os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW);ancestry=None;publisher=None;writers=None
+  root=os.open('/',os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW);ancestry=None;publisher=None;writers=None;channel=None;observation=None
   try:
    ancestry=_Ancestry.open(root,('var','lib','command-center-inventory-refresh'))
    journal=Journal(ancestry.fds[-1])
@@ -776,6 +779,47 @@ with RuntimeResources.fixed() as resources:
     assert public['successful_checked_at']==success['successful_checked_at']
     assert transaction.refresh(nonce)=='existing'
     assert open(status_path,'rb').read(65537)==status
+    try:
+     stage='observation_admission'
+     channel=ObservationChannel.fixed(journal=journal)
+     observation=ObservationTransaction(journal,policy,resources,store,publisher,writers,channel)
+     observed_nonce='0000000000000005'+'d'*16
+     assert observation.begin(observed_nonce)=='dispatched'
+     stage='observation_opening';limit=time.monotonic()+10
+     while True:
+      phase=observation.poll()
+      if phase=='opened':break
+      assert phase=='opening' and time.monotonic()<limit
+      time.sleep(.02)
+     offer=json.loads(open(status_path,'rb').read(65537))['observation_lease']
+     assert offer['nonce']==observed_nonce and offer['cache_generation']==success['attempt']['cache_generation']
+     with store.lease_current() as lease:
+      for index in lease.manifest['files']:lease.verify_index(index['path'])
+     stage='observation_release'
+     assert observation.release(observed_nonce)=='releasing'
+     assert json.loads(open(status_path,'rb').read(65537))['observation_lease'] is None
+     assert observation.release(observed_nonce)=='existing'
+     stage='observation_acceptance';limit=time.monotonic()+10
+     while True:
+      phase=observation.poll()
+      if phase=='succeeded':break
+      assert phase=='releasing' and time.monotonic()<limit
+      time.sleep(.02)
+     value=journal.snapshot();accepted=value['last_observation'];receipt=accepted['receipt']
+     assert not value['unconfirmed'] and value['last_success']==success
+     assert all(value['capabilities'][name]['active'] is None and accepted[name]['phase']=='succeeded' for name in ('observation','release'))
+     assert all(receipt[key]==item for key,item in offer.items())
+     assert receipt['installed_before_sha256']==receipt['installed_after_sha256']
+     public=json.loads(open(status_path,'rb').read(65537))
+     assert public['observation_receipt']==receipt and public['observation_lease'] is None
+     assert public['cache_generation']==success['attempt']['cache_generation']
+     frozen=journal.snapshot();assert observation.begin(observed_nonce)=='existing' and journal.snapshot()==frozen
+    finally:
+     try:
+      if observation is not None:observation.close()
+     finally:
+      if channel is not None:channel.close()
+     observation=None;channel=None
     stage='final_checks'
     writers.check();resources.sample();policy.recheck()
     metrics=resources.sample()
@@ -789,7 +833,7 @@ with RuntimeResources.fixed() as resources:
      try:
       if ancestry is not None:ancestry.close()
      finally:os.close(root)
-print(json.dumps({'fixed_publisher_refresh_transaction_verified':True,'generation':@GENERATION@,'metrics':metrics,
+print(json.dumps({'fixed_publisher_refresh_transaction_verified':True,'fixed_publisher_observation_transaction_verified':True,'generation':@GENERATION@,'metrics':metrics,
  'coordinator_exercised':False,'all_allocators_charged_from_startup_verified':False},sort_keys=True))
 """.replace('@GENERATION@',repr(expected_generation))
     body="stage='imports'\ntry:\n"+''.join(' '+line+'\n' for line in body.splitlines())+"except BaseException as error:\n print('publisher_transaction_failure='+json.dumps({'stage':stage,'operation_stage':getattr(error,'stage',None),'diagnostics':getattr(error,'diagnostics',None),'kind':type(error).__name__,'errno':getattr(error,'errno',None)},sort_keys=True),file=sys.stderr)\n raise SystemExit(74)\n"
@@ -806,7 +850,8 @@ print(json.dumps({'fixed_publisher_refresh_transaction_verified':True,'generatio
     result=json.loads(completed.stdout)
     assert result['generation']==expected_generation and result['fixed_publisher_refresh_transaction_verified']
     assert not result['coordinator_exercised'] and not result['all_allocators_charged_from_startup_verified']
-    return {'fixed_publisher_refresh_transaction_verified':True,'publisher_refresh_transaction_metrics':result['metrics']}
+    assert result['fixed_publisher_observation_transaction_verified']
+    return {'fixed_publisher_refresh_transaction_verified':True,'fixed_publisher_observation_transaction_verified':True,'publisher_refresh_transaction_metrics':result['metrics']}
 
 
 def is_live_worker(raw,*,parent=None):

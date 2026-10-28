@@ -935,3 +935,32 @@ same-process POSIX owner. It takes no kernel lock and cannot block external
 package operations if this parent stops. Coherent collection still acquires
 actual native/executor shared locks in the independently supervised reader;
 this precheck does not replace that receipt or grant installation authority.
+
+
+### Root observation transaction composition (source only)
+
+`ObservationTransaction` composes the existing fixed observation service, private
+channel, cache pin, policy/resource guards and status publisher under one held,
+reconciled journal. It accepts a strict nonce, requires the current cache to match
+the durable refresh success, and persists receive/start before its one-use launch.
+It never reconstructs process ownership from a running journal record.
+
+A public offer requires the actual service's invocation/cgroup/process liveness
+checks. Release withdraws that offer before writing one frozen grant. Acceptance
+requires the exact opened lease, matching grant and equal installed fingerprints,
+owned service termination, confirmed whole-slice/writer cleanup and unchanged
+cache/policy context. The parent cache pin remains held through atomic durable
+acceptance of both operations and their receipt. Failure or lost ownership fences
+uncertainty and withdraws the offer; a poisoned policy guard publishes no admitted
+policy or currently available cache. Prior accepted historical evidence remains
+independent of the current operation. Invalid/unrelated/premature reporter inputs
+cannot abort valid active work; duplicate requests never regenerate grants.
+
+Focused tests use real journal/cache/channel/status components with test-only
+process collaborators. The disposable Linux proof exercises the actual CAP3
+publisher and fixed native observation service in that same context. Its new
+`fixed_publisher_observation_transaction_verified` result is evidence of that
+bounded composition only, not the complete executable coordinator. Initial host
+namespace/unit provenance, all-allocator charging, target repository fit, client
+integration, provisioning and rollout remain separate gates. No service is enabled
+and no package install/upgrade authority is added by this source.
