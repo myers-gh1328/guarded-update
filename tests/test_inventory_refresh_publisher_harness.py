@@ -100,6 +100,19 @@ class PublisherHarnessTests(unittest.TestCase):
         with contextlib.redirect_stdout(stdout),self.assertRaises(ValueError):exec(compile(code,'<actual-child-cleanup>','exec'),scope)
         self.assertEqual(stdout.getvalue(),'');reader.close.assert_called_once();chain.close.assert_called_once()
 
+    def test_actual_writer_actor_uses_only_admitted_fixed_dependencies_and_capabilities(self):
+        tree=ast.parse((Path(__file__).parent/'native_inventory_refresh_apt.py').read_bytes())
+        factory=next(node for node in tree.body if isinstance(node,ast.FunctionDef) and node.name=='reporter_request_program')
+        scope={'ROOT':Path(__file__).resolve().parents[1]}
+        exec(compile(ast.Module(body=[factory],type_ignores=[]),'<writer-actor-factory>','exec'),scope)
+        code=scope['reporter_request_program']();compile(code,'<writer-actor>','exec');body=ast.parse(code)
+        assignments=[node.value for node in body.body if isinstance(node,ast.Assign) and any(isinstance(t,ast.Name) and t.id=='SOURCES' for t in node.targets)]
+        modules=ast.literal_eval(assignments[-1]);self.assertEqual(len(modules),9)
+        self.assertIn(('inventory_refresh_io','inventory_refresh_io.py'),modules)
+        self.assertIn("sys.argv[1] in ('observation','release')",code)
+        self.assertIn('writer.publish(sys.argv[2])',code)
+        self.assertIn('not production admission',code)
+
     def test_synthetic_actor_has_own_imports_and_transfers_ownership_after_chmod(self):
         tree=ast.parse((Path(__file__).parent/'native_inventory_refresh_apt.py').read_bytes())
         outer=next(node for node in tree.body if isinstance(node,ast.FunctionDef) and node.name=='prove_root_refresh_transaction')

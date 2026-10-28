@@ -1231,3 +1231,22 @@ subset and admission callback are trusted test fixtures, not a production
 bootstrap or durable reporting-journal proof. Native pipeline execution is
 required before treating this roundtrip as verified; broader activation gates
 remain unchanged.
+
+The inactive reporter request writer reuses the fixed inbox descriptor checks.
+Its only payload is one canonical nonce, written to an exclusive owned temporary
+file, fsynced and atomically promoted to the literal `request` name. It rechecks
+the previous request's exact metadata/content, rejects equal or higher counters,
+verifies its own temporary identity before promotion, and checks the resulting
+published inode before returning. Visibility becomes uncertain before any rename
+attempt; failure never rolls back a possibly visible request. Cleanup removes
+only the exact temporary inode created by that call and attempts every owned
+close, preserving foreign replacements.
+
+These checks are point-in-time, not atomic compare-and-swap or Root acceptance.
+The caller must retain the existing process lock and durably validate its current
+intent before publishing. Neither publication success nor its error flags prove
+NoWork, cancellation, cleanup, replay permission or report readiness. No fixed
+factory, executable route or capability is enabled. The disposable native actor
+loads the actual writer from a nine-module admitted fixture closure for the
+observation/release roundtrip; synthetic authorization does not verify production
+Control ownership or durable client intent.

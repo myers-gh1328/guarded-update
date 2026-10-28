@@ -1034,6 +1034,40 @@ def decode_reporter_phase(raw,expected):
     return value
 
 
+def reporter_request_program():
+    """Trusted native fixture: actual writer, synthetic caller authorization."""
+    prefix=(ROOT/'scripts/inventory_refresh_root_entry.py').read_text().split('\ndef main():',1)[0]
+    modules=('inventory_refresh_protocol','inventory_refresh_receipt','inventory_refresh_state','inventory_refresh_storage',
+        'inventory_refresh_status','inventory_refresh_observation','inventory_refresh_io','inventory_refresh_reader_session','inventory_refresh_reporter_io')
+    body=r'''
+assert len(sys.argv)==3 and sys.argv[1] in ('observation','release') and re.fullmatch('[0-9a-f]{32}',sys.argv[2])
+fields=dict(line.split(':',1) for line in open('/proc/self/status').read().splitlines())
+assert all(fields[key].split()==['60002']*4 for key in ('Uid','Gid'))
+assert fields['Groups'].split() in ([],['60002']) and fields['NoNewPrivs'].split()==['1']
+assert all(int(fields[key].strip(),16)==0 for key in ('CapInh','CapPrm','CapEff','CapBnd','CapAmb'))
+sources=None;writer=None;ancestry=None;root=None
+try:
+ sources=RootSources.fixed();loaded=sources.execute();closing,sources=sources,None;closing.close()
+ root=os.open('/',os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+ ancestry=loaded['inventory_refresh_observation']._Ancestry.open(root,('run','command-center-inventory-refresh'))
+ writer=loaded['inventory_refresh_reporter_io'].ReporterRequestWriter(ancestry.fds[-1],sys.argv[1],60002,60002)
+ ancestry.verify()
+ # Parent fixture ordering supplies synthetic intent, not production admission.
+ writer.publish(sys.argv[2]);ancestry.verify()
+finally:
+ failed=False
+ for owned in (writer,ancestry,sources):
+  if owned is not None:
+   try:owned.close()
+   except BaseException:failed=True
+ if root is not None:
+  try:os.close(root)
+  except OSError:failed=True
+ if failed:raise ValueError('Restricted request actor cleanup unconfirmed')
+'''
+    return prefix+'\nSOURCES='+repr(tuple((name,name+'.py') for name in modules))+'\n'+body
+
+
 def reporter_library_program():
     # Trusted disposable fixture only: use the actual source-admission/compile
     # implementation with a fixed reader-only closure, not a production entry.
@@ -1261,7 +1295,8 @@ def prove_actual_coordinator_entry_loop():
         with status_path.open('rb') as status:raw=status.read(65537)
         assert len(raw)<=65536;return json.loads(raw)
     def actor(capability,operation=nonce):
-        result=subprocess.run(list(worker_argv(READER,READER)[:-1])+['-S','-c',REPORTER_INBOX_CODE,capability,operation],
+        code=REPORTER_INBOX_CODE if operation==nonce else reporter_request_program()
+        result=subprocess.run(list(worker_argv(READER,READER)[:-1])+['-S','-c',code,capability,operation],
             env=ENV,stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=5)
         assert result.returncode==0,'Restricted synthetic inbox actor failed'
     def write_policy(data):
@@ -1377,7 +1412,8 @@ def prove_actual_coordinator_entry_loop():
         'restricted_reporter_actual_entry_observation_receipt_verified':True,
         'projected_reader_policy_native_query_verified':True,
         'restricted_reporter_fingerprint_matches_root_receipt_verified':True,
-        'restricted_reporter_session_root_status_roundtrip_verified':True}
+        'restricted_reporter_session_root_status_roundtrip_verified':True,
+        'restricted_reporter_request_writer_roundtrip_verified':True}
 
 def is_live_worker(raw,*,parent=None):
     try:

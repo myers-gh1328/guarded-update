@@ -95,3 +95,90 @@ class StatusReader:
     def close(self):
         fd,self._directory=self._directory,None
         if fd is not None:_close(fd)
+
+
+class RequestPublicationError(ReporterIOError):
+    def __init__(self,may_be_visible,cleanup_uncertain):
+        self.may_be_visible=may_be_visible
+        self.cleanup_uncertain=cleanup_uncertain
+        super().__init__('cleanup_unconfirmed' if cleanup_uncertain else 'persistence_unconfirmed')
+
+
+class ReporterRequestWriter:
+    """Fixed nonce I/O only, never independent request/retry authority.
+
+    Trusted caller retains its existing process lock and MUST fsync current
+    intent before publish. Sequence/reference checks are point-in-time, not CAS
+    against another publisher. Full named ancestry remains caller-owned. Neither
+    success nor failure flags prove Root acceptance, cancellation or NoWork.
+    """
+    def __init__(self,parent,capability,reporter_uid,reporter_gid,*,owner=0):
+        # Optional fixed dependency: a reader-only admitted source closure never
+        # imports this module or acquires write capabilities merely by reading.
+        from inventory_refresh_io import Inbox
+        self._inbox=None
+        self._inbox=Inbox(parent,capability,reporter_uid,reporter_gid,owner=owner)
+
+    def _temp(self,info,size):
+        inbox=self._inbox
+        _require(stat.S_ISREG(info.st_mode) and info.st_uid==inbox._reporter and info.st_gid==inbox._group and
+            stat.S_IMODE(info.st_mode)==0o600 and info.st_nlink==1 and info.st_size==size and
+            info.st_dev==os.fstat(inbox._inbox).st_dev)
+
+    def publish(self,nonce):
+        from inventory_refresh_protocol import correlator
+        import secrets
+        try:
+            _require(type(nonce) is str and len(nonce)==32)
+            parsed,sequence=correlator(nonce.encode('ascii'));_require(parsed==nonce)
+        except (ValueError,UnicodeError):raise ReporterIOError('invalid_request') from None
+        fd=None;created=False;identity=None;may_be_visible=False;cleanup_uncertain=False;failed=False
+        temporary='.request-'+secrets.token_hex(16)
+        try:
+            _require(self._inbox is not None)
+            inbox=self._inbox;inbox._verify()
+            previous=inbox.read_snapshot()
+            if previous is not None and previous[1]>=sequence:
+                may_be_visible=True
+                raise ReporterIOError('invalid_request')
+            fd=os.open(temporary,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW|os.O_NONBLOCK,0o600,dir_fd=inbox._inbox)
+            created=True;identity=_identity(os.fstat(fd))
+            os.fchmod(fd,0o600);self._temp(os.fstat(fd),0)
+            raw=nonce.encode('ascii');offset=0
+            while offset<len(raw):
+                written=os.write(fd,raw[offset:]);_require(0<written<=len(raw)-offset);offset+=written
+            self._temp(os.fstat(fd),32);os.fsync(fd)
+            inbox._verify()
+            if inbox.read_snapshot()!=previous:
+                may_be_visible=True
+                raise ReporterIOError('state_inconsistent')
+            after=os.fstat(fd);self._temp(after,32)
+            named=os.stat(temporary,dir_fd=inbox._inbox,follow_symlinks=False);self._temp(named,32)
+            _require(_stable(named)==_stable(after) and _identity(after)==identity)
+            may_be_visible=True  # A failed rename may already have taken effect.
+            os.replace(temporary,'request',src_dir_fd=inbox._inbox,dst_dir_fd=inbox._inbox)
+            os.fsync(inbox._inbox);inbox._verify()
+            published=inbox.read_snapshot()
+            _require(published is not None and published[:2]==(nonce,sequence) and published[2]==_stable(os.fstat(fd)))
+        except BaseException as error:
+            failed=True
+            if getattr(error,'reason',None)=='cleanup_unconfirmed':cleanup_uncertain=True
+        finally:
+            if fd is not None:
+                closing,fd=fd,None
+                try:_close(closing)
+                except BaseException:cleanup_uncertain=True
+            if created:
+                try:
+                    named=os.stat(temporary,dir_fd=self._inbox._inbox,follow_symlinks=False)
+                    if identity is None or _identity(named)!=identity:
+                        cleanup_uncertain=True  # Never remove a foreign replacement.
+                    else:
+                        os.unlink(temporary,dir_fd=self._inbox._inbox);os.fsync(self._inbox._inbox)
+                except FileNotFoundError:pass
+                except BaseException:cleanup_uncertain=True
+        if failed or cleanup_uncertain:raise RequestPublicationError(may_be_visible,cleanup_uncertain) from None
+
+    def close(self):
+        inbox,self._inbox=self._inbox,None
+        if inbox is not None:inbox.close()
