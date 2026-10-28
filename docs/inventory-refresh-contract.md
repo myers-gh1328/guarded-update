@@ -752,3 +752,26 @@ other existing fixture work outside the aggregate remains explicitly excluded
 from an all-allocators claim. Current/free metrics establish neither repository
 fit nor available capacity. Full coordinator, UID/namespace writer exclusion,
 sensitive-path coverage and real target headroom remain separate gates.
+
+### Materialized APT input binding
+
+A job/config hash alone cannot establish that APT consumed the current policy:
+its sources, authentication, trust and pin files are separate inputs.
+`MaterializedPolicy.fixed()` compares every actual rendered input with
+`PolicyGuard.render(staging_token)` and checks the declared job config digest
+against that expected configuration. Only a fixed-origin root PolicyGuard is
+accepted by the production factory.
+
+All consumed files remain single-link, root-owned, worker-group-readable objects
+with exact private modes, lengths, bytes and frozen descriptor/named metadata.
+Nested directory references are rechecked after all reads. The shared empty
+configuration-parts directory must remain empty with unchanged metadata; checking
+rejects after the first streamed entry rather than allocating an unbounded list.
+Changed or closed guards cannot reuse retained evidence, and cleanup attempts all
+owned descriptors without closing the borrowed PolicyGuard.
+
+The native fixture holds this binding during acquisition and separately across
+publication/observation, exposing only a bounded verification flag. It does not
+publish raw auxiliary hashes or private bytes. Byte binding alone does not prove
+worker traversal through every ancestor, namespace readiness or UID exclusion;
+those remain fixed-service/provisioning gates before activation.

@@ -41,6 +41,7 @@ from inventory_refresh_channel import ObservationChannel
 from inventory_refresh_state import Journal
 from inventory_refresh_io import Inbox
 from inventory_refresh_policy_admission import PolicyGuard
+from inventory_refresh_materialized_policy import MaterializedPolicy
 
 WORKER = 60001
 READER = 60002
@@ -659,23 +660,29 @@ def run_worker(policy, number, *, stopped_child=False, policy_guard=None):
         '-p', 'PrivateDevices=yes', '-p', 'PrivateTmp=yes', '-p', 'InaccessiblePaths=/tmp /var/tmp /dev/shm',
         '-p', 'ReadWritePaths='+str(stage), '-p', 'RuntimeMaxSec=610', '-p', 'TimeoutStopSec=1',
         '/usr/bin/python3', '-I', '-B', str(LIB_ROOT/'guardian.py')]
-    if stopped_child:
-        return stopped_child_proof(args,job),token,job['policy_generation']
-    if policy_guard is not None:policy_guard.recheck()
-    result = subprocess.run(args, env=ENV, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=610)
-    status = result.returncode
-    empty_worker()
-    if policy_guard is not None:policy_guard.recheck()
-    if status not in [0, 74, 75, 76]:
-        # Publish only a fixed classification and numeric fixture identity; never native output.
-        collision = b'already exists' in result.stderr or b'already loaded' in result.stderr
-        reason = 'unit_name_in_use' if collision else 'unclassified_launcher_failure'
-        raise AssertionError(f'Fixed worker failed outside its safe exit contract (iteration={number}, exit={status}, reason={reason})')
-    if status!=0:
-        stages=re.findall(rb'inventory_guardian_stage=(?:identity|library|accounts|job|boot|spawn|clock|child)(?::[0-9-]{1,4})?',result.stderr)
-        if stages:
-            print('Native fixture diagnostic: '+b' '.join(stages[:4]).decode('ascii'),file=sys.stderr)
-    return status, token, job['policy_generation']
+    binding=MaterializedPolicy.fixed(policy_guard,token,WORKER,job['config_sha256']) if policy_guard is not None else None
+    try:
+        if binding is not None:binding.recheck()
+        if stopped_child:
+            return stopped_child_proof(args,job),token,job['policy_generation']
+        if policy_guard is not None:policy_guard.recheck()
+        result = subprocess.run(args, env=ENV, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=610)
+        status = result.returncode
+        empty_worker()
+        if binding is not None:binding.recheck()
+        if policy_guard is not None:policy_guard.recheck()
+        if status not in [0, 74, 75, 76]:
+            # Publish only a fixed classification and numeric fixture identity; never native output.
+            collision = b'already exists' in result.stderr or b'already loaded' in result.stderr
+            reason = 'unit_name_in_use' if collision else 'unclassified_launcher_failure'
+            raise AssertionError(f'Fixed worker failed outside its safe exit contract (iteration={number}, exit={status}, reason={reason})')
+        if status!=0:
+            stages=re.findall(rb'inventory_guardian_stage=(?:identity|library|accounts|job|boot|spawn|clock|child)(?::[0-9-]{1,4})?',result.stderr)
+            if stages:
+                print('Native fixture diagnostic: '+b' '.join(stages[:4]).decode('ascii'),file=sys.stderr)
+        return status, token, job['policy_generation']
+    finally:
+        if binding is not None:binding.close()
 
 
 def main():
@@ -826,13 +833,16 @@ for path in sys.argv[2:]:
         cache = os.open(CACHE_ROOT, os.O_RDONLY | os.O_DIRECTORY)
         store = Store(cache, 0, READER, WORKER)
         try:
-            private_policy_guard.recheck()
-            store.publish(stage, 'a'*32, generation, datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'))
-            private_policy_guard.recheck()
-            observation=prove_cache_pinned_observation(store,base)
-            observation.update(prove_observation_process(store,base))
-            observation.update(prove_observation_process(store,base,stopped_child=True))
-            private_policy_guard.recheck()
+            config_hash=hashlib.sha256(private_policy_guard.render(stage)['apt.conf']).hexdigest()
+            with MaterializedPolicy.fixed(private_policy_guard,stage,WORKER,config_hash) as publication_binding:
+                private_policy_guard.recheck()
+                store.publish(stage, 'a'*32, generation, datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'))
+                private_policy_guard.recheck()
+                observation=prove_cache_pinned_observation(store,base)
+                observation.update(prove_observation_process(store,base))
+                observation.update(prove_observation_process(store,base,stopped_child=True))
+                private_policy_guard.recheck()
+                publication_binding.recheck()
             previous = (Path(CACHE_ROOT)/'current.json').read_bytes()
             for number, candidate in [(2, policy(certificate_path=wrong_ca)),
                                       (3, policy(signing_key=wrong_public)),
@@ -857,6 +867,7 @@ for path in sys.argv[2:]:
             'coordinator_exercised': False, 'apt_refresh_exercised': True,
             'root_guardian_fixed_privilege_drop_exercised': True,
             'fixed_root_policy_guard_and_current_commitment_verified':True,
+            'full_rendered_policy_bound_during_worker_and_publication_verified':True,
             'worker_and_reporter_private_policy_key_read_denied':True,
             'exact_guardian_capability_masks_verified': True,
             'unadmitted_package_sibling_and_matching_bytecode_ignored': True,
