@@ -32,7 +32,7 @@ import time
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT/'scripts'))
-from inventory_refresh_policy import parse_policy, render_policy, policy_generation, POLICY_ROOT, CACHE_ROOT, RUNTIME_ROOT
+from inventory_refresh_policy import parse_policy, render_policy, policy_generation, POLICY_ROOT, CACHE_ROOT, RUNTIME_ROOT, STATE_ROOT
 from inventory_refresh_storage import Store
 from inventory_refresh_worker import validate_kernel_identity
 from inventory_refresh_guardian import worker_argv, load_worker
@@ -431,7 +431,7 @@ def prove_resource_admission(expected_generation):
         env=ENV,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,timeout=3)
     assert show.returncode in (0,4) and show.stdout.strip()==b'not-found', 'Refuse existing coordinator unit'
     modules=('inventory_refresh_protocol','inventory_refresh_observation','inventory_refresh_policy',
-             'inventory_refresh_policy_admission','inventory_refresh_resources')
+             'inventory_refresh_policy_admission','inventory_refresh_resources','inventory_refresh_storage')
     for name in modules:
         shutil.copyfile(ROOT/'scripts'/(name+'.py'),LIB_ROOT/(name+'.py'))
         (LIB_ROOT/(name+'.py')).chmod(0o444)
@@ -441,7 +441,7 @@ def prove_resource_admission(expected_generation):
 assert sys.platform=='linux' and len(sys.argv)==1 and sys.flags.isolated and sys.flags.dont_write_bytecode
 assert os.getresuid()==(0,0,0) and os.getresgid()==(0,0,0)
 base='/usr/local/libexec/command-center-inventory-refresh'
-names=('inventory_refresh_protocol','inventory_refresh_observation','inventory_refresh_policy','inventory_refresh_policy_admission','inventory_refresh_resources')
+names=('inventory_refresh_protocol','inventory_refresh_observation','inventory_refresh_policy','inventory_refresh_policy_admission','inventory_refresh_resources','inventory_refresh_storage')
 def stable(info):return (info.st_dev,info.st_ino,info.st_uid,info.st_gid,info.st_mode,info.st_nlink,info.st_size,info.st_mtime_ns,info.st_ctime_ns)
 fds=[];refs=[];sources={}
 try:
@@ -504,6 +504,78 @@ print(json.dumps({'fixed_resource_profile_currently_admitted':True,'policy_admis
     assert not result['all_allocators_charged_from_startup_verified']
     return {'fixed_resource_profile_currently_admitted':True,'policy_admission_inside_fixed_aggregate_probe':True,
         'all_allocators_charged_from_startup_verified':False,'aggregate_resource_probe_metrics':result['metrics']}
+
+
+def prove_publisher_profile(base,expected_generation):
+    """Scoped CAP3 namespace/sealing proof; not a coordinator activation."""
+    from inventory_refresh_publisher_profile import publisher_properties
+    from inventory_refresh_resources import UNIT
+    prepare_fixed_executor_guard()
+    Path(STATE_ROOT).chmod(0o700)
+    token='e'*32;stage=Path(CACHE_ROOT)/('staging-'+token)
+    (stage/'lists').mkdir(parents=True,mode=0o700)
+    for path in (stage,stage/'lists'):
+        os.chown(path,WORKER,WORKER);path.chmod(0o700)
+    index=stage/'lists/synthetic_profile_Packages'
+    index.write_bytes(b'synthetic publisher profile index');os.chown(index,WORKER,WORKER);index.chmod(0o600)
+    sentinel=base/'publisher-private-sentinel';sentinel.write_bytes(b'synthetic-private-sentinel');sentinel.chmod(0o600)
+    original=(LIB_ROOT/'resource-admission-proof.py').read_text()
+    bootstrap,marker,_=original.partition('from inventory_refresh_resources import RuntimeResources')
+    assert marker, 'Missing admitted fixed probe bootstrap'
+    body=r"""from inventory_refresh_resources import RuntimeResources,ResourceError,mount_rows,CACHE
+from inventory_refresh_policy_admission import PolicyGuard
+from inventory_refresh_storage import Store
+from datetime import datetime,timezone
+import errno,subprocess
+fields=dict(line.split(':',1) for line in open('/proc/self/status').read().splitlines())
+masks={name:int(fields[name].strip(),16) for name in ('CapPrm','CapEff','CapBnd','CapInh','CapAmb')}
+if masks!={'CapPrm':3,'CapEff':3,'CapBnd':3,'CapInh':0,'CapAmb':0} or fields['NoNewPrivs'].split()!=['1']:
+ print('publisher_profile_masks='+json.dumps(masks,sort_keys=True),file=sys.stderr)
+ raise SystemExit(74)
+try:
+ resources=RuntimeResources.fixed()
+except ResourceError as error:
+ raw=open('/proc/self/mountinfo','rb').read(1024*1024+1)
+ rows=[{'id':row['id'],'parent':row['parent'],'device':row['device'],'root':row['root']} for row in mount_rows(raw).values() if row['path']==CACHE]
+ print('publisher_cache_mount_diagnostic='+json.dumps({'reason':error.reason,'rows':rows[:8]},sort_keys=True),file=sys.stderr)
+ raise SystemExit(74)
+with resources:
+ with PolicyGuard.fixed() as policy:
+  generation=policy.generation
+  for path in ('/etc/command-center-inventory-refresh/policy.json','/etc/command-center-inventory-refresh/policy-commitment.key','/etc/passwd','/var/lib/dpkg/status'):
+   try:fd=os.open(path,os.O_WRONLY|os.O_NOFOLLOW|os.O_NONBLOCK)
+   except OSError as error:assert error.errno==errno.EROFS
+   else:
+    os.close(fd);raise AssertionError('Publisher read-only input is writable')
+  for directory in ('/var/lib/command-center-inventory-refresh','/run/command-center-inventory-refresh','/etc/command-center-inventory-refresh/apt'):
+   path=directory+'/publisher-profile-fixture'
+   fd=os.open(path,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
+   try:os.write(fd,b'synthetic profile state');os.fsync(fd)
+   finally:os.close(fd)
+   os.unlink(path)
+  assert not os.path.exists(@SENTINEL@)
+  result=subprocess.run(('/bin/systemctl','show','--property=LoadState','--value','command-center-inventory-refresh-worker.service'),env={'PATH':'/usr/sbin:/usr/bin:/sbin:/bin','LC_ALL':'C'},stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,close_fds=True,timeout=3)
+  assert result.returncode in (0,4) and len(result.stdout)<=4096
+  cache=os.open(CACHE,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+  try:
+   store=Store(cache,0,60002,60001)
+   manifest=store.publish('e'*32,'f'*32,generation,datetime.now(timezone.utc).isoformat().replace('+00:00','Z'))
+   with store.lease_current() as lease:
+    assert lease.read_index('synthetic_profile_Packages')==b'synthetic publisher profile index'
+   policy.recheck()
+  finally:os.close(cache)
+ metrics=resources.sample()
+print(json.dumps({'publisher_cap3_sealing_and_scoped_filesystem_verified':True,'publisher_fixed_pid1_socket_query_verified':True,'generation':generation,'metrics':metrics,'all_allocators_charged_from_startup_verified':False},sort_keys=True))
+""".replace('@SENTINEL@',repr(str(sentinel)))
+    probe=LIB_ROOT/'publisher-profile-proof.py';probe.write_text(bootstrap+body);probe.chmod(0o444)
+    info=probe.lstat();assert info.st_uid==0 and info.st_nlink==1 and info.st_mode&0o777==0o444
+    args=['/usr/bin/systemd-run','--quiet','--wait','--collect','--pipe','--unit='+UNIT,'--slice='+PARENT_SLICE]
+    for property in publisher_properties():args+=['-p',property]
+    args+=['-p','RuntimeMaxSec=30','/usr/bin/python3','-I','-B',str(probe)]
+    result=json.loads(command(args,timeout=40))
+    assert result['generation']==expected_generation and result['publisher_cap3_sealing_and_scoped_filesystem_verified']
+    return {'publisher_cap3_sealing_and_scoped_filesystem_verified':True,'publisher_fixed_pid1_socket_query_verified':True,
+            'publisher_profile_probe_metrics':result['metrics']}
 
 
 def is_live_worker(raw,*,parent=None):
@@ -740,7 +812,7 @@ def _run_worker(policy, number, *, stopped_child=False, policy_guard=None,journa
 
 def main():
     assert sys.platform == 'linux' and os.geteuid() == 0 and os.environ.get('GITHUB_ACTIONS') == 'true'
-    for path in [Path(POLICY_ROOT), Path(CACHE_ROOT), Path(RUNTIME_ROOT), LIB_ROOT]:
+    for path in [Path(POLICY_ROOT), Path(CACHE_ROOT), Path(RUNTIME_ROOT), Path(STATE_ROOT), LIB_ROOT]:
         assert not path.exists(), 'Refuse to adopt an existing helper installation'
     unit_files = [Path('/run/systemd/system')/name for name in [PARENT_SLICE, WORKER_SLICE]]
     assert all(not path.exists() for path in unit_files)
@@ -774,7 +846,7 @@ def main():
             command(['/usr/sbin/useradd', '--system', '--uid', str(identity), '--gid', account,
                      '--no-create-home', '--home-dir', '/nonexistent', '--shell', '/usr/sbin/nologin', account])
             accounts.append(account)
-        for path in [Path(POLICY_ROOT), Path(CACHE_ROOT), Path(RUNTIME_ROOT), LIB_ROOT]:
+        for path in [Path(POLICY_ROOT), Path(CACHE_ROOT), Path(RUNTIME_ROOT), Path(STATE_ROOT), LIB_ROOT]:
             path.mkdir(parents=True, mode=0o755)
         shutil.copyfile(ROOT/'scripts/inventory_refresh_worker.py', LIB_ROOT/'worker.py')
         (LIB_ROOT/'worker.py').chmod(0o444)
@@ -858,6 +930,7 @@ def main():
         private_policy_guard=PolicyGuard.fixed()
         assert private_policy_guard.generation==policy_generation(b'k'*32,good)
         resource_proof=prove_resource_admission(private_policy_guard.generation)
+        resource_proof.update(prove_publisher_profile(base,private_policy_guard.generation))
         # Real low-privilege UIDs must not read either private root input. The
         # probe checks actual kernel IDs/capabilities before attempting access.
         probe="""import os,sys
@@ -958,7 +1031,7 @@ for path in sys.argv[2:]:
             command(['/bin/systemctl', 'daemon-reload'])
             if hook.exists():
                 hook.unlink()
-            for path in [Path(POLICY_ROOT), Path(CACHE_ROOT), Path(RUNTIME_ROOT), LIB_ROOT]:
+            for path in [Path(POLICY_ROOT), Path(CACHE_ROOT), Path(RUNTIME_ROOT), Path(STATE_ROOT), LIB_ROOT]:
                 if path.exists():
                     shutil.rmtree(path)
             for home in signers:

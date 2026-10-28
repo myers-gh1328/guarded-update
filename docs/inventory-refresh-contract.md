@@ -823,3 +823,23 @@ DNS or real repository fit. Unsupported layouts remain readiness failures;
 no host APT, resolver-runtime directory or broader control-socket fallback is
 allowed. Actual device secret-location coverage and initial namespace/unit
 provenance remain separate provisioning gates before activation.
+
+### Publisher permission profile (source only)
+
+The fixed publisher profile retains only CHOWN and DAC_OVERRIDE in its capability
+bounding set, with no ambient capabilities and NoNewPrivileges. Its writable
+filesystem bindings are the capability's cache, private state, runtime and
+rendered APT subtree. Private policy inputs and host native package state are
+read-only. Empty `/etc`, `/var/lib` and `/run` views expose only explicit inputs.
+
+Root access to PID1's private socket confers broad service-management authority.
+The trusted fixed wrapper and data-only nonce protocol limit the operations;
+these filesystem masks and capabilities do not sandbox malicious root code with
+that socket. The profile itself supplies no launcher or activation entrypoint.
+
+The disposable publisher probe checks exact kernel capability sets, current
+resource admission, read-only/writeable bindings, hidden synthetic host state,
+a fixed PID1 query and sealing of worker-owned synthetic metadata. Its staging
+fixture is prepared outside the aggregate; the probe cannot establish complete
+allocator accounting, a complete coordinator or target repository fit. Those
+remain separate gates before enabling the capability.
