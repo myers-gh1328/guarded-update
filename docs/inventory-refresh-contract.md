@@ -326,3 +326,38 @@ exercises actual runner package locks, native clock and installed-state reads.
 Its cache/policy identifiers are explicitly synthetic: it does not establish
 cache pinning, durable coordinator/status publication or independent deadline
 containment. Those integration gates remain required before activation.
+
+The primitive native proof also passed for `f989b048a14046126d65ba511bb1472b8b006c07`
+in [CI run 40635358769](https://github.com/myers-gh1328/guarded-update/actions/runs/40635358769).
+The retrieved `native-refresh-observation-proof.json` SHA-256 is
+`6f98fd62741f8779af06ff82363a6e9b99a789f7f617b599fa1c6435263341b3`.
+It confirms actual runner package/executor writer exclusion and matching native
+installed-state fingerprints through a released observation; its explicit false
+integration flags remain rollout gates.
+
+## Fixed inbox and status I/O primitives
+
+The staged I/O library reads only `request` beneath the fixed runtime root's
+`refresh`, `observation` and `release` directories. Each inbox is root-owned,
+mode 0770 with the reporting group; all parents remain nonwritable by reporter.
+A request must be reporter-owned, mode 0600, single-link regular data. Reading
+retains the original file, caps total data at 65 bytes to detect growth, rechecks
+descriptor/named identity and then parses the exact bounded correlator. This does
+not grant work: durable high-water/lifecycle admission still follows separately.
+
+The fixed public output is `status/status.json` beneath that runtime root. Its
+directory is root-owned mode 0750 with the reporting group; each fixed ancestor
+must permit reporter traversal. These permissions and full named ancestry are
+rechecked at use. The public file is root-owned mode 0640 with the reporting
+group. Unsafe existing files are rejected without following, repairing or
+changing their ownership.
+
+The private byte publisher requires the held root journal lock. It creates an
+exclusive private temporary file, writes bounded bytes, verifies final ownership,
+mode/type/link count, fsyncs, atomically replaces the fixed public name and fsyncs
+the directory. A failed exclusive creation never removes another private file.
+Any attempted replacement is classified as possibly visible on failure; directory
+fsync failure does not promise rollback to old bytes. The strict public-status
+schema builder and coordinator ordering remain mandatory before exposing this
+trusted byte sink through an operational helper. There is no executable I/O
+entrypoint or enabled capability in this slice.
