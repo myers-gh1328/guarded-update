@@ -945,6 +945,7 @@ def _run_worker(policy, number, *, stopped_child=False, policy_guard=None,journa
             # Only legacy fault fixtures use host system-bus wait/stdio. The
             # actual production adapters use private PID1 and raw retained status.
             args=args[:1]+['--wait','--collect','--pipe']+args[1:]
+            args=['CollectMode=inactive-or-failed' if value=='CollectMode=inactive' else value for value in args]
             result = subprocess.run(args, env=ENV, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=610)
             status = result.returncode
             empty_worker()

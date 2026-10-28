@@ -58,7 +58,7 @@ class NativeRefreshFixtureTests(unittest.TestCase):
             nonlocal retained
             if retained:
                 return SimpleNamespace(returncode=1, stderr=b'Unit fixed.service already exists.')
-            retained = '--collect' not in arguments
+            retained = '--collect' not in arguments or 'CollectMode=inactive' in arguments
             return SimpleNamespace(returncode=75, stderr=b'')
         with TemporaryDirectory() as directory:
             root = Path(directory)
