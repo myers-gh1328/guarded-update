@@ -104,6 +104,8 @@ class Journal:
         self.fd = directory_fd
         self.owner = owner
         self._held = False
+        self._launch_permits=set()
+        self._launch_epoch=object()
         self._needs_reconciliation = True
 
     def _check(self, fd):
@@ -128,6 +130,8 @@ class Journal:
             self._held = True
             yield self
         finally:
+            self._launch_permits.clear()
+            self._launch_epoch=object()
             self._held = False
             os.close(fd)
 
@@ -188,6 +192,8 @@ class Journal:
 
     def _save(self, value):
         self._held_lock()
+        self._launch_permits.clear()
+        self._launch_epoch=object()
         self._validate(value)
         data=encoded(value)
         if len(data)>LIMIT:
@@ -362,6 +368,8 @@ class Journal:
 
     def startup_ready(self):
         self._held_lock()
+        self._launch_permits.clear()
+        self._launch_epoch=object()
         self._needs_reconciliation=True
         fd=None
         try:
@@ -473,7 +481,25 @@ class Journal:
             'correlator': incoming, 'helper_sequence': record['helper_sequence'],
             'boot_id': boot_id, 'started_boottime_ms': now}
         self._save(value)
+        self._launch_permits.add((capability,incoming,boot_id,policy))
         return True
+
+    def _consume_launch(self,capability,incoming,boot_id,policy):
+        """Consume only a new-start permission in this held root lifecycle.
+
+        Existing durable running metadata or a new Journal instance cannot mint
+        this process-local permission. Startup reconciliation invalidates it.
+        """
+        self._locked()
+        value=self.snapshot()
+        permit=(capability,incoming,boot_id,policy)
+        if value['unconfirmed'] or permit not in self._launch_permits:
+            raise ValueError('Physical helper launch lacks a new one-use start')
+        record=value['capabilities'][capability]['active']
+        if (record is None or record['phase']!='running' or record['correlator']!=incoming or
+                record['boot_id']!=boot_id or record['policy_generation']!=policy):
+            raise ValueError('Physical helper launch does not match its new start')
+        self._launch_permits.remove(permit)
 
     def defer(self, capability, incoming, boot_id, reason, *, now):
         self._locked()

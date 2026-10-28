@@ -162,6 +162,33 @@ class RefreshStateTests(unittest.TestCase):
                 value=json.loads(json.dumps(frozen));mutate(value)
                 with self.subTest(value=value),self.assertRaises(ValueError):self.journal._validate(value)
 
+    def test_launch_permit_only_from_new_start_consumed_once_per_journal(self):
+        self.initialize()
+        with self.journal.exclusive():
+            self.journal.receive('observation',self.nonce,self.boot,100,'b'*64)
+            with self.assertRaises(ValueError):self.journal._consume_launch('observation',self.nonce,self.boot,'b'*64)
+            self.journal.start('observation',self.nonce,self.boot,101,policy='b'*64)
+            self.journal._consume_launch('observation',self.nonce,self.boot,'b'*64)
+            with self.assertRaises(ValueError):self.journal._consume_launch('observation',self.nonce,self.boot,'b'*64)
+            self.assertFalse(self.journal.start('observation',self.nonce,self.boot,102,policy='b'*64))
+            with self.assertRaises(ValueError):self.journal._consume_launch('observation',self.nonce,self.boot,'b'*64)
+
+    def test_reconciliation_invalidates_unconsumed_launch_permit(self):
+        self.initialize()
+        with self.journal.exclusive():
+            self.journal.receive('observation',self.nonce,self.boot,100,'b'*64)
+            self.journal.start('observation',self.nonce,self.boot,101,policy='b'*64)
+            self.assertFalse(self.journal.startup_ready())
+            with self.assertRaises(ValueError):self.journal._consume_launch('observation',self.nonce,self.boot,'b'*64)
+
+    def test_unlock_invalidates_unconsumed_physical_launch_permit(self):
+        self.initialize()
+        with self.journal.exclusive():
+            self.journal.receive('observation',self.nonce,self.boot,100,'b'*64)
+            self.journal.start('observation',self.nonce,self.boot,101,policy='b'*64)
+        with self.journal.exclusive():
+            with self.assertRaises(ValueError):self.journal._consume_launch('observation',self.nonce,self.boot,'b'*64)
+
     def test_prior_verified_success_survives_later_terminal_failure_and_restart(self):
         self.initialize()
         checked='2026-10-28T07:00:00Z'

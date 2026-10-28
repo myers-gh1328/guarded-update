@@ -274,6 +274,7 @@ def prove_observation_process(store,base,*,stopped_child=False):
     """Separate fixed guardian/native processes; no full parent activation."""
     from inventory_refresh_entry import SOURCES
     from inventory_refresh_observer import admit_profile
+    from inventory_refresh_service import ObservationService, UNIT
     for _,filename in SOURCES:
         source=ROOT/'scripts'/('inventory_refresh_guardian.py' if filename=='guardian.py' else filename)
         shutil.copyfile(source,LIB_ROOT/filename);(LIB_ROOT/filename).chmod(0o444)
@@ -284,7 +285,7 @@ def prove_observation_process(store,base,*,stopped_child=False):
     now=lambda:time.clock_gettime_ns(time.CLOCK_BOOTTIME)//1_000_000
     state=base/('observation-stopped-state' if stopped_child else 'observation-process-state');state.mkdir(mode=0o700)
     fd=os.open(state,os.O_RDONLY|os.O_DIRECTORY);journal=Journal(fd)
-    unit='command-center-inventory-observation-proof.service'
+    unit=UNIT
     private=Path(RUNTIME_ROOT)/'observation-private'
     parent=None;launcher=None
     try:
@@ -301,20 +302,7 @@ def prove_observation_process(store,base,*,stopped_child=False):
                 job=ObservationJob(1,secrets.token_hex(16),nonce,sequence,boot,manifest['cache_generation'],
                     manifest['policy_generation'],manifest['successful_checked_at'],accepted,started,accepted+(8000 if stopped_child else 120000))
                 parent=ObservationChannel.fixed(journal=journal);parent.write_job(job)
-                args=['/usr/bin/systemd-run','--quiet','--wait','--collect','--pipe','--unit='+unit,
-                    '--slice='+WORKER_SLICE,'-p','User=root','-p','Group=root',
-                    '-p','Type=exec','-p','ExitType=main','-p','RemainAfterExit=no','-p','Restart=no',
-                    '-p','KillMode=control-group','-p','KillSignal=SIGKILL','-p','SendSIGKILL=yes',
-                    '-p','TimeoutStopSec=1','-p','OOMPolicy=kill','-p','TasksMax=2','-p','RuntimeMaxSec=125',
-                    '-p','NoNewPrivileges=yes','-p','CapabilityBoundingSet=CAP_KILL CAP_SETPCAP',
-                    '-p','AmbientCapabilities=','-p','ProtectSystem=strict','-p','ProtectHome=yes',
-                    '-p','PrivateDevices=yes','-p','ProtectControlGroups=yes','-p','RestrictNamespaces=yes',
-                    '-p','PrivateNetwork=yes','-p','InaccessiblePaths=/tmp /var/tmp /dev/shm',
-                    '-p','TemporaryFileSystem=/etc:ro /var/lib:ro /run:ro',
-                    '-p','BindReadOnlyPaths=/var/lib/dpkg '+str(private)+' /run/guarded-update-executor.lock',
-                    '-p','BindPaths='+str(private/'results'),'-p','ReadWritePaths='+str(private/'results'),
-                    '/usr/bin/python3','-I','-B',str(LIB_ROOT/'observation-guardian.py')]
-                launcher=subprocess.Popen(args,env=ENV,stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.PIPE)
+                launcher=ObservationService(journal,parent,job).launch()
                 opened=None;limit=time.monotonic()+15
                 while time.monotonic()<limit and launcher.poll() is None:
                     opened=parent.read_result(expected_job=job)
@@ -393,7 +381,6 @@ finally:
                 granted=now();assert journal.start('release',nonce,boot,granted,policy=job.policy_generation)
                 parent.write_release(ReleaseGrant(job,granted))
                 assert launcher.wait(timeout=10)==0, 'Separate native/guardian rejected release'
-                launcher.stderr.close()
                 # PID1 main exit tears down its descendants before completion.
                 assert dict(line.split() for line in (cgroup(WORKER_SLICE)/'cgroup.events').read_text().splitlines())['populated']=='0'
                 released=parent.read_result(expected_job=job);receipt=released.document()['observation_receipt']
@@ -408,15 +395,7 @@ finally:
                     'separate_process_observation_receipt':receipt}
     finally:
         try:
-            try:
-                subprocess.run(['/bin/systemctl','stop',unit],env=ENV,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=10)
-            finally:
-                if launcher is not None:
-                    try:
-                        if launcher.poll() is None:launcher.kill()
-                        launcher.wait(timeout=5)
-                    finally:
-                        if launcher.stderr is not None:launcher.stderr.close()
+            if launcher is not None:launcher.close()
         finally:
             try:
                 if parent is not None:parent.close()

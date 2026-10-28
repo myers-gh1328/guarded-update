@@ -655,3 +655,30 @@ may remove current availability while leaving the historical receipt unchanged.
 The shared structural validator preserves honest expired/unconfirmed public
 receipts; only a released, timely, unchanged-state receipt can be accepted as a
 successful observation transaction.
+
+### Fixed service adapter (source only)
+
+`ObservationService` supplies the exact observation profile used by disposable
+native CI. It admits both fixed entry scripts and the complete bounded project
+source bundle before PID1 executes an entry. Root provisioning must drain running
+helpers before replacing that bundle; this is not isolation from malicious root.
+
+Launch consumes a process-local permit minted only after a new durable journal
+start succeeds. Existing running metadata and a fresh adapter object cannot mint
+permission. Journal mutations, reconciliation and lock release revoke pending
+permits and consumed handles through the current launch epoch. Failed or unknown
+launches are never automatically retried.
+
+A spawned launcher alone proves no service ownership. The adapter requires its
+strict root-job description marker, systemd InvocationID and a pinned actual
+cgroup directory identity. Before stopping the fixed unit it checks that same
+incarnation again. Missing/unconfirmed ownership or a replacement invocation
+never authorizes stopping an encountered service; cleanup can reap only its own
+launcher and retain uncertainty. Source-descriptor cleanup errors after launch
+also trigger owned cleanup. Root administration racing the coordination lock is
+outside the cooperating-controller boundary.
+
+The adapter has no command/path/options CLI and enables no service. The parent
+still owns actual OS readiness, policy/cache provenance, exact live-child checks,
+whole-cgroup/UID exclusion and durable restart reconciliation. An exit code,
+service disappearance or profile string alone is not completion authority.
