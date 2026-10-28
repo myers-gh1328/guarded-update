@@ -272,7 +272,7 @@ finally: os.close(fd)
             'observation_process_containment_verified':False}
 
 
-def prove_observation_process(store,base):
+def prove_observation_process(store,base,*,stopped_child=False):
     """Separate fixed guardian/native processes; no full parent activation."""
     from inventory_refresh_entry import SOURCES
     from inventory_refresh_observer import admit_profile
@@ -284,7 +284,7 @@ def prove_observation_process(store,base):
         (LIB_ROOT/filename).chmod(0o444)
     boot=Path('/proc/sys/kernel/random/boot_id').read_text().strip()
     now=lambda:time.clock_gettime_ns(time.CLOCK_BOOTTIME)//1_000_000
-    state=base/'observation-process-state';state.mkdir(mode=0o700)
+    state=base/('observation-stopped-state' if stopped_child else 'observation-process-state');state.mkdir(mode=0o700)
     fd=os.open(state,os.O_RDONLY|os.O_DIRECTORY);journal=Journal(fd)
     unit='command-center-inventory-observation-proof.service'
     private=Path(RUNTIME_ROOT)/'observation-private'
@@ -294,13 +294,14 @@ def prove_observation_process(store,base):
             journal.initialize(secrets.token_hex(16))
             with store.lease_current() as pin:
                 manifest=pin.manifest
-                nonce='0000000000000002'+secrets.token_hex(8)
+                sequence=3 if stopped_child else 2
+                nonce=f'{sequence:016x}'+secrets.token_hex(8)
                 accepted=now()
                 assert journal.receive('observation',nonce,boot,accepted,manifest['policy_generation'])=='new'
                 started=now()
                 assert journal.start('observation',nonce,boot,started,policy=manifest['policy_generation'])
-                job=ObservationJob(1,secrets.token_hex(16),nonce,2,boot,manifest['cache_generation'],
-                    manifest['policy_generation'],manifest['successful_checked_at'],accepted,started,accepted+120000)
+                job=ObservationJob(1,secrets.token_hex(16),nonce,sequence,boot,manifest['cache_generation'],
+                    manifest['policy_generation'],manifest['successful_checked_at'],accepted,started,accepted+(8000 if stopped_child else 120000))
                 parent=ObservationChannel.fixed(journal=journal);parent.write_job(job)
                 args=['/usr/bin/systemd-run','--quiet','--wait','--collect','--pipe','--unit='+unit,
                     '--slice='+WORKER_SLICE,'-p','User=root','-p','Group=root',
@@ -338,6 +339,46 @@ def prove_observation_process(store,base):
                 # do not exist there. No host secret is read by this proof.
                 assert not Path('/proc',str(native),'root'+POLICY_ROOT).exists()
                 assert not Path('/proc',str(native),'root'+str(state)).exists()
+                if stopped_child:
+                    # Only this disposable CI-created transient unit's own
+                    # direct native reader, root identity but all capabilities
+                    # empty. Never signal the guardian, mutate memory limits or
+                    # use a numeric PID fallback.
+                    assert sys.platform=='linux' and os.geteuid()==0 and os.environ.get('GITHUB_ACTIONS')=='true'
+                    assert command(['/bin/systemctl','show','--property=Transient','--value',unit]).strip()==b'yes'
+                    def recheck():
+                        raw=Path('/proc',str(native),'status').read_bytes()
+                        admit_profile(raw)
+                        return (str(native) in (owned/'cgroup.procs').read_text().split() and
+                            b'PPid:\t'+str(guardian).encode()+b'\n' in raw and
+                            Path('/proc',str(native),'cmdline').read_bytes().split(b'\0')[:-1]==
+                                [b'/usr/bin/python3',b'-I',b'-B',str(LIB_ROOT/'observation-native.py').encode()])
+                    stop_owned_child(native,recheck)
+                    assert launcher.wait(timeout=12)==76
+                    finished=now()
+                    assert job.deadline_boottime_ms<=finished<=job.deadline_boottime_ms+3000
+                    assert dict(line.split() for line in (cgroup(WORKER_SLICE)/'cgroup.events').read_text().splitlines())['populated']=='0'
+                    # Actual exclusive writer locks in a separate process,
+                    # without creating or writing any file. Another SH reader
+                    # must prevent this probe; shared reacquisition is weaker.
+                    writer_probe="""import fcntl,os
+fds=[]
+try:
+ for path,native in [('/run/guarded-update-executor.lock',False),('/var/lib/dpkg/lock-frontend',True),('/var/lib/dpkg/lock',True)]:
+  fd=os.open(path,os.O_RDWR|os.O_NOFOLLOW|os.O_NONBLOCK);fds.append(fd)
+  if native:fcntl.lockf(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)
+  else:fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)
+finally:
+ for fd in fds:os.close(fd)
+"""
+                    command(['/usr/bin/python3','-I','-B','-c',writer_probe],timeout=5)
+                    residue=parent.read_result(expected_job=job)
+                    assert residue.document()['phase']=='opened'
+                    return {'observation_independent_deadline_verified':True,
+                        'stopped_native_reader_cleanup_verified':True,
+                        'native_exclusive_writer_locks_after_cleanup_verified':True,
+                        'stopped_observation_deadline_ms':job.deadline_boottime_ms,
+                        'stopped_observation_cleanup_ms':finished}
                 requested=now()
                 assert journal.receive('release',nonce,boot,requested,job.policy_generation)=='new'
                 granted=now();assert journal.start('release',nonce,boot,granted,policy=job.policy_generation)
@@ -669,6 +710,7 @@ def main():
             store.publish(stage, 'a'*32, generation, datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'))
             observation=prove_cache_pinned_observation(store,base)
             observation.update(prove_observation_process(store,base))
+            observation.update(prove_observation_process(store,base,stopped_child=True))
             previous = (Path(CACHE_ROOT)/'current.json').read_bytes()
             for number, candidate in [(2, policy(certificate_path=wrong_ca)),
                                       (3, policy(signing_key=wrong_public)),
