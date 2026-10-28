@@ -703,17 +703,11 @@ def prove_root_refresh_transaction(expected_generation):
     """Actual fixed production components in one CAP3 publisher, synthetic only."""
     from inventory_refresh_publisher_profile import publisher_properties
     from inventory_refresh_resources import UNIT
-    modules=('inventory_refresh_protocol','inventory_refresh_receipt','inventory_refresh_state',
-        'inventory_refresh_storage','inventory_refresh_status','inventory_refresh_observation',
-        'inventory_refresh_cached_observation','inventory_refresh_channel','inventory_refresh_guardian',
-        'inventory_refresh_observer','inventory_refresh_entry','inventory_refresh_unit_status','inventory_refresh_service',
-        'inventory_refresh_policy','inventory_refresh_policy_admission','inventory_refresh_materialized_policy',
-        'inventory_refresh_worker_service','inventory_refresh_resources','inventory_refresh_materializer',
-        'inventory_refresh_writer_exclusion','inventory_refresh_io','inventory_refresh_coordinator','inventory_refresh_contention',
-        'inventory_refresh_transaction','inventory_refresh_observation_transaction','inventory_refresh_dispatch','inventory_refresh_runtime')
-    for name in modules:
-        filename='guardian.py' if name=='inventory_refresh_guardian' else name+'.py'
+    from inventory_refresh_root_entry import SOURCES
+    for name,filename in SOURCES:
         shutil.copyfile(ROOT/'scripts'/(name+'.py'),LIB_ROOT/filename);(LIB_ROOT/filename).chmod(0o444)
+    shutil.copyfile(ROOT/'scripts/inventory_refresh_root_entry.py',LIB_ROOT/'coordinator.py')
+    (LIB_ROOT/'coordinator.py').chmod(0o444)
     # All earlier observation scopes have been independently confirmed empty.
     for filename in ('observation-native.py','observation-guardian.py'):
         shutil.copyfile(ROOT/'scripts/inventory_refresh_entry.py',LIB_ROOT/filename);(LIB_ROOT/filename).chmod(0o444)
@@ -733,9 +727,11 @@ def prove_root_refresh_transaction(expected_generation):
     original=(LIB_ROOT/'resource-admission-proof.py').read_text()
     bootstrap,marker,_=original.partition('from inventory_refresh_resources import RuntimeResources')
     assert marker
-    bootstrap=re.sub(r'^names=.*$', 'names='+repr(modules),bootstrap,count=1,flags=re.MULTILINE)
-    bootstrap=bootstrap.replace("filename=name+'.py'", "filename='guardian.py' if name=='inventory_refresh_guardian' else name+'.py'")
-    bootstrap=bootstrap.replace('compiled={name:compile(', 'assert sum(map(len,sources.values()))<=512*1024\ncompiled={name:compile(')
+    # Test wrapper pre-admits the fixed entry itself. That actual entry's loader
+    # then admits/compiles every root module; no fixture module-list bootstrap.
+    bootstrap=re.sub(r'^names=.*$', "names=('inventory_refresh_root_entry',)",bootstrap,count=1,flags=re.MULTILINE)
+    bootstrap=bootstrap.replace("filename=name+'.py'", "filename='coordinator.py'")
+    bootstrap+="root_sources=sys.modules['inventory_refresh_root_entry'].RootSources.fixed()\ntry:root_sources.execute()\nfinally:root_sources.close()\n"
     body=r"""from inventory_refresh_runtime import FixedRuntime
 from inventory_refresh_writer_exclusion import WriterExclusion
 import secrets
@@ -743,6 +739,7 @@ import time
 fields=dict(line.split(':',1) for line in open('/proc/self/status').read().splitlines())
 assert {name:int(fields[name].strip(),16) for name in ('CapPrm','CapEff','CapBnd','CapInh','CapAmb')}=={'CapPrm':3,'CapEff':3,'CapBnd':3,'CapInh':0,'CapAmb':0}
 assert fields['NoNewPrivs'].split()==['1']
+assert sys.flags.no_site
 stage='runtime_admission';runtime=FixedRuntime.fixed()
 try:
  journal=runtime._journal;store=runtime._store;resources=runtime._resources;policy=runtime._policy
@@ -822,7 +819,7 @@ postclose=WriterExclusion.fixed(60001)
 try:postclose.check()
 finally:postclose.close()
 print(json.dumps({'fixed_publisher_refresh_transaction_verified':True,'fixed_publisher_observation_transaction_verified':True,
- 'fixed_publisher_inbox_dispatch_verified':True,'fixed_publisher_runtime_verified':True,'generation':@GENERATION@,'metrics':metrics,
+ 'fixed_publisher_inbox_dispatch_verified':True,'fixed_publisher_runtime_verified':True,'fixed_publisher_root_bootstrap_verified':True,'generation':@GENERATION@,'metrics':metrics,
  'coordinator_exercised':False,'all_allocators_charged_from_startup_verified':False},sort_keys=True))
 """.replace('@GENERATION@',repr(expected_generation))
     body="stage='imports'\ntry:\n"+''.join(' '+line+'\n' for line in body.splitlines())+"except BaseException as error:\n print('publisher_transaction_failure='+json.dumps({'stage':stage,'operation_stage':getattr(error,'stage',None),'diagnostics':getattr(error,'diagnostics',None),'kind':type(error).__name__,'errno':getattr(error,'errno',None)},sort_keys=True),file=sys.stderr)\n raise SystemExit(74)\n"
@@ -831,7 +828,7 @@ print(json.dumps({'fixed_publisher_refresh_transaction_verified':True,'fixed_pub
     probe.write_text(bootstrap+body);probe.chmod(0o444)
     args=['/usr/bin/systemd-run','--quiet','--wait','--collect','--pipe','--unit='+UNIT,'--slice='+PARENT_SLICE]
     for property in publisher_properties():args+=['-p',property]
-    args+=['-p','RuntimeMaxSec=120','/usr/bin/python3','-I','-B',str(probe)]
+    args+=['-p','RuntimeMaxSec=120','/usr/bin/python3','-I','-B','-S',str(probe)]
     completed=subprocess.run(args,env=ENV,stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=130)
     if completed.returncode:
         lines=[line[:2048].decode('ascii',errors='replace') for line in (completed.stdout+b'\n'+completed.stderr).splitlines() if line.startswith(b'publisher_transaction_failure=')]
@@ -839,8 +836,8 @@ print(json.dumps({'fixed_publisher_refresh_transaction_verified':True,'fixed_pub
     result=json.loads(completed.stdout)
     assert result['generation']==expected_generation and result['fixed_publisher_refresh_transaction_verified']
     assert not result['coordinator_exercised'] and not result['all_allocators_charged_from_startup_verified']
-    assert result['fixed_publisher_observation_transaction_verified'] and result['fixed_publisher_inbox_dispatch_verified'] and result['fixed_publisher_runtime_verified']
-    return {'fixed_publisher_refresh_transaction_verified':True,'fixed_publisher_observation_transaction_verified':True,'fixed_publisher_inbox_dispatch_verified':True,'fixed_publisher_runtime_verified':True,'publisher_refresh_transaction_metrics':result['metrics']}
+    assert result['fixed_publisher_observation_transaction_verified'] and result['fixed_publisher_inbox_dispatch_verified'] and result['fixed_publisher_runtime_verified'] and result['fixed_publisher_root_bootstrap_verified']
+    return {'fixed_publisher_refresh_transaction_verified':True,'fixed_publisher_observation_transaction_verified':True,'fixed_publisher_inbox_dispatch_verified':True,'fixed_publisher_runtime_verified':True,'fixed_publisher_root_bootstrap_verified':True,'publisher_refresh_transaction_metrics':result['metrics']}
 
 
 def is_live_worker(raw,*,parent=None):

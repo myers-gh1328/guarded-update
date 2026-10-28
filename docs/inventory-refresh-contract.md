@@ -1011,3 +1011,32 @@ nonce dispatch and runtime close, then checks writer exclusion after shutdown.
 `fixed_publisher_runtime_verified` therefore covers bounded assembly and ownership,
 not a complete executable/bootstrap, trusted initial namespaces, all startup
 allocations, actual target repository fit or device rollout.
+
+### Fixed coordinator source bootstrap (inactive source)
+
+`inventory_refresh_root_entry.py` is installed as the fixed `coordinator.py`
+entry. Its launcher must admit the entry and trusted OS interpreter before either
+executes. Current entry checks require Linux root, exact fixed argv, Python
+`-I -B -S`, CAP3/empty inherited and ambient capabilities, NoNewPrivs and the exact
+coordinator cgroup. Environment becomes a fixed PATH/locale. These checks cannot
+prove initial host namespaces, prior startup allocations or already-executed entry
+provenance.
+
+Only stdlib loads before the fixed project source bundle. Every root-owned,
+single-link bounded source and full library ancestry is pinned; all modules are
+compiled before a final whole-batch FD/named-reference/ancestry fence and any
+project execution. Entire-batch module collisions are rejected first. Failed
+execution removes only exact module objects installed by this loader, and a
+bundle cannot be retried. No project search path or bytecode import is used.
+
+Main creates the fixed runtime and polls every 250ms. Admission, step, sleep or
+cleanup failure exits with static code 74, without reopening or retrying work.
+Physical guardians remain independent of this parent; interrupted started work
+requires existing explicit reconciliation at the next startup. No service is
+enabled by adding this source.
+
+The native fixture pre-admits the actual entry, then exercises its actual bundle
+loader and a finite actual-runtime proof under `-I -B -S`.
+`fixed_publisher_root_bootstrap_verified` covers that loader path; it does not
+claim that the fixture ran production main/profile admission or its infinite loop.
+Those entry/provisioning and target/client rollout gates remain separate.
