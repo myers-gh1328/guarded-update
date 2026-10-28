@@ -1171,3 +1171,19 @@ closure. A fixed adapter must still authenticate root status/ancestry and the
 native clock, persist observation intent, supervise the reader and use the existing
 Rust collector inside the admitted interval. Request capabilities remain disabled
 until that adapter and durable publication/recovery integration are verified.
+
+The request journal also has a two-phase native collection admission seam. It
+atomically persists `submitted=true`, `Running`, `scan=null` and a reserved root
+observation nonce before returning a private, non-cloneable intent. Report ID,
+sequence, source, request, boot and negotiation identity are frozen in that
+same-run intent. Only consuming that intent on the original journal epoch can
+persist the actual later scan start; the fixed adapter must first admit the
+opened root lease. Every mutation/recovery attempt revokes outstanding intents,
+and reopening an identical journal cannot recover them. A dropped intent or a
+crash leaves submitted work unresolved, never permission to resubmit. Failed
+persistence returns no authority and poisons the journal handle.
+
+This seam uses the existing private journal schema: interrupted submission with
+no scan is already an unresolved state. It has no native invocation and remains
+behind the existing inactive request integration. Neither an admission token nor
+an attached scan proof supplies native coherence or report-ready authority.
