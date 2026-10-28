@@ -31,7 +31,7 @@ sys.path.insert(0, str(ROOT/'scripts'))
 from inventory_refresh_policy import parse_policy, render_policy, policy_generation, POLICY_ROOT, CACHE_ROOT, RUNTIME_ROOT
 from inventory_refresh_storage import Store
 from inventory_refresh_worker import validate_kernel_identity
-from inventory_refresh_guardian import worker_argv
+from inventory_refresh_guardian import worker_argv, load_worker
 
 WORKER = 60001
 READER = 60002
@@ -163,6 +163,14 @@ def prove_privilege_transition():
     # Disposable CI ONLY. Read current-process credentials; no signals, service
     # property changes, package operations or live-device invocation.
     assert sys.platform=='linux' and os.geteuid()==0 and os.environ.get('GITHUB_ACTIONS')=='true'
+    try:
+        load_worker()
+    except (OSError,ValueError,ImportError):
+        checks=[]
+        for index,path in enumerate([Path('/'),Path('/usr'),Path('/usr/local'),Path('/usr/local/libexec'),LIB_ROOT,LIB_ROOT/'worker.py']):
+            value=path.lstat()
+            checks.append((index,value.st_uid==0,not bool(value.st_mode&0o022),not path.is_symlink()))
+        raise AssertionError('Fixed source admission rejected; component ownership/mode/link checks='+repr(checks)) from None
     code="import sys;sys.stdout.buffer.write(open('/proc/self/status','rb').read(65537))"
     fixed=list(worker_argv(WORKER,WORKER)[:-1])+['-c',code]
     args=['/usr/bin/systemd-run','--quiet','--wait','--collect','--pipe',
