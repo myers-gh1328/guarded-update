@@ -97,14 +97,58 @@ def read_json(parent, entry, owner, limit):
         os.close(fd)
 
 
-class Store:
-    def __init__(self, cache_fd, publisher_uid=0, reader_gid=0, worker_uid=None):
+class CacheReader:
+    """Lease-only cache view; no worker identity or publication authority.
+
+    The fixed OS adapter must admit the cache's full ancestry before passing its
+    borrowed descriptor. This view never performs account/NSS lookups.
+    """
+    def __init__(self, cache_fd, *, owner=0):
         metadata = os.fstat(cache_fd)
-        if (not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != publisher_uid or
-                metadata.st_mode & 0o022 or worker_uid is None):
+        if (not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != owner or
+                metadata.st_mode & 0o022):
             raise ValueError('Inventory cache root is not admitted')
         self.fd = cache_fd
-        self.uid = publisher_uid
+        self.uid = owner
+
+    def _current(self):
+        pointer, data = read_json(self.fd, 'current.json', self.uid, 65536)
+        if (type(pointer) is not dict or
+                set(pointer) != {'schema_version', 'cache_generation', 'manifest_sha256'} or
+                pointer['schema_version'] != 1 or type(pointer['schema_version']) is not int or
+                not re.fullmatch('[0-9a-f]{64}', str(pointer['manifest_sha256']))):
+            raise ValueError('Invalid current inventory reference')
+        token(pointer['cache_generation'])
+        return pointer, data
+
+    @contextmanager
+    def lease_current(self):
+        pointer, before = self._current()
+        directory = opened(self.fd, 'generation-'+pointer['cache_generation'], self.uid, directory=True)
+        lock = None
+        try:
+            lock = opened(directory, LEASE, self.uid, limit=0)
+            try:
+                fcntl.flock(lock, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise ValueError('Inventory generation lease unavailable') from None
+            manifest, encoded = read_json(directory, MANIFEST, self.uid, MAX_MANIFEST)
+            _, after = self._current()
+            if (before != after or hashlib.sha256(encoded).hexdigest() != pointer['manifest_sha256'] or
+                    manifest.get('cache_generation') != pointer['cache_generation']):
+                raise ValueError('Inventory generation changed before lease admission')
+            yield Lease(directory, manifest, self.uid)
+        finally:
+            if lock is not None:
+                os.close(lock)
+            os.close(directory)
+
+
+class Store(CacheReader):
+    def __init__(self, cache_fd, publisher_uid=0, reader_gid=0, worker_uid=None):
+        super().__init__(cache_fd, owner=publisher_uid)
+        if worker_uid is None:
+            raise ValueError('Inventory cache worker identity is not admitted')
         self.gid = reader_gid
         self.worker = worker_uid
 
@@ -122,16 +166,6 @@ class Store:
             os.fsync(fd)
         finally:
             os.close(fd)
-
-    def _current(self):
-        pointer, data = read_json(self.fd, 'current.json', self.uid, 65536)
-        if (type(pointer) is not dict or
-                set(pointer) != {'schema_version', 'cache_generation', 'manifest_sha256'} or
-                pointer['schema_version'] != 1 or type(pointer['schema_version']) is not int or
-                not re.fullmatch('[0-9a-f]{64}', str(pointer['manifest_sha256']))):
-            raise ValueError('Invalid current inventory reference')
-        token(pointer['cache_generation'])
-        return pointer, data
 
     def publish(self, staging_token, generation_token, policy, checked_at):
         token(staging_token)
@@ -206,28 +240,6 @@ class Store:
                 os.fsync(fd)
             finally:
                 os.close(fd)
-
-    @contextmanager
-    def lease_current(self):
-        pointer, before = self._current()
-        directory = opened(self.fd, 'generation-'+pointer['cache_generation'], self.uid, directory=True)
-        lock = None
-        try:
-            lock = opened(directory, LEASE, self.uid, limit=0)
-            try:
-                fcntl.flock(lock, fcntl.LOCK_SH | fcntl.LOCK_NB)
-            except BlockingIOError:
-                raise ValueError('Inventory generation lease unavailable') from None
-            manifest, encoded = read_json(directory, MANIFEST, self.uid, MAX_MANIFEST)
-            _, after = self._current()
-            if (before != after or hashlib.sha256(encoded).hexdigest() != pointer['manifest_sha256'] or
-                    manifest.get('cache_generation') != pointer['cache_generation']):
-                raise ValueError('Inventory generation changed before lease admission')
-            yield Lease(directory, manifest, self.uid)
-        finally:
-            if lock is not None:
-                os.close(lock)
-            os.close(directory)
 
     def retire(self, generation_token):
         token(generation_token)

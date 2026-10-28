@@ -272,6 +272,102 @@ finally: os.close(fd)
             'observation_process_containment_verified':False}
 
 
+def prove_observation_process(store,base):
+    """Separate fixed guardian/native processes; no full parent activation."""
+    from inventory_refresh_entry import SOURCES
+    from inventory_refresh_observer import admit_profile
+    for _,filename in SOURCES:
+        source=ROOT/'scripts'/('inventory_refresh_guardian.py' if filename=='guardian.py' else filename)
+        shutil.copyfile(source,LIB_ROOT/filename);(LIB_ROOT/filename).chmod(0o444)
+    for filename in ('observation-native.py','observation-guardian.py'):
+        shutil.copyfile(ROOT/'scripts/inventory_refresh_entry.py',LIB_ROOT/filename)
+        (LIB_ROOT/filename).chmod(0o444)
+    boot=Path('/proc/sys/kernel/random/boot_id').read_text().strip()
+    now=lambda:time.clock_gettime_ns(time.CLOCK_BOOTTIME)//1_000_000
+    state=base/'observation-process-state';state.mkdir(mode=0o700)
+    fd=os.open(state,os.O_RDONLY|os.O_DIRECTORY);journal=Journal(fd)
+    unit='command-center-inventory-observation-proof.service'
+    private=Path(RUNTIME_ROOT)/'observation-private'
+    parent=None;launcher=None
+    try:
+        with journal.exclusive():
+            journal.initialize(secrets.token_hex(16))
+            with store.lease_current() as pin:
+                manifest=pin.manifest
+                nonce='0000000000000002'+secrets.token_hex(8)
+                accepted=now()
+                assert journal.receive('observation',nonce,boot,accepted,manifest['policy_generation'])=='new'
+                started=now()
+                assert journal.start('observation',nonce,boot,started,policy=manifest['policy_generation'])
+                job=ObservationJob(1,secrets.token_hex(16),nonce,2,boot,manifest['cache_generation'],
+                    manifest['policy_generation'],manifest['successful_checked_at'],accepted,started,accepted+120000)
+                parent=ObservationChannel.fixed(journal=journal);parent.write_job(job)
+                args=['/usr/bin/systemd-run','--quiet','--wait','--collect','--pipe','--unit='+unit,
+                    '--slice='+WORKER_SLICE,'-p','User=root','-p','Group=root',
+                    '-p','Type=exec','-p','ExitType=main','-p','RemainAfterExit=no','-p','Restart=no',
+                    '-p','KillMode=control-group','-p','KillSignal=SIGKILL','-p','SendSIGKILL=yes',
+                    '-p','TimeoutStopSec=1','-p','OOMPolicy=kill','-p','TasksMax=2','-p','RuntimeMaxSec=125',
+                    '-p','NoNewPrivileges=yes','-p','CapabilityBoundingSet=CAP_KILL CAP_SETPCAP',
+                    '-p','AmbientCapabilities=','-p','ProtectSystem=strict','-p','ProtectHome=yes',
+                    '-p','PrivateDevices=yes','-p','ProtectControlGroups=yes','-p','RestrictNamespaces=yes',
+                    '-p','PrivateNetwork=yes','-p','InaccessiblePaths=/tmp /var/tmp /dev/shm',
+                    '-p','TemporaryFileSystem=/etc:ro /var/lib:ro /run:ro',
+                    '-p','BindReadOnlyPaths=/var/lib/dpkg '+str(private)+' /run/guarded-update-executor.lock',
+                    '-p','BindPaths='+str(private/'results'),'-p','ReadWritePaths='+str(private/'results'),
+                    '/usr/bin/python3','-I','-B',str(LIB_ROOT/'observation-guardian.py')]
+                launcher=subprocess.Popen(args,env=ENV,stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.PIPE)
+                opened=None;limit=time.monotonic()+15
+                while time.monotonic()<limit and launcher.poll() is None:
+                    opened=parent.read_result(expected_job=job)
+                    if opened is not None:break
+                    time.sleep(0.02)
+                assert opened is not None and opened.document()['phase']=='opened', 'Separate native process did not open observation (exit='+str(launcher.poll())+')'
+                owned=cgroup(unit)
+                guardian=int(command(['/bin/systemctl','show','--property=MainPID','--value',unit]))
+                admit_profile(Path('/proc',str(guardian),'status').read_bytes(),guardian=True)
+                native=None
+                for pid in (owned/'cgroup.procs').read_text().split():
+                    status=Path('/proc',pid,'status').read_bytes()
+                    if b'PPid:\t'+str(guardian).encode()+b'\n' in status:
+                        admit_profile(status)
+                        argv=Path('/proc',pid,'cmdline').read_bytes().split(b'\0')
+                        assert argv[:-1]==[b'/usr/bin/python3',b'-I',b'-B',str(LIB_ROOT/'observation-native.py').encode()]
+                        native=int(pid)
+                assert native is not None and now()<job.deadline_boottime_ms
+                # Actual masked namespace: configured policy root and parent state
+                # do not exist there. No host secret is read by this proof.
+                assert not Path('/proc',str(native),'root'+POLICY_ROOT).exists()
+                assert not Path('/proc',str(native),'root'+str(state)).exists()
+                requested=now()
+                assert journal.receive('release',nonce,boot,requested,job.policy_generation)=='new'
+                granted=now();assert journal.start('release',nonce,boot,granted,policy=job.policy_generation)
+                parent.write_release(ReleaseGrant(job,granted))
+                assert launcher.wait(timeout=10)==0, 'Separate native/guardian rejected release'
+                launcher.stderr.close()
+                # PID1 main exit tears down its descendants before completion.
+                assert dict(line.split() for line in (cgroup(WORKER_SLICE)/'cgroup.events').read_text().splitlines())['populated']=='0'
+                released=parent.read_result(expected_job=job);receipt=released.document()['observation_receipt']
+                assert released.document()['phase']=='released' and all(receipt[key]==value for key,value in opened.document()['observation_lease'].items())
+                assert receipt['installed_before_sha256']==receipt['installed_after_sha256']
+                with store.lease_current() as current:assert current.manifest==manifest
+                for capability in ('observation','release'):
+                    journal.finish(capability,nonce,boot,receipt['released_boottime_ms'],'succeeded',cache=job.cache_generation,policy=job.policy_generation)
+                return {'observation_separate_native_process_verified':True,
+                    'observation_native_zero_capabilities_verified':True,
+                    'observation_masked_policy_and_parent_state_verified':True,
+                    'separate_process_observation_receipt':receipt}
+    finally:
+        try:
+            subprocess.run(['/bin/systemctl','stop',unit],env=ENV,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=10)
+            if launcher is not None:
+                if launcher.poll() is None:launcher.kill()
+                launcher.wait(timeout=5)
+                if launcher.stderr is not None:launcher.stderr.close()
+        finally:
+            if parent is not None:parent.close()
+            os.close(fd)
+
+
 def is_live_worker(raw,*,parent=None):
     try:
         validate_kernel_identity(raw,WORKER,WORKER)
@@ -572,6 +668,7 @@ def main():
         try:
             store.publish(stage, 'a'*32, generation, datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'))
             observation=prove_cache_pinned_observation(store,base)
+            observation.update(prove_observation_process(store,base))
             previous = (Path(CACHE_ROOT)/'current.json').read_bytes()
             for number, candidate in [(2, policy(certificate_path=wrong_ca)),
                                       (3, policy(signing_key=wrong_public)),

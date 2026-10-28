@@ -44,6 +44,23 @@ class RefreshStorageTests(unittest.TestCase):
         return self.store.publish(stage or self.stage, generation or self.generation,
                                   self.policy, '2026-01-01T00:00:00Z')
 
+    def test_reader_leases_without_worker_identity_or_mutation_methods(self):
+        self.stage_lists()
+        self.publish()
+        reader = self.module.CacheReader(self.fd, owner=os.getuid())
+        with reader.lease_current() as lease:
+            self.assertEqual(lease.read_index('synthetic_Packages'), b'synthetic-package-index')
+        for method in ('publish', 'retire', '_new_file', '_seal', '_remove'):
+            self.assertFalse(hasattr(reader, method), method)
+        self.assertFalse(hasattr(reader, 'worker'))
+
+    def test_reader_rejects_writable_cache_and_wrong_owner(self):
+        with self.assertRaises(ValueError):
+            self.module.CacheReader(self.fd, owner=os.getuid()+1)
+        self.root.chmod(0o770)
+        with self.assertRaises(ValueError):
+            self.module.CacheReader(self.fd, owner=os.getuid())
+
     def test_publish_seals_exact_opened_index_objects_and_current_reference(self):
         self.stage_lists()
         self.publish()
