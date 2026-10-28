@@ -10,7 +10,7 @@ import stat
 import sys
 
 from inventory_refresh_observation import _Ancestry, _identity
-from inventory_refresh_resources import mount_rows, _mount_id, _proc
+from inventory_refresh_resources import mount_rows, _mount_id, _proc, _Chain
 
 SLICE=('command.slice','command-center.slice','command-center-inventory.slice','command-center-inventory-worker.slice')
 MAX_TASKS=32768
@@ -77,7 +77,7 @@ class WriterExclusion:
         try:
             root=os.open('/',os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
             value._proc=_Ancestry.open(root,('proc',))
-            value._cgroup=_Ancestry.open(root,('sys','fs','cgroup')+SLICE)
+            value._cgroup=_Chain(('sys','fs','cgroup')+SLICE)
             value._uid=worker_uid;value.check();return value
         except BaseException:
             try:value.close()

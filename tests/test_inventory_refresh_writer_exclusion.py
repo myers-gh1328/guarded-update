@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock,patch
 import unittest
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'scripts'))
+import inventory_refresh_writer_exclusion as exclusion
 from inventory_refresh_writer_exclusion import task_identity,proc_mount,WriterExclusion
 
 
@@ -16,6 +17,21 @@ class WriterExclusionTests(unittest.TestCase):
 
     def mount(self,options=b'rw,nosuid,nodev,noexec',super_options=b'rw',root=b'/'):
         return b'42 1 0:2 '+root+b' /proc '+options+b' - proc proc '+super_options+b'\n'
+
+    def test_fixed_factory_admits_literal_dotted_slice_names_without_generic_path_options(self):
+        proc=Mock();groups=Mock()
+        def native_chain(root,parts):
+            # The existing native-file helper intentionally disallows dots.
+            # The cgroup factory must use the reviewed cgroup ancestry helper.
+            if any('.' in part for part in parts):raise ValueError('native component grammar')
+            return proc
+        with patch.object(exclusion.sys,'platform','linux'),patch.object(exclusion.os,'getresuid',return_value=(0,0,0),create=True),patch.object(exclusion.os,'getresgid',return_value=(0,0,0),create=True),patch.object(exclusion._Ancestry,'open',side_effect=native_chain) as native,patch.object(exclusion,'_Chain',return_value=groups,create=True) as chain,patch.object(WriterExclusion,'check'):
+            value=WriterExclusion.fixed(60001)
+            try:
+                chain.assert_called_once_with(('sys','fs','cgroup')+exclusion.SLICE)
+                self.assertIs(value._cgroup,groups)
+                self.assertEqual(native.call_args.args[1],('proc',))
+            finally:value.close()
 
     def test_each_kernel_uid_column_is_checked_including_saved_and_fs(self):
         self.assertEqual(task_identity(self.status(),100,101,60001),(1000,)*4)
