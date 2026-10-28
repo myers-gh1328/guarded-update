@@ -533,11 +533,13 @@ from inventory_refresh_policy_admission import PolicyGuard
 from inventory_refresh_storage import Store
 from datetime import datetime,timezone
 import errno,subprocess
+stage='identity'
 fields=dict(line.split(':',1) for line in open('/proc/self/status').read().splitlines())
 masks={name:int(fields[name].strip(),16) for name in ('CapPrm','CapEff','CapBnd','CapInh','CapAmb')}
 if masks!={'CapPrm':3,'CapEff':3,'CapBnd':3,'CapInh':0,'CapAmb':0} or fields['NoNewPrivs'].split()!=['1']:
  print('publisher_profile_masks='+json.dumps(masks,sort_keys=True),file=sys.stderr)
  raise SystemExit(74)
+stage='resources'
 try:
  resources=RuntimeResources.fixed()
 except ResourceError as error:
@@ -546,22 +548,28 @@ except ResourceError as error:
  print('publisher_cache_mount_diagnostic='+json.dumps({'reason':error.reason,'rows':rows[:8]},sort_keys=True),file=sys.stderr)
  raise SystemExit(74)
 with resources:
+ stage='policy'
  with PolicyGuard.fixed() as policy:
   generation=policy.generation
+  stage='read_only_inputs'
   for path in ('/etc/command-center-inventory-refresh/policy.json','/etc/command-center-inventory-refresh/policy-commitment.key','/etc/passwd','/var/lib/dpkg/status'):
    try:fd=os.open(path,os.O_WRONLY|os.O_NOFOLLOW|os.O_NONBLOCK)
    except OSError as error:assert error.errno==errno.EROFS
    else:
     os.close(fd);raise AssertionError('Publisher read-only input is writable')
+  stage='writable_outputs'
   for directory in ('/var/lib/command-center-inventory-refresh','/run/command-center-inventory-refresh','/etc/command-center-inventory-refresh/apt'):
    path=directory+'/publisher-profile-fixture'
    fd=os.open(path,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
    try:os.write(fd,b'synthetic profile state');os.fsync(fd)
    finally:os.close(fd)
    os.unlink(path)
+  stage='masked_sentinel'
   assert not os.path.exists(@SENTINEL@)
+  stage='manager_socket'
   result=subprocess.run(('/bin/systemctl','show','--property=LoadState','--value','command-center-inventory-refresh-worker.service'),env={'PATH':'/usr/sbin:/usr/bin:/sbin:/bin','LC_ALL':'C'},stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,close_fds=True,timeout=3)
   assert result.returncode in (0,4) and len(result.stdout)<=4096
+  stage='sealing'
   cache=os.open(CACHE,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
   try:
    store=Store(cache,0,60002,60001)
@@ -570,10 +578,14 @@ with resources:
     assert lease.read_index('synthetic_profile_Packages')==b'synthetic publisher profile index'
    policy.recheck()
   finally:os.close(cache)
+ stage='resource_sample'
  metrics=resources.sample()
 print(json.dumps({'publisher_cap3_sealing_and_scoped_filesystem_verified':True,'publisher_fixed_pid1_socket_query_verified':True,'generation':generation,'metrics':metrics,'all_allocators_charged_from_startup_verified':False},sort_keys=True))
 """.replace('@SENTINEL@',repr(str(sentinel)))
-    probe=LIB_ROOT/'publisher-profile-proof.py';probe.write_text(bootstrap+body);probe.chmod(0o444)
+    body="stage='imports'\ntry:\n"+''.join(' '+line+'\n' for line in body.splitlines())+"except BaseException as error:\n print('publisher_probe_failure='+json.dumps({'stage':stage,'kind':type(error).__name__,'errno':getattr(error,'errno',None)},sort_keys=True),file=sys.stderr)\n raise SystemExit(74)\n"
+    probe=LIB_ROOT/'publisher-profile-proof.py'
+    compile(bootstrap+body,str(probe),'exec',dont_inherit=True)
+    probe.write_text(bootstrap+body);probe.chmod(0o444)
     info=probe.lstat();assert info.st_uid==0 and info.st_nlink==1 and info.st_mode&0o777==0o444
     args=['/usr/bin/systemd-run','--quiet','--wait','--collect','--pipe','--unit='+UNIT,'--slice='+PARENT_SLICE]
     for property in publisher_properties():args+=['-p',property]
@@ -582,7 +594,7 @@ print(json.dumps({'publisher_cap3_sealing_and_scoped_filesystem_verified':True,'
     if completed.returncode:
         diagnostics=[]
         for line in (completed.stdout+b'\n'+completed.stderr).splitlines():
-            if line.startswith((b'publisher_profile_masks=',b'publisher_cache_mount_diagnostic=')):
+            if line.startswith((b'publisher_profile_masks=',b'publisher_cache_mount_diagnostic=',b'publisher_probe_failure=')):
                 diagnostics.append(line[:2048].decode('ascii',errors='replace'))
         raise RuntimeError('Publisher probe exit='+str(completed.returncode)+' '+ ' '.join(diagnostics[:2]))
     result=json.loads(completed.stdout)
