@@ -632,3 +632,26 @@ root processes. Full filesystem write-denial, stopped-reader deadline, durable
 parent restart, actual key-location coverage and target repository/resource fit
 remain separate gates. These source files install or enable no service, timer,
 account or reporting capability.
+
+### Atomic observation acceptance
+
+Private journal schema 3 retains the latest accepted observation, release and
+receipt together. `finish_observation` commits both successful terminals and the
+detached strict receipt in one file-sync/rename/directory-sync transaction.
+Individual observation/release success writes are rejected. Exact duplicates
+cannot change the receipt; later failures preserve the accepted historical proof.
+Unsupported older private state fails closed and is never reset by runtime.
+
+Acceptance requires matching running nonce, boot, policy, counter identities and
+actual held/release intervals. The caller must first prove exact root grant,
+current job/policy/cache, owned-process termination and cleanup; the journal is
+metadata validation, not physical execution authority. Uncertain persistence
+blocks publication until the existing reconciliation barrier succeeds.
+
+Public coordinator status derives historical receipt only from that fresh
+accepted journal record. Optional explicit receipt input can assert equality but
+cannot introduce, replace or suppress accepted proof. Policy/cache loss or reboot
+may remove current availability while leaving the historical receipt unchanged.
+The shared structural validator preserves honest expired/unconfirmed public
+receipts; only a released, timely, unchanged-state receipt can be accepted as a
+successful observation transaction.

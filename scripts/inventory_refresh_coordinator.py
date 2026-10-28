@@ -7,6 +7,7 @@ module does not acquire native observation or manufacture physical evidence.
 from inventory_refresh_state import boot, hexadecimal, checked_timestamp
 from inventory_refresh_status import PublicStatus
 from inventory_refresh_storage import MAX_FILES
+from inventory_refresh_receipt import observation as validate_observation
 
 
 def _cache_metadata(manifest):
@@ -39,6 +40,12 @@ def publish_current_status(journal,publisher,*,boot_id,current_policy,manifest,
         raise ValueError('Invalid admitted inventory status context')
     # Never accept a cached snapshot, particularly across a failed save/barrier.
     snapshot=journal.snapshot()
+    accepted=snapshot['last_observation']
+    retained_receipt=None if accepted is None else accepted['receipt']
+    if observation_receipt is not None:
+        if validate_observation(observation_receipt,True)!=retained_receipt:
+            raise ValueError('Observation status requires its durable accepted receipt')
+    observation_receipt=retained_receipt
     cache=_cache_metadata(manifest)
     success=snapshot['last_success']
     available=(cache is not None and success is not None and current_policy is not None and

@@ -49,6 +49,36 @@ class CoordinatorTests(unittest.TestCase):
                                manifest=self.manifest if manifest=='current' else manifest,**kwargs)
         return json.loads((self.root/'public/status.json').read_bytes())
 
+    def accept_observation(self):
+        nonce='0000000000000002'+'a'*16
+        self.journal.receive('observation',nonce,BOOT,110,POLICY)
+        self.journal.start('observation',nonce,BOOT,111,policy=POLICY)
+        self.journal.receive('release',nonce,BOOT,120,POLICY)
+        self.journal.start('release',nonce,BOOT,121,policy=POLICY)
+        receipt={'nonce':nonce,'boot_id':BOOT,'cache_generation':'c'*32,'policy_generation':POLICY,
+                 'lock_open_boottime_ms':115,'expires_boottime_ms':1000,'lock_held_until_boottime_ms':125,
+                 'released_boottime_ms':126,'outcome':'released','installed_before_sha256':'d'*64,'installed_after_sha256':'d'*64}
+        self.journal.finish_observation(receipt)
+        return receipt
+
+    def test_accepted_historical_receipt_survives_policy_cache_loss_and_reboot(self):
+        with self.journal.exclusive():
+            self.success();receipt=self.accept_observation()
+            for kwargs in ({},{'policy':'e'*64},{'manifest':None},{'boot':'22222222-2222-4222-8222-222222222222'}):
+                with self.subTest(kwargs=kwargs):
+                    self.assertEqual(self.publish(**kwargs)['observation_receipt'],receipt)
+            self.assertEqual(self.publish(observation_receipt=None)['observation_receipt'],receipt)
+            self.assertEqual(self.publish(observation_receipt=dict(receipt))['observation_receipt'],receipt)
+            with self.assertRaises(ValueError):self.publish(observation_receipt=dict(receipt,released_boottime_ms=127))
+
+    def test_unaccepted_child_receipt_cannot_be_projected(self):
+        with self.journal.exclusive():
+            self.success()
+            receipt={'nonce':NONCE,'boot_id':BOOT,'cache_generation':'c'*32,'policy_generation':POLICY,
+                     'lock_open_boottime_ms':115,'expires_boottime_ms':1000,'lock_held_until_boottime_ms':125,
+                     'released_boottime_ms':126,'outcome':'released','installed_before_sha256':'d'*64,'installed_after_sha256':'d'*64}
+            with self.assertRaises(ValueError):self.publish(observation_receipt=receipt)
+
     def test_current_policy_change_never_relabels_any_correlated_attempt(self):
         newer='0000000000000002'+'b'*16
         with self.journal.exclusive():

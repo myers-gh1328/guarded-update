@@ -14,6 +14,7 @@ import secrets
 import stat
 
 from inventory_refresh_protocol import OperationState, correlator, safe_integer
+from inventory_refresh_receipt import observation as validate_observation
 
 CAPABILITIES = ('refresh', 'observation', 'release')
 LIMIT = 65536
@@ -229,14 +230,14 @@ class Journal:
             raise ValueError('Existing helper metadata requires recovery, never reset')
         self._new('initialized-epoch', epoch.encode('ascii'))
         os.fsync(self.fd)
-        self._save({'schema_version': 2, 'epoch': epoch, 'unconfirmed': False, 'last_success': None,
+        self._save({'schema_version': 3, 'epoch': epoch, 'unconfirmed': False, 'last_success': None, 'last_observation': None,
                     'capabilities': {key: {'high_water': 0, 'active': None, 'terminal': None, 'last_started': None}
                                      for key in CAPABILITIES}})
 
     def _validate(self, value):
         if (type(value) is not dict or
-                set(value) != {'schema_version', 'epoch', 'unconfirmed', 'capabilities', 'last_success'} or
-                type(value['schema_version']) is not int or value['schema_version'] != 2 or
+                set(value) != {'schema_version', 'epoch', 'unconfirmed', 'capabilities', 'last_success', 'last_observation'} or
+                type(value['schema_version']) is not int or value['schema_version'] != 3 or
                 not hexadecimal(value['epoch'], 32) or type(value['unconfirmed']) is not bool or
                 type(value['capabilities']) is not dict or set(value['capabilities']) != set(CAPABILITIES)):
             raise ValueError('Unsupported or malformed helper journal')
@@ -274,7 +275,67 @@ class Journal:
         terminal=refresh['terminal']
         if terminal is not None and terminal['phase']=='succeeded' and (success is None or terminal!=success['attempt']):
             raise ValueError('Successful refresh terminal lacks matching retained evidence')
+        accepted=value['last_observation']
+        if accepted is not None:
+            if type(accepted) is not dict or set(accepted)!={'observation','release','receipt'}:
+                raise ValueError('Invalid retained observation acceptance')
+            receipt=validate_observation(accepted['receipt'],True)
+            records={capability:operation(accepted[capability]) for capability in ('observation','release')}
+            self._observation_binding(records,receipt,terminal=True)
+            for capability,record in records.items():
+                if record['helper_sequence']>value['capabilities'][capability]['high_water']:
+                    raise ValueError('Observation acceptance exceeds durable counter')
+        for capability in ('observation','release'):
+            terminal=value['capabilities'][capability]['terminal']
+            if terminal is not None and terminal['phase']=='succeeded' and (accepted is None or terminal!=accepted[capability]):
+                raise ValueError('Successful observation terminal lacks accepted receipt')
         return value
+
+    @staticmethod
+    def _observation_binding(records,receipt,*,terminal):
+        if receipt['outcome']!='released':
+            raise ValueError('Only released observation evidence may complete')
+        for record in records.values():
+            if (record is None or record['phase']!=('succeeded' if terminal else 'running') or
+                    record['started_boottime_ms'] is None or record['decision_boottime_ms'] is not None or
+                    record['correlator']!=receipt['nonce'] or record['boot_id']!=receipt['boot_id'] or
+                    record['policy_generation']!=receipt['policy_generation'] or
+                    terminal and (record['cache_generation']!=receipt['cache_generation'] or
+                                  record['finished_boottime_ms']!=receipt['released_boottime_ms'])):
+                raise ValueError('Observation acceptance does not bind its running operations')
+        observed=records['observation'];released=records['release']
+        if not (observed['accepted_boottime_ms']<=released['accepted_boottime_ms'] and
+                observed['started_boottime_ms']<=receipt['lock_open_boottime_ms']<=
+                released['started_boottime_ms']<=receipt['lock_held_until_boottime_ms'] and
+                receipt['expires_boottime_ms']<=observed['accepted_boottime_ms']+120000):
+            raise ValueError('Observation acceptance times do not bind held interval')
+
+    def finish_observation(self,receipt):
+        """Commit metadata only AFTER caller proves exact grant/current scope and cleanup."""
+        self._locked()
+        receipt=validate_observation(receipt,True)
+        value=self.snapshot()
+        if value['unconfirmed']:
+            raise ValueError('Unconfirmed observation cannot complete')
+        records={capability:value['capabilities'][capability]['active'] for capability in ('observation','release')}
+        if all(record is None for record in records.values()):
+            accepted=value['last_observation']
+            if (accepted is not None and accepted['receipt']==receipt and
+                    all(value['capabilities'][capability]['terminal']==accepted[capability] for capability in records)):
+                return
+            raise ValueError('Observation completion conflicts with durable metadata')
+        self._observation_binding(records,receipt,terminal=False)
+        accepted={'receipt':dict(receipt)}
+        for capability,record in records.items():
+            record.update(phase='succeeded',reason=None,cache_generation=receipt['cache_generation'],
+                          finished_boottime_ms=receipt['released_boottime_ms'])
+            operation(record)
+            state=value['capabilities'][capability]
+            state['terminal']=record;state['active']=None
+            accepted[capability]=dict(record)
+        value['last_observation']=accepted
+        self._validate(value)
+        self._save(value)
 
     def snapshot(self):
         self._ready()
@@ -439,6 +500,8 @@ class Journal:
         if (capability not in CAPABILITIES or phase not in ['succeeded', 'failed'] or
                 reason is not None and reason not in REASONS):
             raise ValueError('Invalid helper terminal outcome')
+        if capability in ('observation','release') and phase=='succeeded':
+            raise ValueError('Observation success requires atomic receipt acceptance')
         refresh_success=capability=='refresh' and phase=='succeeded'
         if refresh_success:
             checked_timestamp(successful_checked_at)

@@ -11,7 +11,7 @@ import types
 
 LIB_ROOT='/usr/local/libexec/command-center-inventory-refresh'
 SOURCES=tuple((name,name+'.py') for name in (
-    'inventory_refresh_protocol','inventory_refresh_state','inventory_refresh_storage',
+    'inventory_refresh_protocol','inventory_refresh_receipt','inventory_refresh_state','inventory_refresh_storage',
     'inventory_refresh_status','inventory_refresh_observation',
     'inventory_refresh_cached_observation','inventory_refresh_channel'))+(
     ('inventory_refresh_guardian','guardian.py'),

@@ -37,6 +37,131 @@ class RefreshStateTests(unittest.TestCase):
         with self.journal.exclusive():
             self.journal.initialize('a'*32)
 
+    def observation_started(self, *, release=True):
+        self.journal.receive('observation',self.nonce,self.boot,100,'b'*64)
+        self.journal.start('observation',self.nonce,self.boot,101,policy='b'*64)
+        if release:
+            self.journal.receive('release',self.nonce,self.boot,120,'b'*64)
+            self.journal.start('release',self.nonce,self.boot,121,policy='b'*64)
+        return {'nonce':self.nonce,'boot_id':self.boot,'cache_generation':'c'*32,
+                'policy_generation':'b'*64,'lock_open_boottime_ms':110,'expires_boottime_ms':1000,
+                'lock_held_until_boottime_ms':125,'released_boottime_ms':126,'outcome':'released',
+                'installed_before_sha256':'d'*64,'installed_after_sha256':'d'*64}
+
+    def test_observation_accepts_both_terminals_and_receipt_in_one_durable_save(self):
+        self.initialize()
+        with self.journal.exclusive():
+            receipt=self.observation_started()
+            with patch.object(self.journal,'_save',wraps=self.journal._save) as save:
+                self.journal.finish_observation(receipt)
+                save.assert_called_once()
+                value=save.call_args.args[0]
+                for cap in ('observation','release'):
+                    self.assertIsNone(value['capabilities'][cap]['active'])
+                    self.assertEqual(value['capabilities'][cap]['terminal']['phase'],'succeeded')
+                    self.assertEqual(value['capabilities'][cap]['terminal'],value['last_observation'][cap])
+                self.assertEqual(value['last_observation']['receipt'],receipt)
+            frozen=self.journal.snapshot()['last_observation']
+            receipt['released_boottime_ms']=127
+            self.assertEqual(self.journal.snapshot()['last_observation'],frozen)
+        restarted=self.p.Journal(self.fd,owner=os.getuid())
+        with restarted.exclusive():
+            self.assertTrue(restarted.startup_ready())
+            self.assertEqual(restarted.snapshot()['last_observation'],frozen)
+
+    def test_observation_duplicate_frozen_and_later_failure_retains_accepted_receipt(self):
+        self.initialize()
+        with self.journal.exclusive():
+            receipt=self.observation_started();self.journal.finish_observation(receipt)
+            frozen=self.journal.snapshot()['last_observation']
+            self.journal.finish_observation(dict(receipt))
+            with self.assertRaises(ValueError):self.journal.finish_observation(dict(receipt,released_boottime_ms=127))
+            newer='0000000000000002'+'b'*16
+            self.journal.receive('observation',newer,self.boot,200,'b'*64)
+            self.journal.start('observation',newer,self.boot,201,policy='b'*64)
+            self.journal.finish('observation',newer,self.boot,202,'failed',reason='internal_error')
+            self.assertEqual(self.journal.snapshot()['last_observation'],frozen)
+
+    def test_individual_observation_success_cannot_bypass_atomic_acceptance(self):
+        self.initialize()
+        with self.journal.exclusive():
+            self.observation_started()
+            for cap in ('observation','release'):
+                with self.assertRaises(ValueError):self.journal.finish(cap,self.nonce,self.boot,126,'succeeded',cache='c'*32,policy='b'*64)
+
+    def test_observation_rejects_foreign_changed_expired_or_premature_receipt(self):
+        self.initialize()
+        with self.journal.exclusive():
+            receipt=self.observation_started()
+            for key,bad in [('nonce','0000000000000002'+'a'*16),('policy_generation','e'*64),
+                            ('boot_id','22222222-2222-4222-8222-222222222222'),
+                            ('installed_after_sha256','f'*64),('outcome','expired'),
+                            ('expires_boottime_ms',125),('expires_boottime_ms',120101),
+                            ('lock_open_boottime_ms',100),('lock_open_boottime_ms',122),
+                            ('lock_held_until_boottime_ms',120),('released_boottime_ms',True)]:
+                with self.subTest(key=key,bad=bad),self.assertRaises(ValueError):
+                    self.journal.finish_observation(dict(receipt,**{key:bad}))
+            self.assertIsNone(self.journal.snapshot()['last_observation'])
+
+    def test_observation_requires_running_release_and_reconciled_state(self):
+        self.initialize()
+        with self.journal.exclusive():
+            receipt=self.observation_started(release=False)
+            with self.assertRaises(ValueError):self.journal.finish_observation(receipt)
+            self.journal.receive('release',self.nonce,self.boot,120,'b'*64)
+            with self.assertRaises(ValueError):self.journal.finish_observation(receipt)
+            self.journal.start('release',self.nonce,self.boot,121,policy='b'*64)
+            self.assertFalse(self.journal.startup_ready())
+            with self.assertRaises(ValueError):self.journal.finish_observation(receipt)
+
+    def test_observation_uncertain_terminal_sync_blocks_further_work(self):
+        self.initialize()
+        with self.journal.exclusive():
+            receipt=self.observation_started()
+            with patch.object(self.p.os,'fsync',side_effect=OSError('uncertain')):
+                with self.assertRaises(OSError):self.journal.finish_observation(receipt)
+            with self.assertRaises(ValueError):self.journal.snapshot()
+
+    def test_observation_directory_sync_uncertainty_requires_reconciliation_barrier(self):
+        self.initialize()
+        with self.journal.exclusive():
+            receipt=self.observation_started()
+            real_sync=self.p.os.fsync
+            def sync(fd):
+                if fd==self.fd:raise OSError('directory sync uncertain')
+                return real_sync(fd)
+            with patch.object(self.p.os,'fsync',side_effect=sync):
+                with self.assertRaises(OSError):self.journal.finish_observation(receipt)
+            with self.assertRaises(ValueError):self.journal.snapshot()
+            visible=json.loads((self.directory/'control.json').read_bytes())
+            self.assertEqual(visible['last_observation']['receipt'],receipt)
+            for cap in ('observation','release'):
+                self.assertIsNone(visible['capabilities'][cap]['active'])
+                self.assertEqual(visible['capabilities'][cap]['terminal']['phase'],'succeeded')
+        restarted=self.p.Journal(self.fd,owner=os.getuid())
+        with restarted.exclusive():
+            with patch.object(self.p.os,'fsync',side_effect=OSError('still uncertain')):
+                with self.assertRaises(OSError):restarted.startup_ready()
+            with self.assertRaises(ValueError):restarted.snapshot()
+            self.assertTrue(restarted.startup_ready())
+            self.assertEqual(restarted.snapshot()['last_observation']['receipt'],receipt)
+
+    def test_snapshot_rejects_incomplete_or_rewritten_observation_acceptance(self):
+        self.initialize()
+        with self.journal.exclusive():
+            receipt=self.observation_started();self.journal.finish_observation(receipt)
+            frozen=self.journal.snapshot()
+            mutations=[lambda value:value.update(schema_version=2),
+                       lambda value:value.update(last_observation=None),
+                       lambda value:value['last_observation']['receipt'].update(installed_after_sha256='f'*64),
+                       lambda value:value['last_observation']['release'].update(finished_boottime_ms=127),
+                       lambda value:value['last_observation']['receipt'].update(released_boottime_ms=True),
+                       lambda value:value['last_observation']['receipt'].update(extra=True),
+                       lambda value:value['capabilities']['release']['terminal'].update(cache_generation='e'*32)]
+            for mutate in mutations:
+                value=json.loads(json.dumps(frozen));mutate(value)
+                with self.subTest(value=value),self.assertRaises(ValueError):self.journal._validate(value)
+
     def test_prior_verified_success_survives_later_terminal_failure_and_restart(self):
         self.initialize()
         checked='2026-10-28T07:00:00Z'
@@ -312,7 +437,12 @@ class RefreshStateTests(unittest.TestCase):
             self.assertEqual(self.journal.receive('observation', observe, self.boot, 101, 'b'*64), 'new')
             self.assertTrue(self.journal.start('observation', observe, self.boot, 102, policy='b'*64))
             self.assertFalse(self.journal.start('refresh', self.nonce, self.boot, 103, policy='b'*64))
-            self.journal.finish('observation', observe, self.boot, 104, 'succeeded', cache='c'*32, policy='b'*64)
+            self.journal.receive('release',observe,self.boot,103,'b'*64)
+            self.journal.start('release',observe,self.boot,103,policy='b'*64)
+            self.journal.finish_observation({'nonce':observe,'boot_id':self.boot,'cache_generation':'c'*32,
+                'policy_generation':'b'*64,'lock_open_boottime_ms':102,'expires_boottime_ms':1000,
+                'lock_held_until_boottime_ms':104,'released_boottime_ms':104,'outcome':'released',
+                'installed_before_sha256':'d'*64,'installed_after_sha256':'d'*64})
             self.assertFalse(self.journal.start('refresh', self.nonce, self.boot, 105, policy='b'*64))
             newer='0000000000000002'+'c'*16
             self.assertEqual(self.journal.receive('refresh',newer,self.boot,105,'b'*64),'new')

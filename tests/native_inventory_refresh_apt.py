@@ -254,10 +254,7 @@ finally: os.close(fd)
             receipt=released.document()['observation_receipt']
             assert all(receipt[key]==value for key,value in active.items())
             assert receipt['outcome']=='released' and receipt['installed_before_sha256']==receipt['installed_after_sha256']
-            journal.finish('observation',nonce,boot,receipt['released_boottime_ms'],'succeeded',
-                           cache=job.cache_generation,policy=job.policy_generation)
-            journal.finish('release',nonce,boot,receipt['released_boottime_ms'],'succeeded',
-                           cache=job.cache_generation,policy=job.policy_generation)
+            journal.finish_observation(receipt)
     finally:
         try:
             if child is not None:child.close()
@@ -403,8 +400,7 @@ finally:
                 assert released.document()['phase']=='released' and all(receipt[key]==value for key,value in opened.document()['observation_lease'].items())
                 assert receipt['installed_before_sha256']==receipt['installed_after_sha256']
                 with store.lease_current() as current:assert current.manifest==manifest
-                for capability in ('observation','release'):
-                    journal.finish(capability,nonce,boot,receipt['released_boottime_ms'],'succeeded',cache=job.cache_generation,policy=job.policy_generation)
+                journal.finish_observation(receipt)
                 return {'observation_separate_native_process_verified':True,
                     'observation_native_zero_capabilities_verified':True,
                     'observation_masked_policy_and_parent_state_verified':True,
