@@ -710,13 +710,20 @@ def prove_root_refresh_transaction(expected_generation):
         'inventory_refresh_policy','inventory_refresh_policy_admission','inventory_refresh_materialized_policy',
         'inventory_refresh_worker_service','inventory_refresh_resources','inventory_refresh_materializer',
         'inventory_refresh_writer_exclusion','inventory_refresh_io','inventory_refresh_coordinator','inventory_refresh_contention',
-        'inventory_refresh_transaction','inventory_refresh_observation_transaction')
+        'inventory_refresh_transaction','inventory_refresh_observation_transaction','inventory_refresh_dispatch')
     for name in modules:
         filename='guardian.py' if name=='inventory_refresh_guardian' else name+'.py'
         shutil.copyfile(ROOT/'scripts'/(name+'.py'),LIB_ROOT/filename);(LIB_ROOT/filename).chmod(0o444)
     # All earlier observation scopes have been independently confirmed empty.
     for filename in ('observation-native.py','observation-guardian.py'):
         shutil.copyfile(ROOT/'scripts/inventory_refresh_entry.py',LIB_ROOT/filename);(LIB_ROOT/filename).chmod(0o444)
+    # Synthetic actor files only; the production dispatcher cannot create them.
+    for capability in ('refresh','observation','release'):
+        directory=Path(RUNTIME_ROOT)/capability
+        directory.mkdir(mode=0o770,exist_ok=True);os.chown(directory,0,READER);directory.chmod(0o770)
+        (directory/'request').unlink(missing_ok=True)
+    request=Path(RUNTIME_ROOT)/'refresh/request'
+    request.write_bytes(('0000000000000001'+'a'*16).encode('ascii'));request.chmod(0o600);os.chown(request,READER,READER)
     status=Path(RUNTIME_ROOT)/'status';status.mkdir(mode=0o750);os.chown(status,0,READER);status.chmod(0o750)
     state=os.open(STATE_ROOT,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
     try:
@@ -739,6 +746,8 @@ from inventory_refresh_writer_exclusion import WriterExclusion
 from inventory_refresh_transaction import RefreshTransaction
 from inventory_refresh_observation_transaction import ObservationTransaction
 from inventory_refresh_channel import ObservationChannel
+from inventory_refresh_io import Inbox
+from inventory_refresh_dispatch import RootDispatcher
 import time
 fields=dict(line.split(':',1) for line in open('/proc/self/status').read().splitlines())
 assert {name:int(fields[name].strip(),16) for name in ('CapPrm','CapEff','CapBnd','CapInh','CapAmb')}=={'CapPrm':3,'CapEff':3,'CapBnd':3,'CapInh':0,'CapAmb':0}
@@ -748,7 +757,7 @@ with RuntimeResources.fixed() as resources:
  stage='policy'
  with PolicyGuard.fixed() as policy:
   assert policy.generation==@GENERATION@
-  root=os.open('/',os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW);ancestry=None;publisher=None;writers=None;channel=None;observation=None
+  root=os.open('/',os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW);ancestry=None;publisher=None;writers=None;channel=None;observation=None;dispatcher=None;inboxes={}
   try:
    ancestry=_Ancestry.open(root,('var','lib','command-center-inventory-refresh'))
    journal=Journal(ancestry.fds[-1])
@@ -760,8 +769,12 @@ with RuntimeResources.fixed() as resources:
     store=Store(resources._cache.fds[-1],0,60002,60001)
     transaction=RefreshTransaction(journal,policy,resources,store,publisher,writers)
     nonce='0000000000000001'+'a'*16
+    channel=ObservationChannel.fixed(journal=journal)
+    observation=ObservationTransaction(journal,policy,resources,store,publisher,writers,channel)
+    inboxes={name:Inbox.fixed(name) for name in ('release','observation','refresh')}
+    dispatcher=RootDispatcher(journal,inboxes,transaction,observation)
     stage='transaction'
-    assert transaction.refresh(nonce)=='succeeded'
+    assert dispatcher.step()['refresh']=='succeeded'
     value=journal.snapshot();success=value['last_success']
     assert not value['unconfirmed'] and success['attempt']['correlator']==nonce
     assert value['capabilities']['refresh']['active'] is None
@@ -777,17 +790,28 @@ with RuntimeResources.fixed() as resources:
     assert public['phase']=='succeeded' and public['operation_nonce']==nonce
     assert public['cache_generation']==success['attempt']['cache_generation']
     assert public['successful_checked_at']==success['successful_checked_at']
-    assert transaction.refresh(nonce)=='existing'
+    assert dispatcher.step()['refresh']=='existing'
     assert open(status_path,'rb').read(65537)==status
     try:
      stage='observation_admission'
-     channel=ObservationChannel.fixed(journal=journal)
-     observation=ObservationTransaction(journal,policy,resources,store,publisher,writers,channel)
+     def synthetic_request(capability,nonce):
+      # Test-only actor: complete bounded bytes, chmod before transferring owner.
+      directory=os.open('/run/command-center-inventory-refresh/'+capability,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+      temporary='.fixture-'+secrets.token_hex(16)
+      try:
+       fd=os.open(temporary,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600,dir_fd=directory)
+       try:
+        raw=nonce.encode('ascii');assert os.write(fd,raw)==len(raw)
+        os.fchmod(fd,0o600);os.fchown(fd,60002,60002);os.fsync(fd)
+       finally:os.close(fd)
+       os.rename(temporary,'request',src_dir_fd=directory,dst_dir_fd=directory);os.fsync(directory)
+      finally:os.close(directory)
      observed_nonce='0000000000000005'+'d'*16
-     assert observation.begin(observed_nonce)=='dispatched'
+     synthetic_request('observation',observed_nonce)
+     assert dispatcher.step()['observation']=='dispatched'
      stage='observation_opening';limit=time.monotonic()+10
      while True:
-      phase=observation.poll()
+      phase=dispatcher.step()['poll']
       if phase=='opened':break
       assert phase=='opening' and time.monotonic()<limit
       time.sleep(.02)
@@ -796,12 +820,13 @@ with RuntimeResources.fixed() as resources:
      with store.lease_current() as lease:
       for index in lease.manifest['files']:lease.verify_index(index['path'])
      stage='observation_release'
-     assert observation.release(observed_nonce)=='releasing'
+     synthetic_request('release',observed_nonce)
+     assert dispatcher.step()['release']=='releasing'
      assert json.loads(open(status_path,'rb').read(65537))['observation_lease'] is None
-     assert observation.release(observed_nonce)=='existing'
+     assert dispatcher.step()['release']=='existing'
      stage='observation_acceptance';limit=time.monotonic()+10
      while True:
-      phase=observation.poll()
+      phase=dispatcher.step()['poll']
       if phase=='succeeded':break
       assert phase=='releasing' and time.monotonic()<limit
       time.sleep(.02)
@@ -813,12 +838,16 @@ with RuntimeResources.fixed() as resources:
      public=json.loads(open(status_path,'rb').read(65537))
      assert public['observation_receipt']==receipt and public['observation_lease'] is None
      assert public['cache_generation']==success['attempt']['cache_generation']
-     frozen=journal.snapshot();assert observation.begin(observed_nonce)=='existing' and journal.snapshot()==frozen
+     frozen=journal.snapshot();assert dispatcher.step()['observation']=='existing' and journal.snapshot()==frozen
     finally:
      try:
+      if dispatcher is not None:dispatcher.close()
       if observation is not None:observation.close()
      finally:
-      if channel is not None:channel.close()
+      try:
+       if channel is not None:channel.close()
+      finally:
+       for inbox in inboxes.values():inbox.close()
      observation=None;channel=None
     stage='final_checks'
     writers.check();resources.sample();policy.recheck()
@@ -833,7 +862,7 @@ with RuntimeResources.fixed() as resources:
      try:
       if ancestry is not None:ancestry.close()
      finally:os.close(root)
-print(json.dumps({'fixed_publisher_refresh_transaction_verified':True,'fixed_publisher_observation_transaction_verified':True,'generation':@GENERATION@,'metrics':metrics,
+print(json.dumps({'fixed_publisher_refresh_transaction_verified':True,'fixed_publisher_observation_transaction_verified':True,'fixed_publisher_inbox_dispatch_verified':True,'generation':@GENERATION@,'metrics':metrics,
  'coordinator_exercised':False,'all_allocators_charged_from_startup_verified':False},sort_keys=True))
 """.replace('@GENERATION@',repr(expected_generation))
     body="stage='imports'\ntry:\n"+''.join(' '+line+'\n' for line in body.splitlines())+"except BaseException as error:\n print('publisher_transaction_failure='+json.dumps({'stage':stage,'operation_stage':getattr(error,'stage',None),'diagnostics':getattr(error,'diagnostics',None),'kind':type(error).__name__,'errno':getattr(error,'errno',None)},sort_keys=True),file=sys.stderr)\n raise SystemExit(74)\n"
@@ -850,8 +879,8 @@ print(json.dumps({'fixed_publisher_refresh_transaction_verified':True,'fixed_pub
     result=json.loads(completed.stdout)
     assert result['generation']==expected_generation and result['fixed_publisher_refresh_transaction_verified']
     assert not result['coordinator_exercised'] and not result['all_allocators_charged_from_startup_verified']
-    assert result['fixed_publisher_observation_transaction_verified']
-    return {'fixed_publisher_refresh_transaction_verified':True,'fixed_publisher_observation_transaction_verified':True,'publisher_refresh_transaction_metrics':result['metrics']}
+    assert result['fixed_publisher_observation_transaction_verified'] and result['fixed_publisher_inbox_dispatch_verified']
+    return {'fixed_publisher_refresh_transaction_verified':True,'fixed_publisher_observation_transaction_verified':True,'fixed_publisher_inbox_dispatch_verified':True,'publisher_refresh_transaction_metrics':result['metrics']}
 
 
 def is_live_worker(raw,*,parent=None):

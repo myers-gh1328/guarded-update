@@ -964,3 +964,26 @@ bounded composition only, not the complete executable coordinator. Initial host
 namespace/unit provenance, all-allocator charging, target repository fit, client
 integration, provisioning and rollout remain separate gates. No service is enabled
 and no package install/upgrade authority is added by this source.
+
+### Bounded root inbox dispatch (source only)
+
+`RootDispatcher` connects the three fixed nonce inboxes to those transactions in
+one bounded step under their shared journal, policy, resources, cache, publisher
+and writer guards. It claims a fresh observation lifecycle once per process;
+second owners and reattachment are rejected. Each step polls its owned scope,
+reads each inbox at most once, and dispatches release before observation and
+refresh. Only typed invalid-request input is ignored per inbox, allowing valid
+requests in other inboxes to proceed. Trusted I/O or lifecycle uncertainty stops
+and fences the dispatcher. Active observation suppresses refresh; the durable
+journal remains the sole nonce/high-water authority. No request files are deleted,
+rewritten or queued by production dispatch. Closing permanently disables dispatch
+and cleans only its owned observation, preserving borrowed inputs.
+
+Tests cover real nonce files, malformed-peer fairness, canonical tuples,
+context/ownership rejection, duplicate requests, cleanup failure and idle close.
+The native fixture uses synthetic reporter-owned nonce files to exercise the same
+fixed Inbox readers and CAP3 transactions; this is distinct from the earlier
+actual unprivileged reporter transport proof. A successful
+`fixed_publisher_inbox_dispatch_verified` flag proves this bounded source
+composition, not an enabled service, complete executable loop, initial namespace
+provenance, startup allocator accounting or target resource fit.

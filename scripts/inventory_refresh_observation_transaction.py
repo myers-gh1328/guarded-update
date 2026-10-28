@@ -29,7 +29,20 @@ class ObservationTransaction:
         self._publisher=publisher;self._writers=writers;self._channel=channel
         self._factory=service_factory;self._clock=clock;self._previous=None
         self._service=None;self._pin=None;self._manifest=None;self._job=None
-        self._opened=None;self._grant=None;self._phase='idle';self._poisoned=False
+        self._opened=None;self._grant=None;self._phase='idle';self._poisoned=False;self._dispatcher_owner=None
+
+    @property
+    def pristine(self):
+        return (self._dispatcher_owner is None and not self._poisoned and self._phase=='idle' and self._job is None and
+                self._service is None and self._pin is None)
+
+    def _claim_dispatcher(self,owner):
+        if not self.pristine:raise ValueError('Observation lifecycle already owned')
+        self._dispatcher_owner=owner
+
+    @property
+    def owns_scope(self):
+        return self._service is not None
 
     def _time(self):
         identity,now=self._clock()
