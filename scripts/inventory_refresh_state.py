@@ -366,6 +366,32 @@ class Journal:
         except (UnicodeError, json.JSONDecodeError, RecursionError):
             raise ValueError('Malformed helper journal requires explicit recovery') from None
 
+    def fence_external(self):
+        """Fence after caller-observed external I/O/cleanup uncertainty.
+
+        Preserve frozen terminals and receipts. A failed/unknown journal cannot
+        be repaired here; no runtime method clears the durable global fence.
+        Caller terminates rather than retrying possibly started work.
+        """
+        self._held_lock()
+        self._launch_permits.clear()
+        self._launch_epoch=object()
+        if self._needs_reconciliation:
+            return False
+        try:
+            value=self.snapshot()
+            self._needs_reconciliation=True
+            value['unconfirmed']=True
+            for state in value['capabilities'].values():
+                record=state['active']
+                if record is not None and record['started_boottime_ms'] is not None:
+                    record['phase']='unconfirmed'
+            self._save(value)
+            return True
+        except BaseException:
+            self._needs_reconciliation=True
+            raise
+
     def startup_ready(self):
         self._held_lock()
         self._launch_permits.clear()
@@ -545,6 +571,8 @@ class Journal:
                     (not refresh_success or value['last_success']['successful_checked_at']==successful_checked_at)):
                 return
             raise ValueError('Helper terminal outcome conflicts with durable metadata')
+        if refresh_success and (value['unconfirmed'] or record['phase']!='running'):
+            raise ValueError('Unconfirmed or unstarted refresh cannot complete successfully')
         if (record['correlator'] != incoming or record['boot_id'] != boot_id or
                 record['decision_boottime_ms'] is not None or not safe_integer(now) or now < (record['started_boottime_ms'] or record['accepted_boottime_ms'])):
             raise ValueError('Helper outcome does not match its accepted operation')

@@ -847,3 +847,37 @@ a fixed PID1 query and sealing of worker-owned synthetic metadata. Its staging
 fixture is prepared outside the aggregate; the probe cannot establish complete
 allocator accounting, a complete coordinator or target repository fit. Those
 remain separate gates before enabling the capability.
+
+### Root refresh transaction composition (source only)
+
+`RefreshMaterializer` prepares only a newly started operation under the held
+journal. Its production factory admits fixed root-owned directory ancestry and
+fixed numeric accounts. It creates fresh worker staging directories, sets their
+private modes while root-owned, then transfers ownership to the worker. Rendered
+policy/config/job files remain root-owned and worker-group-readable, with bounded
+complete writes, pinned temporary identities and file/directory durability
+barriers. Unsafe existing files, changed references and nonempty configuration
+parts fail closed. Cleanup uncertainty revokes the admitted lifecycle's launch
+permission through the same journal.
+
+`WriterExclusion` checks the actual worker slice is empty and scans every thread's
+real, effective, saved and filesystem UIDs through a full proc view. Hidden proc
+subtrees, restricted mount options, empty visibility for a still-present group,
+unreadable credentials and incomplete cleanup fail closed. Reserved refresh UID,
+cooperating launchers and initial host namespaces remain trusted provisioning
+prerequisites; a scan does not prevent a privileged actor starting a later writer.
+
+`RefreshTransaction` composes admission, a brief nonblocking native/executor busy
+probe, durable start, fixed materialization and service ownership, cleanup,
+writer/resource/policy rechecks, actual cache sealing, durable success and fresh
+public projection. Existing/stale/busy requests do not invent new no-work evidence
+or relaunch started work. A manifest alone still cannot authorize success.
+
+External persistence/cleanup failures call `Journal.fence_external`: revoke launch
+permissions and durably retain global uncertainty without changing frozen success
+or accepted receipts. Failed fence persistence keeps local readiness poisoned.
+Successful completion cannot bypass this fence. Runtime does not clear durable
+uncertainty, replay started work or infer that a failed publication rolled back.
+Actual CAP3 transaction proof, full observation coordination, provisioning,
+repository fit and activation remain separate gates. No production entrypoint or
+enabled service is supplied by this source composition.

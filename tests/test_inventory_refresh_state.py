@@ -48,6 +48,59 @@ class RefreshStateTests(unittest.TestCase):
                 'lock_held_until_boottime_ms':125,'released_boottime_ms':126,'outcome':'released',
                 'installed_before_sha256':'d'*64,'installed_after_sha256':'d'*64}
 
+    def test_external_publication_uncertainty_preserves_success_but_blocks_admission(self):
+        self.initialize()
+        with self.journal.exclusive():
+            self.journal.receive('refresh',self.nonce,self.boot,100,'b'*64)
+            self.journal.start('refresh',self.nonce,self.boot,101,policy='b'*64)
+            self.journal.finish('refresh',self.nonce,self.boot,102,'succeeded',cache='c'*32,
+                                policy='b'*64,successful_checked_at='2026-10-28T00:00:00Z')
+            before=self.journal.snapshot()
+            self.assertTrue(self.journal.fence_external())
+            after=self.journal.snapshot()
+            self.assertTrue(after['unconfirmed'])
+            self.assertEqual(before['capabilities'],after['capabilities'])
+            self.assertEqual(before['last_success'],after['last_success'])
+            self.assertEqual(self.journal.receive('refresh','0000000000000002'+'a'*16,self.boot,103,'b'*64),'unconfirmed')
+        fresh=self.p.Journal(self.fd,owner=os.getuid())
+        with fresh.exclusive():
+            self.assertFalse(fresh.startup_ready())
+            self.assertEqual(fresh.snapshot()['last_success'],before['last_success'])
+
+    def test_fenced_refresh_cannot_mint_success_and_unstarted_refresh_cannot_complete(self):
+        self.initialize()
+        with self.journal.exclusive():
+            self.journal.receive('refresh',self.nonce,self.boot,100,'b'*64)
+            for fenced in (False,True):
+                if fenced:
+                    self.journal.start('refresh',self.nonce,self.boot,101,policy='b'*64)
+                    self.journal.fence_external()
+                with self.subTest(fenced=fenced),self.assertRaises(ValueError):
+                    self.journal.finish('refresh',self.nonce,self.boot,102,'succeeded',cache='c'*32,
+                                        policy='b'*64,successful_checked_at='2026-10-28T00:00:00Z')
+                self.assertIsNone(self.journal.snapshot()['last_success'])
+
+    def test_external_fence_save_failure_poisoned_and_unready_cannot_be_cleared_by_fence(self):
+        self.initialize()
+        with self.journal.exclusive():
+            with patch.object(self.p.os,'fsync',side_effect=OSError('synthetic I/O')):
+                with self.assertRaises(OSError):self.journal.fence_external()
+            with self.assertRaises(ValueError):self.journal.snapshot()
+            with patch.object(self.journal,'_save') as save:
+                self.assertFalse(self.journal.fence_external())
+                save.assert_not_called()
+            with self.assertRaises(ValueError):self.journal.snapshot()
+
+    def test_external_fence_requires_held_lock_and_preserves_historical_receipt(self):
+        self.initialize()
+        with self.assertRaises(ValueError):self.journal.fence_external()
+        with self.journal.exclusive():
+            receipt=self.observation_started()
+            self.journal.finish_observation(receipt)
+            accepted=self.journal.snapshot()['last_observation']
+            self.journal.fence_external()
+            self.assertEqual(self.journal.snapshot()['last_observation'],accepted)
+
     def test_observation_accepts_both_terminals_and_receipt_in_one_durable_save(self):
         self.initialize()
         with self.journal.exclusive():
