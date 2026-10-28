@@ -274,7 +274,7 @@ def prove_observation_process(store,base,*,stopped_child=False):
     """Separate fixed guardian/native processes; no full parent activation."""
     from inventory_refresh_entry import SOURCES
     from inventory_refresh_observer import admit_profile
-    from inventory_refresh_service import ObservationService, UNIT
+    from inventory_refresh_service import ObservationService, UNIT, pidfds_live
     for _,filename in SOURCES:
         source=ROOT/'scripts'/('inventory_refresh_guardian.py' if filename=='guardian.py' else filename)
         shutil.copyfile(source,LIB_ROOT/filename);(LIB_ROOT/filename).chmod(0o444)
@@ -305,7 +305,7 @@ def prove_observation_process(store,base,*,stopped_child=False):
                 launcher=ObservationService(journal,parent,job).launch()
                 opened=None;limit=time.monotonic()+15
                 while time.monotonic()<limit and launcher.poll() is None:
-                    opened=parent.read_result(expected_job=job)
+                    opened=launcher.live_opened()
                     if opened is not None:break
                     time.sleep(0.02)
                 assert opened is not None and opened.document()['phase']=='opened', 'Separate native process did not open observation (exit='+str(launcher.poll())+')'
@@ -351,7 +351,13 @@ def prove_observation_process(store,base,*,stopped_child=False):
                             Path('/proc',str(native),'cmdline').read_bytes().split(b'\0')[:-1]==
                                 [b'/usr/bin/python3',b'-I',b'-B',str(LIB_ROOT/'observation-native.py').encode()])
                     stop_owned_child(native,recheck)
+                    try:launcher.live_opened()
+                    except ValueError:pass
+                    else:raise AssertionError('Stopped native child retained active offer')
                     assert launcher.wait(timeout=12)==76
+                    try:pidfds_live(tuple(launcher._pidfds.values()))
+                    except ValueError:pass
+                    else:raise AssertionError('Exited pinned tasks retained active readiness')
                     finished=now()
                     assert job.deadline_boottime_ms<=finished<=job.deadline_boottime_ms+3000
                     assert dict(line.split() for line in (cgroup(WORKER_SLICE)/'cgroup.events').read_text().splitlines())['populated']=='0'
@@ -374,10 +380,14 @@ finally:
                     return {'observation_independent_deadline_verified':True,
                         'stopped_native_reader_cleanup_verified':True,
                         'native_exclusive_writer_locks_after_cleanup_verified':True,
+                        'stopped_and_exited_native_offer_rejected':True,
                         'stopped_observation_deadline_ms':job.deadline_boottime_ms,
                         'stopped_observation_cleanup_ms':finished}
                 requested=now()
                 assert journal.receive('release',nonce,boot,requested,job.policy_generation)=='new'
+                try:launcher.live_opened()
+                except ValueError:pass
+                else:raise AssertionError('Durable release admission reoffered old opened result')
                 granted=now();assert journal.start('release',nonce,boot,granted,policy=job.policy_generation)
                 parent.write_release(ReleaseGrant(job,granted))
                 assert launcher.wait(timeout=10)==0, 'Separate native/guardian rejected release'
@@ -392,6 +402,9 @@ finally:
                     'observation_native_zero_capabilities_verified':True,
                     'observation_masked_policy_and_parent_state_verified':True,
                     'observation_actual_input_write_denial_verified':True,
+                    'observation_owned_live_child_offer_verified':True,
+                    'observation_durable_release_offer_fence_verified':True,
+                    'fixed_observation_service_adapter_verified':True,
                     'separate_process_observation_receipt':receipt}
     finally:
         try:

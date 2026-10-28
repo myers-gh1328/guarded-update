@@ -682,3 +682,24 @@ The adapter has no command/path/options CLI and enables no service. The parent
 still owns actual OS readiness, policy/cache provenance, exact live-child checks,
 whole-cgroup/UID exclusion and durable restart reconciliation. An exit code,
 service disappearance or profile string alone is not completion authority.
+
+### Owned live observation offers
+
+`live_opened()` reads only the fixed root channel for its admitted job. Before
+returning an active offer it checks the current service invocation/cgroup,
+exact guardian/native process pair, direct parent, numeric identities, capability
+sets and fixed command lines. Both tasks are pinned by pidfds, which are polled
+for exit before and after process checks; numeric PID reuse cannot substitute a
+new task. A changed pair or failed physical check cannot reattach to that job.
+
+The opened bytes remain frozen. Matching durable release admission, a release
+terminal or an existing root grant fences further offers. The adapter rereads the
+exact result after physical checks, then rechecks pidfds and BOOTTIME/expiry so
+an observed terminal change cannot return stale opened metadata. Partial pidfd
+pinning unwinds and cleanup attempts every owned descriptor despite close errors.
+
+This is point-in-time scope evidence, not continuous lock ownership or a promise
+that a process cannot exit after checking. The parent must clear invalid offers
+and require the matching final unchanged-state release receipt, current policy,
+cache and actual cleanup before accepting a completed report. Full coordinator
+readiness and target provisioning remain separate unactivated gates.
