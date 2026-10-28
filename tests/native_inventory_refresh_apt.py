@@ -184,8 +184,12 @@ def prove_privilege_transition():
     # boundary and exact sandbox. Its child only reads /proc/self/status.
     errors=['keep process capabilities failed','activate capabilities','reactivate capabilities',
             'apply bounding set','apply capabilities','setresuid failed','setresgid failed',
-            'setgroups failed','disallow granting new privileges failed','failed to execute']
+            'setgroups failed','disallow granting new privileges failed','failed to execute',
+            'Operation not permitted','Invalid argument','Permission denied']
     source=('import subprocess,sys\n'
+            'state=dict(line.split(":",1) for line in open("/proc/self/status") if ":" in line)\n'
+            'uidmap=open("/proc/self/uid_map").read().split()\n'
+            'print("parent_state="+str(bool(int(state["CapEff"],16)&128))+":"+str(uidmap==["0","0","4294967295"]),file=sys.stderr)\n'
             'result=subprocess.run('+repr(fixed)+',env='+repr(ENV)+',stdin=subprocess.DEVNULL,'
             'stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=5)\n'
             'if result.returncode:\n'
@@ -205,8 +209,23 @@ def prove_privilege_transition():
         '/usr/bin/python3','-I','-B',str(probe)]
     result=subprocess.run(args,env=ENV,stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=10)
     if result.returncode!=0:
-        labels=re.findall(rb'transition_failure=[0-9]{1,3}:[a-z ,]+',result.stderr)
-        raise AssertionError('Fixed full-sandbox privilege transition failed: '+repr(labels[:1]))
+        labels=re.findall(rb'(?:transition_failure=[0-9]{1,3}:[a-zA-Z ,]+|parent_state=(?:True|False):(?:True|False))',result.stderr)
+        # Diagnostic-only read-only bisection on this disposable VM. No helper
+        # metadata, APT operation, signal or persistent unit is involved.
+        sandbox=['ProtectSystem=strict','ProtectHome=yes','ProtectControlGroups=yes','RestrictNamespaces=yes',
+                 'PrivateDevices=yes','PrivateTmp=yes','InaccessiblePaths=/tmp /var/tmp /dev/shm']
+        for index,property_value in enumerate(sandbox):
+            isolated=args[:]
+            for value in sandbox:
+                location=isolated.index(value)
+                del isolated[location-1:location+1]
+            location=isolated.index('/usr/bin/python3')
+            isolated[location:location]=['-p',property_value]
+            check=subprocess.run(isolated,env=ENV,stdout=subprocess.DEVNULL,stderr=subprocess.PIPE,timeout=10)
+            details=re.findall(rb'(?:transition_failure=[0-9]{1,3}:[a-zA-Z ,]+|parent_state=(?:True|False):(?:True|False))',check.stderr)
+            labels.append(('property_'+str(index)+'_exit_'+str(check.returncode)).encode())
+            labels.extend(details[:2])
+        raise AssertionError('Fixed full-sandbox privilege transition failed: '+repr(labels))
     assert is_live_worker(result.stdout), 'Kernel privilege state rejected after fixed transition'
 
 
