@@ -896,6 +896,13 @@ struct ReportRef {
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct NativeAttempt {
+    observation_nonce: String,
+    boot_id: String,
+    admitted_boottime_ms: u64,
+}
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Entry {
     delivery: Delivery,
     source_revision: u64,
@@ -905,6 +912,8 @@ struct Entry {
     #[serde(deserialize_with = "nullable")]
     acknowledged_nonce: Option<String>,
     submitted: bool,
+    #[serde(deserialize_with = "nullable")]
+    native_attempt: Option<NativeAttempt>,
     no_work_acknowledged: bool,
     pending_status: ClientStatus,
     #[serde(deserialize_with = "nullable")]
@@ -934,6 +943,21 @@ impl Entry {
                     && self.proof.ready()
                     && self.report.is_none()),
         )?;
+        if let Some(native) = &self.native_attempt {
+            require(
+                matches!(self.proof, Proof::Collection(_))
+                    && self.submitted
+                    && self.acknowledged_nonce.is_some()
+                    && native.boot_id == self.proof.boot()
+                    && nonce_sequence(&native.observation_nonce).is_some()
+                    && safe(native.admitted_boottime_ms)
+                    && self.proof.accepted() <= native.admitted_boottime_ms
+                    && self
+                        .proof
+                        .scan()
+                        .is_none_or(|scan| native.admitted_boottime_ms <= scan.started_boottime_ms),
+            )?;
+        }
         if let Delivery::Collection(d) = &self.delivery {
             require(d.source_revision == self.source_revision)?;
         }
@@ -1017,12 +1041,13 @@ impl Journal {
     }
     fn validate(&self) -> Result<()> {
         require(
-            self.schema_version == 1
+            self.schema_version == 2
                 && uuid(&self.enrollment_id)
                 && safe(self.counters.helper)
                 && safe(self.counters.collection)
                 && safe(self.counters.observation),
         )?;
+        let mut observations = Vec::new();
         for cap in [Capability::Manual, Capability::Collection] {
             let domain = self.domain(cap);
             require(safe(domain.delivery_highwater))?;
@@ -1040,6 +1065,21 @@ impl Journal {
                 .flatten()
             {
                 entry.validate()?;
+                let observation = match &entry.proof {
+                    Proof::Manual(proof) => proof.observation.as_ref().map(|v| v.nonce.as_str()),
+                    Proof::Collection(_) => entry
+                        .native_attempt
+                        .as_ref()
+                        .map(|v| v.observation_nonce.as_str()),
+                };
+                if let Some(nonce) = observation {
+                    let sequence =
+                        nonce_sequence(nonce).ok_or("Invalid retained observation nonce")?;
+                    require(
+                        sequence <= self.counters.observation && !observations.contains(&sequence),
+                    )?;
+                    observations.push(sequence);
+                }
                 require(
                     entry.delivery.capability() == cap
                         && entry.delivery.sequence() <= domain.delivery_highwater
@@ -1148,7 +1188,7 @@ impl<'a> RequestJournal<'a> {
             return Err("Existing request journal cannot be reset".into());
         }
         let journal = Journal {
-            schema_version: 1,
+            schema_version: 2,
             enrollment_id: enrollment.into(),
             counters: Counters {
                 helper: seeds.helper,
@@ -1337,6 +1377,7 @@ impl<'a> RequestJournal<'a> {
                 previous_no_work: None,
                 acknowledged_nonce: None,
                 submitted: false,
+                native_attempt: None,
                 no_work_acknowledged: false,
                 pending_status: ClientStatus::Received,
                 reason: None,
@@ -1498,6 +1539,15 @@ impl<'a> RequestJournal<'a> {
             let id = entry.delivery.id().to_owned();
             let nonce = entry.proof.nonce().to_owned();
             let observation = j.counters.reserve(OperationDomain::Observation, suffix)?;
+            j.collection
+                .active
+                .as_mut()
+                .ok_or("No active collection request")?
+                .native_attempt = Some(NativeAttempt {
+                observation_nonce: observation.clone(),
+                boot_id: clock.boot_id.clone(),
+                admitted_boottime_ms: clock.boottime_ms,
+            });
             Ok((id, nonce, observation))
         })?;
         Ok(NativeCollectionIntent {
@@ -1956,6 +2006,192 @@ mod tests {
             )
             .unwrap();
         journal
+    }
+    #[test]
+    fn retained_native_and_manual_observations_cannot_reuse_counter_prefix() {
+        let fixture = Fixture::new();
+        let session = session();
+        let mut journal = native_ready(&fixture, &session);
+        drop(
+            journal
+                .admit_native_collection(REPORT, 1, 1, &clock(1001), "bbbbbbbbbbbbbbbb", &session)
+                .unwrap(),
+        );
+        let mut persisted: Journal =
+            serde_json::from_slice(&std::fs::read(fixture.dir.join("requests.json")).unwrap())
+                .unwrap();
+        let mut manual = persisted.collection.active.as_ref().unwrap().clone();
+        let mut proof = manual_ready(6, 1000, 100000);
+        proof.observation.as_mut().unwrap().nonce = "0000000000000009dddddddddddddddd".into();
+        manual.delivery = manual_delivery(1);
+        manual.acknowledged_nonce = Some(proof.operation_nonce.clone());
+        manual.proof = Proof::Manual(Box::new(proof));
+        manual.native_attempt = None;
+        persisted.manual.active = Some(manual);
+        persisted.manual.delivery_highwater = 1;
+        persisted.counters.helper = 6;
+        persisted.counters.observation = 9;
+        assert!(persisted.validate().is_ok());
+        let Proof::Manual(proof) = &mut persisted.manual.active.as_mut().unwrap().proof else {
+            unreachable!()
+        };
+        proof.observation.as_mut().unwrap().nonce = "0000000000000008dddddddddddddddd".into();
+        assert!(persisted.validate().is_err()); // different suffix, same native Root sequence8
+    }
+    #[test]
+    fn client_schema_one_is_rejected_without_migration_or_counter_reset() {
+        let fixture = Fixture::new();
+        let path = fixture.dir.join("requests.json");
+        let mut legacy: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        legacy["schema_version"] = serde_json::json!(1);
+        let bytes = serde_json::to_vec(&legacy).unwrap();
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(RequestJournal::open(&fixture.dir, BOOT, &fixture.lock).is_err());
+        assert!(
+            RequestJournal::initialize(
+                &fixture.dir,
+                BOOT,
+                CounterSeeds {
+                    helper: 0,
+                    observation: 0
+                },
+                &fixture.lock
+            )
+            .is_err()
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    }
+    #[test]
+    fn native_attempt_mapping_is_required_strict_and_counter_bound() {
+        let fixture = Fixture::new();
+        let session = session();
+        let mut journal = native_ready(&fixture, &session);
+        let intent = journal
+            .admit_native_collection(REPORT, 1, 1, &clock(1001), "bbbbbbbbbbbbbbbb", &session)
+            .unwrap();
+        journal
+            .attach_native_scan(intent, &clock(1010), &session)
+            .unwrap();
+        let path = fixture.dir.join("requests.json");
+        let original: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        for action in 0..8 {
+            let mut invalid = original.clone();
+            let entry = &mut invalid["collection"]["active"];
+            match action {
+                0 => {
+                    entry.as_object_mut().unwrap().remove("native_attempt");
+                }
+                1 => entry["native_attempt"]["extra"] = serde_json::json!(true),
+                2 => entry["native_attempt"]["admitted_boottime_ms"] = serde_json::json!(true),
+                3 => entry["native_attempt"]["admitted_boottime_ms"] = serde_json::json!(999),
+                4 => entry["native_attempt"]["admitted_boottime_ms"] = serde_json::json!(1011),
+                5 => {
+                    entry["native_attempt"]["boot_id"] =
+                        serde_json::json!("00000000-0000-4000-8000-000000000099")
+                }
+                6 => {
+                    entry["native_attempt"]["observation_nonce"] =
+                        serde_json::json!("0000000000000009bbbbbbbbbbbbbbbb")
+                }
+                _ => entry["submitted"] = serde_json::json!(false),
+            }
+            let bytes = serde_json::to_vec(&invalid).unwrap();
+            std::fs::write(&path, &bytes).unwrap();
+            assert!(
+                RequestJournal::open(&fixture.dir, BOOT, &fixture.lock).is_err(),
+                "action {action}"
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        }
+    }
+    #[test]
+    fn native_scope_is_preserved_in_canonical_terminal_uncertainty() {
+        let fixture = Fixture::new();
+        let session = session();
+        let mut journal = native_ready(&fixture, &session);
+        let intent = journal
+            .admit_native_collection(REPORT, 1, 1, &clock(1001), "bbbbbbbbbbbbbbbb", &session)
+            .unwrap();
+        let nonce = intent.observation_nonce().to_owned();
+        drop(intent);
+        let pending = journal.pending(Capability::Collection).unwrap().unwrap();
+        journal
+            .canonical(
+                Capability::Collection,
+                &canonical(&pending, CanonicalStatus::Failed, None),
+            )
+            .unwrap();
+        drop(journal);
+        let mut reopened = fixture.open();
+        assert_eq!(
+            reopened.recover_collection(None).unwrap(),
+            CollectionRecovery::Unfinished
+        );
+        let value: Value =
+            serde_json::from_slice(&std::fs::read(fixture.dir.join("requests.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            value["collection"]["last_terminal"]["native_attempt"]["observation_nonce"],
+            nonce
+        );
+        assert!(
+            reopened
+                .admit(delivery(2), 1, &clock(1010), "cccccccccccccccc", &session)
+                .is_err()
+        );
+    }
+    #[test]
+    fn generic_collection_path_keeps_explicit_null_native_mapping() {
+        let fixture = Fixture::new();
+        let session = session();
+        let mut journal = native_ready(&fixture, &session);
+        journal
+            .start_collection(REPORT, 1, 1, &clock(1001), &session)
+            .unwrap();
+        let value: Value =
+            serde_json::from_slice(&std::fs::read(fixture.dir.join("requests.json")).unwrap())
+                .unwrap();
+        assert!(
+            value["collection"]["active"]
+                .as_object()
+                .unwrap()
+                .contains_key("native_attempt")
+        );
+        assert!(value["collection"]["active"]["native_attempt"].is_null());
+    }
+    #[test]
+    fn native_exact_root_scope_survives_restart_without_reminting_authority() {
+        let fixture = Fixture::new();
+        let session = session();
+        let mut journal = native_ready(&fixture, &session);
+        let intent = journal
+            .admit_native_collection(REPORT, 1, 1, &clock(1001), "bbbbbbbbbbbbbbbb", &session)
+            .unwrap();
+        let bytes = std::fs::read(fixture.dir.join("requests.json")).unwrap();
+        let value: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["schema_version"], 2);
+        assert_eq!(
+            value["collection"]["active"]["native_attempt"],
+            serde_json::json!({
+            "observation_nonce":intent.observation_nonce(),"boot_id":BOOT,"admitted_boottime_ms":1001})
+        );
+        let mut reopened = fixture.open();
+        assert_eq!(
+            reopened.recover_collection(None).unwrap(),
+            CollectionRecovery::Unfinished
+        );
+        assert!(
+            reopened
+                .attach_native_scan(intent, &clock(1010), &session)
+                .is_err()
+        );
+        let after: Value =
+            serde_json::from_slice(&std::fs::read(fixture.dir.join("requests.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            after["collection"]["active"]["native_attempt"],
+            value["collection"]["active"]["native_attempt"]
+        );
     }
     #[test]
     fn native_intent_is_revoked_even_when_mutator_prevalidation_rejects() {

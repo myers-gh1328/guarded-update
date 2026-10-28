@@ -1183,10 +1183,22 @@ and reopening an identical journal cannot recover them. A dropped intent or a
 crash leaves submitted work unresolved, never permission to resubmit. Failed
 persistence returns no authority and poisons the journal handle.
 
-This seam uses the existing private journal schema: interrupted submission with
-no scan is already an unresolved state. It has no native invocation and remains
-behind the existing inactive request integration. Neither an admission token nor
-an attached scan proof supplies native coherence or report-ready authority.
+The private **client** request journal now uses schema 2. Native admission also
+persists the immutable observation nonce, boot ID and admission BOOTTIME in a
+required nullable `native_attempt` field; ordinary/manual entries use explicit
+null. The observation nonce and submission fence commit together. This exact
+scope survives restart and canonical source failure for future cleanup-only
+correlation, while reopening still cannot recreate an execution token or resume
+a scan. Root observation sequence prefixes are unique across retained native
+and manual observations and cannot exceed the reserved observation high-water.
+
+Schema 1 is rejected without migration, reset or counter reseeding. Explicit
+provisioning remains gated on trusted counter handoff; no client journals or
+capabilities are activated by this change. Root journal schema 3, public helper
+status schema 1 and reporting schemas are unchanged. The mapping alone cannot
+submit release, prove NoWork, clear physical uncertainty or supply coherent or
+report-ready evidence. A separate durable release intent and verified cleanup
+witness remain necessary.
 
 `StatusReader` supplies the inactive reporter's bounded protected-file input. It
 holds its own duplicate of an admitted status-directory descriptor and checks the
