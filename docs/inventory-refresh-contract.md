@@ -1187,3 +1187,18 @@ This seam uses the existing private journal schema: interrupted submission with
 no scan is already an unresolved state. It has no native invocation and remains
 behind the existing inactive request integration. Neither an admission token nor
 an attached scan proof supplies native coherence or report-ready authority.
+
+`StatusReader` supplies the inactive reporter's bounded protected-file input. It
+holds its own duplicate of an admitted status-directory descriptor and checks the
+root publication's exact owner, reader group, modes, single-link regular-file
+shape and same-filesystem identity. It keeps the opened file through strict JSON
+and schema parsing, then compares descriptor and named metadata. Concurrent root
+replacement or in-place modification rejects that read; a fresh poll can observe
+the new publication. Missing status returns no status after rechecking directory
+protection. Previous content is never substituted, and absence proves neither
+root termination nor clean native cleanup. Close failures prevent output.
+
+The borrowed-directory constructor does not establish full named ancestry or
+process provenance. Its fixed factory and source bootstrap remain deferred until
+the restricted managed bridge is implemented and natively verified. It writes
+no inbox, starts no process and changes no reporting capability or artifact.
