@@ -5,6 +5,7 @@ same root lock across admission, process lifecycle, publication and retirement.
 Returning True from start is the only permission to launch work, after fsync.
 """
 from contextlib import contextmanager
+from datetime import datetime
 import fcntl
 import json
 import os
@@ -49,6 +50,17 @@ def identity(value):
         return correlator(value.encode('ascii'))
     except (AttributeError, UnicodeError):
         raise ValueError('Invalid helper correlator') from None
+
+
+def checked_timestamp(value):
+    if (type(value) is not str or len(value)>27 or re.fullmatch(
+            r'[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]{1,6})?Z',value) is None):
+        raise ValueError('Invalid retained cache success timestamp')
+    try:
+        datetime.fromisoformat(value[:-1]+'+00:00')
+    except ValueError:
+        raise ValueError('Invalid retained cache success timestamp') from None
+    return value
 
 
 def operation(value):
@@ -217,14 +229,14 @@ class Journal:
             raise ValueError('Existing helper metadata requires recovery, never reset')
         self._new('initialized-epoch', epoch.encode('ascii'))
         os.fsync(self.fd)
-        self._save({'schema_version': 1, 'epoch': epoch, 'unconfirmed': False,
+        self._save({'schema_version': 2, 'epoch': epoch, 'unconfirmed': False, 'last_success': None,
                     'capabilities': {key: {'high_water': 0, 'active': None, 'terminal': None, 'last_started': None}
                                      for key in CAPABILITIES}})
 
     def _validate(self, value):
         if (type(value) is not dict or
-                set(value) != {'schema_version', 'epoch', 'unconfirmed', 'capabilities'} or
-                type(value['schema_version']) is not int or value['schema_version'] != 1 or
+                set(value) != {'schema_version', 'epoch', 'unconfirmed', 'capabilities', 'last_success'} or
+                type(value['schema_version']) is not int or value['schema_version'] != 2 or
                 not hexadecimal(value['epoch'], 32) or type(value['unconfirmed']) is not bool or
                 type(value['capabilities']) is not dict or set(value['capabilities']) != set(CAPABILITIES)):
             raise ValueError('Unsupported or malformed helper journal')
@@ -249,6 +261,19 @@ class Journal:
                     phases = ['succeeded', 'failed', 'deferred'] if key == 'terminal' else ['received', 'deferred', 'running', 'unconfirmed']
                     if record['phase'] not in phases:
                         raise ValueError('Helper journal phase is inconsistent')
+        success=value['last_success']
+        refresh=value['capabilities']['refresh']
+        if success is not None:
+            if type(success) is not dict or set(success)!={'attempt','successful_checked_at'}:
+                raise ValueError('Invalid retained cache success evidence')
+            prior=operation(success['attempt'])
+            checked_timestamp(success['successful_checked_at'])
+            if (prior['phase']!='succeeded' or prior['helper_sequence']>refresh['high_water'] or
+                    prior['finished_boottime_ms']-prior['started_boottime_ms']>600000):
+                raise ValueError('Invalid retained successful refresh')
+        terminal=refresh['terminal']
+        if terminal is not None and terminal['phase']=='succeeded' and (success is None or terminal!=success['attempt']):
+            raise ValueError('Successful refresh terminal lacks matching retained evidence')
         return value
 
     def snapshot(self):
@@ -406,13 +431,19 @@ class Journal:
         record['decision_boottime_ms'] = now
         self._save(value)
 
-    def finish(self, capability, incoming, boot_id, now, phase, reason=None, cache=None, policy=None):
+    def finish(self, capability, incoming, boot_id, now, phase, reason=None, cache=None, policy=None,
+               *, successful_checked_at=None):
         """Caller must prove owned cgroup empty before publication or terminal success."""
         self._locked()
         value = self.snapshot()
         if (capability not in CAPABILITIES or phase not in ['succeeded', 'failed'] or
                 reason is not None and reason not in REASONS):
             raise ValueError('Invalid helper terminal outcome')
+        refresh_success=capability=='refresh' and phase=='succeeded'
+        if refresh_success:
+            checked_timestamp(successful_checked_at)
+        elif successful_checked_at is not None:
+            raise ValueError('Only successful refresh records a cache success timestamp')
         state = value['capabilities'][capability]
         record = state['active']
         if phase == 'succeeded' and not hexadecimal(policy, 64):
@@ -421,7 +452,8 @@ class Journal:
             terminal = state['terminal']
             if (terminal is not None and terminal['correlator'] == incoming and terminal['boot_id'] == boot_id and
                     terminal['phase'] == phase and terminal['reason'] == reason and terminal['cache_generation'] == cache and
-                    (phase != 'succeeded' or terminal['policy_generation'] == policy)):
+                    (phase != 'succeeded' or terminal['policy_generation'] == policy) and
+                    (not refresh_success or value['last_success']['successful_checked_at']==successful_checked_at)):
                 return
             raise ValueError('Helper terminal outcome conflicts with durable metadata')
         if (record['correlator'] != incoming or record['boot_id'] != boot_id or
@@ -436,4 +468,6 @@ class Journal:
         operation(record)
         state['terminal'] = record
         state['active'] = None
+        if refresh_success:
+            value['last_success']={'attempt':dict(record),'successful_checked_at':successful_checked_at}
         self._save(value)

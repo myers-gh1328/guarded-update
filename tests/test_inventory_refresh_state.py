@@ -37,6 +37,76 @@ class RefreshStateTests(unittest.TestCase):
         with self.journal.exclusive():
             self.journal.initialize('a'*32)
 
+    def test_prior_verified_success_survives_later_terminal_failure_and_restart(self):
+        self.initialize()
+        checked='2026-10-28T07:00:00Z'
+        newer='0000000000000002'+'b'*16
+        with self.journal.exclusive():
+            self.journal.receive('refresh',self.nonce,self.boot,100,'b'*64)
+            self.journal.start('refresh',self.nonce,self.boot,101,policy='b'*64)
+            self.journal.finish('refresh',self.nonce,self.boot,102,'succeeded',cache='c'*32,
+                                policy='b'*64,successful_checked_at=checked)
+            frozen=self.journal.snapshot()['last_success']
+            self.assertEqual(frozen['successful_checked_at'],checked)
+            self.assertEqual(frozen['attempt']['correlator'],self.nonce)
+            self.journal.receive('refresh',newer,self.boot,1000000,'b'*64)
+            self.journal.start('refresh',newer,self.boot,1000001,policy='b'*64)
+            self.journal.finish('refresh',newer,self.boot,1000002,'failed',reason='repository_failed')
+            self.assertEqual(self.journal.snapshot()['last_success'],frozen)
+        restarted=self.p.Journal(self.fd,owner=os.getuid())
+        with restarted.exclusive():
+            self.assertTrue(restarted.startup_ready())
+            self.assertEqual(restarted.snapshot()['last_success'],frozen)
+
+    def test_success_timestamp_is_required_strict_and_duplicate_cannot_rewrite_it(self):
+        self.initialize()
+        with self.journal.exclusive():
+            self.journal.receive('refresh',self.nonce,self.boot,100,'b'*64)
+            self.journal.start('refresh',self.nonce,self.boot,101,policy='b'*64)
+            for bad in [None,True,'2026-02-30T07:00:00Z','2026-10-28T07:00:00+00:00','2026-10-28T07:00:00.1234567Z']:
+                with self.subTest(bad=bad),self.assertRaises(ValueError):
+                    self.journal.finish('refresh',self.nonce,self.boot,102,'succeeded',cache='c'*32,
+                                        policy='b'*64,successful_checked_at=bad)
+                self.assertIsNone(self.journal.snapshot()['last_success'])
+            checked='2026-10-28T07:00:00Z'
+            self.journal.finish('refresh',self.nonce,self.boot,102,'succeeded',cache='c'*32,
+                                policy='b'*64,successful_checked_at=checked)
+            before=self.journal.snapshot()
+            with self.assertRaises(ValueError):
+                self.journal.finish('refresh',self.nonce,self.boot,102,'succeeded',cache='c'*32,
+                                    policy='b'*64,successful_checked_at='2026-10-28T08:00:00Z')
+            self.assertEqual(self.journal.snapshot(),before)
+
+    def test_old_private_format_and_inconsistent_success_fail_closed_without_reset(self):
+        self.initialize()
+        with self.journal.exclusive():
+            self.journal.receive('refresh',self.nonce,self.boot,100,'b'*64)
+            self.journal.start('refresh',self.nonce,self.boot,101,policy='b'*64)
+            self.journal.finish('refresh',self.nonce,self.boot,102,'succeeded',cache='c'*32,
+                                policy='b'*64,successful_checked_at='2026-10-28T07:00:00Z')
+            original=(self.directory/'control.json').read_bytes()
+            def altered(change):
+                value=json.loads(original)
+                change(value)
+                (self.directory/'control.json').write_text(json.dumps(value))
+                with self.assertRaises(ValueError):
+                    self.journal.snapshot()
+            for mutate in [lambda v:v.update(schema_version=1),lambda v:v.update(last_success=None),
+                           lambda v:v['last_success'].update(extra=True),
+                           lambda v:v['last_success']['attempt'].update(cache_generation='d'*32),
+                           lambda v:v['last_success'].update(successful_checked_at='2026-02-30T00:00:00Z')]:
+                altered(mutate)
+            # Overbudget proof must also be rejected when no current successful
+            # terminal remains to compare it with.
+            value=json.loads(original)
+            value['capabilities']['refresh']['terminal']=None
+            value['last_success']['attempt']['finished_boottime_ms']=600102
+            (self.directory/'control.json').write_text(json.dumps(value))
+            with self.assertRaises(ValueError):
+                self.journal.snapshot()
+            (self.directory/'control.json').write_bytes(original)
+            self.assertEqual(self.journal.snapshot()['capabilities']['refresh']['high_water'],1)
+
     def test_no_work_decision_is_durable_immutable_and_old_nonce_never_starts_later(self):
         self.initialize()
         newer='0000000000000002'+'c'*16
@@ -64,7 +134,7 @@ class RefreshStateTests(unittest.TestCase):
         with self.journal.exclusive():
             self.journal.receive('refresh',self.nonce,self.boot,10,'b'*64)
             self.journal.start('refresh',self.nonce,self.boot,11,policy='b'*64)
-            self.journal.finish('refresh',self.nonce,self.boot,12,'succeeded',cache='c'*32,policy='b'*64)
+            self.journal.finish('refresh',self.nonce,self.boot,12,'succeeded',cache='c'*32,policy='b'*64,successful_checked_at='2026-10-28T07:00:00Z')
             self.journal.receive('refresh',second,self.boot,100,'b'*64)
             self.assertFalse(self.journal.start('refresh',second,self.boot,101,policy='b'*64))
             frozen=self.journal.snapshot()['capabilities']['refresh']['active']
@@ -211,14 +281,14 @@ class RefreshStateTests(unittest.TestCase):
         with self.journal.exclusive():
             self.journal.receive('refresh', self.nonce, self.boot, 100, 'b'*64)
             with self.assertRaises(ValueError):
-                self.journal.finish('refresh', self.nonce, self.boot, 102, 'succeeded', cache='c'*32, policy='b'*64)
+                self.journal.finish('refresh', self.nonce, self.boot, 102, 'succeeded', cache='c'*32, policy='b'*64,successful_checked_at='2026-10-28T07:00:00Z')
             self.journal.start('refresh', self.nonce, self.boot, 101, policy='b'*64)
-            self.journal.finish('refresh', self.nonce, self.boot, 102, 'succeeded', cache='c'*32, policy='b'*64)
-            self.journal.finish('refresh', self.nonce, self.boot, 200, 'succeeded', cache='c'*32, policy='b'*64)
+            self.journal.finish('refresh', self.nonce, self.boot, 102, 'succeeded', cache='c'*32, policy='b'*64,successful_checked_at='2026-10-28T07:00:00Z')
+            self.journal.finish('refresh', self.nonce, self.boot, 200, 'succeeded', cache='c'*32, policy='b'*64,successful_checked_at='2026-10-28T07:00:00Z')
             terminal = self.journal.snapshot()['capabilities']['refresh']['terminal']
             self.assertEqual(terminal['finished_boottime_ms'], 102)
             with self.assertRaises(ValueError):
-                self.journal.finish('refresh', self.nonce, self.boot, 200, 'succeeded', cache='d'*32, policy='b'*64)
+                self.journal.finish('refresh', self.nonce, self.boot, 200, 'succeeded', cache='d'*32, policy='b'*64,successful_checked_at='2026-10-28T07:00:00Z')
 
     def test_restart_with_unresolved_active_work_blocks_new_work(self):
         self.initialize()
@@ -302,7 +372,7 @@ class RefreshStateTests(unittest.TestCase):
             self.journal.start('refresh',newer,self.boot,104,policy='b'*64)
             with self.assertRaises(ValueError):
                 self.journal.finish('refresh', newer, self.boot, 105, 'succeeded',
-                                    cache='d'*32, policy='c'*64)
+                                    cache='d'*32, policy='c'*64,successful_checked_at='2026-10-28T07:00:00Z')
 
     def test_counter_alias_and_unknown_schema_fail_closed(self):
         self.initialize()
@@ -316,7 +386,7 @@ class RefreshStateTests(unittest.TestCase):
             self.journal.snapshot()
         (self.directory/'control.json').unlink()
         data = json.loads(content)
-        data['schema_version'] = 2
+        data['schema_version'] = 99
         (self.directory/'control.json').write_text(json.dumps(data))
         (self.directory/'control.json').chmod(0o600)
         with self.assertRaises(ValueError):

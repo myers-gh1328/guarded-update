@@ -497,3 +497,20 @@ The same run verifies permitted/effective/bounding mask480, ambient mask128,
 and NNP=1. This is parent supervision authority; setpriv must still clear every
 worker capability set. See the
 [capability helper](https://github.com/systemd/systemd/blob/v255/src/basic/capability-util.c#L337-L359).
+
+### Durable retained refresh success
+
+The unactivated private helper journal now uses schema2. It retains one
+`last_success` independently of later active/terminal refresh attempts: the exact
+completed refresh operation plus `successful_checked_at` from its sealed cache
+manifest. Terminal success and retained evidence commit in the same guarded
+journal save. Strict calendar UTC, nonce/high-water, completed-start and
+600-second checks apply; a duplicate cannot rewrite the checked timestamp.
+Failure, deferral or another capability cannot erase prior success.
+
+Private schema1/missing fields fail closed and require explicit recovery; runtime
+never resets or silently migrates counters. No deployed helper state exists.
+Public helper status remains schema1. Retained metadata alone never proves that
+the cache survived reboot, still exists or matches current admitted policy;
+coordinator projection must obtain a fresh snapshot under its held lock and
+verify all those bindings before advertising usable cache evidence.
