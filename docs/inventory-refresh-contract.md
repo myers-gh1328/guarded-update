@@ -1147,3 +1147,27 @@ only a bounded internal hash/timing envelope. The parent requires exact context,
 all four reporter/root hashes equal, and the entire interval within the final
 root-held endpoint before recording success. This is a native proof prerequisite
 for the still-disconnected production collector/adapter, not device activation.
+
+### Inactive reporter reader-session library
+
+`ReaderSession` pins and verifies the exact current generation, including all six
+manifest-bound reader files and the same-filesystem, read-only empty config-parts
+directory, **before** the caller requests a root observation. After an exact opened
+lease is admitted, a one-use callback must durably record the actual scan start
+before the first installed-state read. Both bounded data fingerprints bracket all
+collector reads. Evidence is returned only after an exact released root receipt
+matches the frozen context, all four hashes and the entire scan interval, and the
+session has successfully closed its own generation pin. Receipt release cannot
+be in the future relative to the current same-boot clock.
+
+Invalid state, clock rewind/change, expiry, callback failure, changed data, missing
+receipt or close failure consumes the session. None authorizes replay, reports
+refresh success, or proves clean failure of possibly submitted root work. Cache
+and dpkg directory descriptors remain borrowed; the session never accesses package
+lock files, submits inbox requests, executes commands or publishes reports.
+
+This library is not an executable adapter or part of the installed root source
+closure. A fixed adapter must still authenticate root status/ancestry and the
+native clock, persist observation intent, supervise the reader and use the existing
+Rust collector inside the admitted interval. Request capabilities remain disabled
+until that adapter and durable publication/recovery integration are verified.
