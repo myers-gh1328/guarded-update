@@ -735,8 +735,12 @@ reporter UID can read either private input.
 service beneath the inventory aggregate. It pins full root-owned cache/cgroup
 ancestry and binds kernel mount IDs and devices to those descriptors. The cache
 must be a dedicated writable tmpfs with nodev/nosuid/noexec, exactly 128 MiB and
-32,768 inodes; duplicate paths, child mounts and whole/subtree bind aliases are
-unsupported. The cgroup2 mount must expose its full root at the fixed mountpoint.
+32,768 inodes; child mounts and whole/subtree aliases at other paths are unsupported. The
+fixed systemd publisher may expose exactly two whole-root mounts stacked at the
+same cache pathname. Both must retain nodev/nosuid/noexec on the same tmpfs
+device; the actual cache descriptor must identify the writable top mount, whose
+immediate parent is the lower mount. Forked, disconnected, cyclic or third-layer
+stacks and lower-descriptor selection are rejected. The cgroup2 mount must expose its full root at the fixed mountpoint.
 
 The aggregate must enforce the initial 256 MiB memory, zero swap and 64-task
 profile. Stricter ancestor settings fail with `resource_limit`; this describes a

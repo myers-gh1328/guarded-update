@@ -22,6 +22,31 @@ class ResourceTests(unittest.TestCase):
                              (b'rw,nosuid,nodev,noexec',b'ro,nosuid,nodev,noexec')]:
             with self.subTest(before=before),self.assertRaises(ValueError):self.mounts(MOUNTS.replace(before,after))
 
+    def stack(self):
+        return MOUNTS.replace(b'10 1 0:10 / ',b'9 1 0:10 / ').replace(b'rw,nosuid,nodev,noexec',b'ro,nosuid,nodev,noexec',1)+(
+            '10 9 0:10 / '+CACHE+' rw,nosuid,nodev,noexec - tmpfs tmpfs rw\n').encode()
+
+    def test_exact_two_same_path_whole_root_stack_has_visible_rw_top(self):
+        self.assertEqual(self.mounts(self.stack()),(10,20))
+        self.assertEqual(self.mounts(b'\n'.join(reversed(self.stack().splitlines()))+b'\n'),(10,20))
+
+    def test_stack_rejects_disconnected_fork_cycle_subroot_or_unsafe_lower(self):
+        for before,after in ((b'10 9 0:10',b'10 1 0:10'),(b'9 1 0:10',b'9 10 0:10'),
+                             (b'9 1 0:10 / ',b'9 1 0:10 /subtree '),
+                             (b'ro,nosuid,nodev,noexec',b'ro,nosuid,nodev'),
+                             (b'10 9 0:10 / ',b'10 9 0:10 /subtree ')):
+            with self.subTest(before=before),self.assertRaises(ValueError):self.mounts(self.stack().replace(before,after))
+
+    def test_stack_rejects_extra_alias_or_third_same_path_mount(self):
+        for path in (CACHE,'/alias',CACHE+'/child'):
+            raw=self.stack()+('30 10 0:10 / '+path+' rw,nosuid,nodev,noexec - tmpfs tmpfs rw\n').encode()
+            with self.subTest(path=path),self.assertRaises(ValueError):self.mounts(raw)
+
+    def test_stack_fd_must_reference_top_not_hidden_lower_or_new_mount(self):
+        for mount_id in (9,11):
+            with self.subTest(mount_id=mount_id),self.assertRaises(ValueError):
+                resources.validate_mounts(self.stack(),cache_device=(0,10),cache_mount_id=mount_id,cgroup_device=(0,20),cgroup_mount_id=20)
+
     def test_unrelated_mount_source_may_itself_be_a_hyphen(self):
         self.assertEqual(self.mounts(MOUNTS+b'30 1 0:30 / /unrelated rw - tmpfs - rw\n'),(10,20))
 

@@ -65,13 +65,20 @@ def validate_mounts(raw,*,cache_device,cache_mount_id,cgroup_device,cgroup_mount
     rows=mount_rows(raw)
     cache=[row for row in rows.values() if row['path']==CACHE]
     groups=[row for row in rows.values() if row['path']=='/sys/fs/cgroup']
-    _require(len(cache)==len(groups)==1)
-    cache=cache[0];groups=groups[0]
-    _require(cache['fs']==b'tmpfs' and cache['root']=='/' and cache['device']==cache_device and cache['id']==cache_mount_id and
-             {b'rw',b'nodev',b'nosuid',b'noexec'}<=cache['options'])
+    _require(len(cache) in (1,2) and len(groups)==1)
+    _require(all(row['fs']==b'tmpfs' and row['root']=='/' and row['device']==cache_device and
+                 {b'nodev',b'nosuid',b'noexec'}<=row['options'] for row in cache))
+    visible=[row for row in cache if row['id']==cache_mount_id]
+    _require(len(visible)==1 and b'rw' in visible[0]['options'])
+    if len(cache)==2:
+        lower=next(row for row in cache if row['id']!=cache_mount_id)
+        _require(visible[0]['parent']==lower['id'] and lower['parent'] not in {row['id'] for row in cache})
+    cache_count=len(cache);cache=visible[0];groups=groups[0]
     _require(groups['fs']==b'cgroup2' and groups['root']=='/' and groups['device']==cgroup_device and groups['id']==cgroup_mount_id)
     _require(not any(row['path'].startswith(CACHE+'/') for row in rows.values()))
-    _require(sum(row['device']==cache_device for row in rows.values())==1)
+    # Only the proved same-path overmount stack is allowed. No bind alias at
+    # another path (whole filesystem or subtree) can escape this admission.
+    _require(sum(row['device']==cache_device for row in rows.values())==cache_count)
     return cache['id'],groups['id']
 
 
