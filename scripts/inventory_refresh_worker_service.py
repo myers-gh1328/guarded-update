@@ -36,7 +36,12 @@ def refresh_argv(token):
         'OOMPolicy=kill','MemoryAccounting=yes','TasksMax=64','RuntimeMaxSec=610','NoNewPrivileges=yes',
         'CapabilityBoundingSet=CAP_KILL CAP_SETUID CAP_SETGID CAP_SETPCAP','AmbientCapabilities=CAP_SETUID',
         'ProtectSystem=strict','ProtectHome=yes','ProtectControlGroups=yes','RestrictNamespaces=yes',
-        'PrivateDevices=yes','PrivateTmp=yes','InaccessiblePaths=/tmp /var/tmp /dev/shm',
+        'PrivateDevices=yes','PrivateTmp=yes',
+        'InaccessiblePaths=/tmp /var/tmp /dev/shm -/opt -/srv -/var/opt -/usr/local/etc -/usr/local/var',
+        'TemporaryFileSystem=/etc:ro /var/lib:ro /run:ro',
+        'BindReadOnlyPaths=/etc/command-center-inventory-refresh/apt '+RUNTIME_ROOT+'/job.json '+
+            RUNTIME_ROOT+'/worker-apt.conf /etc/passwd /etc/group /etc/nsswitch.conf /etc/hosts /etc/resolv.conf '+
+            '-/etc/services -/etc/protocols -/etc/host.conf -/etc/gai.conf -/etc/ld.so.cache',
         'ReadWritePaths='+CACHE_ROOT+'/staging-'+token)
     return ('/usr/bin/systemd-run','--quiet','--wait','--collect','--pipe','--unit='+UNIT,'--slice='+SLICE)+tuple(
         item for value in properties for item in ('-p',value))+('/usr/bin/python3','-I','-B',LIB_ROOT+'/guardian.py')

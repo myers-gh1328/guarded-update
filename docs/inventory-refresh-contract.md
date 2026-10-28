@@ -800,3 +800,26 @@ runs outside the aggregate. This establishes neither a complete executable
 coordinator nor all-allocator accounting. Whole-cgroup/UID exclusion, actual
 worker ancestry traversal, filesystem key masks, namespace provenance and real
 target readiness remain mandatory caller/provisioning gates before activation.
+
+### Refresh guardian filesystem view
+
+The fixed refresh profile masks `/etc`, `/var/lib` and `/run` with read-only
+empty filesystems. It binds only the rendered APT subtree, exact root job/config
+files and the listed OS account/resolver files. Private parent policy/key inputs,
+host APT/dpkg state and service-control sockets are not bound. Optional generic
+application-state roots are inaccessible; the strict staging-token path remains
+the sole writable cache area. Privilege-drop and independent-deadline properties
+remain unchanged.
+
+The native acquisition tests use this same profile. During the already approved
+stopped-unprivileged-child test, the owned guardian namespace must hide paths
+known to exist on the host and expose required inputs as actual regular-file
+binds, without following final symlinks or reading private bytes. In particular,
+a resolver symlink into host `/run` must not require exposing its runtime parent.
+
+Host `nsswitch.conf` can select nonlocal backends; these binds do not prove
+local-only NSS. The signed fixture uses an IP URL and does not prove external
+DNS or real repository fit. Unsupported layouts remain readiness failures;
+no host APT, resolver-runtime directory or broader control-socket fallback is
+allowed. Actual device secret-location coverage and initial namespace/unit
+provenance remain separate provisioning gates before activation.

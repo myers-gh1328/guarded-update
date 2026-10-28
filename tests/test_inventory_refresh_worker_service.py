@@ -94,6 +94,19 @@ class WorkerServiceTests(unittest.TestCase):
             with self.assertRaises(ValueError):value.launch()
             spawn.assert_not_called()
 
+    def test_worker_filesystem_whitelist_excludes_parent_inputs_and_control_sockets(self):
+        args=service.refresh_argv('a'*32)
+        self.assertIn('TemporaryFileSystem=/etc:ro /var/lib:ro /run:ro',args)
+        binds=next(value for value in args if value.startswith('BindReadOnlyPaths=')).split('=',1)[1].split()
+        self.assertIn('/etc/command-center-inventory-refresh/apt',binds)
+        self.assertIn('/run/command-center-inventory-refresh/job.json',binds)
+        self.assertIn('/run/command-center-inventory-refresh/worker-apt.conf',binds)
+        for path in ('/etc/passwd','/etc/group','/etc/nsswitch.conf','/etc/hosts','/etc/resolv.conf'):
+            self.assertIn(path,binds)
+        for forbidden in ('/etc/command-center-inventory-refresh','/var/lib','/run','/run/systemd/private',
+                          '/etc/command-center-inventory-refresh/policy.json','/etc/command-center-inventory-refresh/policy-commitment.key'):
+            self.assertNotIn(forbidden,binds)
+
     def test_same_name_replacement_cannot_be_stopped(self):
         value=self.owned()
         with patch.object(service,'show_unit',return_value=self.properties(value,InvocationID='c'*32)),patch.object(service,'stop_unit') as stop:

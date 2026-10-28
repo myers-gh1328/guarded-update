@@ -23,6 +23,7 @@ import secrets
 import shutil
 import signal
 import ssl
+import stat
 import struct
 import subprocess
 import sys
@@ -42,7 +43,7 @@ from inventory_refresh_state import Journal
 from inventory_refresh_io import Inbox
 from inventory_refresh_policy_admission import PolicyGuard
 from inventory_refresh_materialized_policy import MaterializedPolicy
-from inventory_refresh_worker_service import RefreshService
+from inventory_refresh_worker_service import RefreshService, refresh_argv
 
 WORKER = 60001
 READER = 60002
@@ -612,6 +613,20 @@ def stopped_child_proof(args,job,*,owner=None):
             return (str(worker) in (owned/'cgroup.procs').read_text().split() and
                     is_live_worker(Path('/proc',str(worker),'status').read_bytes(),parent=guardian))
         stop_owned_child(worker,recheck)
+        if owner is not None:
+            # Host prerequisites are present; inspect only their absence through
+            # the exact owned guardian's namespace, never read private bytes.
+            masked=[Path(POLICY_ROOT)/'policy.json',Path(POLICY_ROOT)/'policy-commitment.key',
+                    Path('/etc/apt'),Path('/var/lib/dpkg'),Path('/run/systemd/private')]
+            for path in masked:
+                assert path.exists(), 'Missing host prerequisite invalidates mask proof'
+                assert not Path('/proc',str(guardian),'root'+str(path)).exists(), 'Unneeded host state visible to guardian'
+            required=[Path('/etc/passwd'),Path('/etc/group'),Path('/etc/nsswitch.conf'),Path('/etc/hosts'),
+                      Path('/etc/resolv.conf'),Path(POLICY_ROOT)/'apt/sources.sources',
+                      Path(RUNTIME_ROOT)/'job.json',Path(RUNTIME_ROOT)/'worker-apt.conf']
+            for path in required:
+                info=Path('/proc',str(guardian),'root'+str(path)).lstat()
+                assert stat.S_ISREG(info.st_mode), 'Fixed regular-file bind missing in guardian namespace'
         status=launcher.wait(timeout=12)
         released=time.clock_gettime_ns(time.CLOCK_BOOTTIME)//1_000_000
         assert status==76 and job['deadline_boottime_ms']<=released<=job['deadline_boottime_ms']+3000
@@ -686,18 +701,7 @@ def _run_worker(policy, number, *, stopped_child=False, policy_guard=None,journa
            'deadline_boottime_ms': (now if admission is None else admission['started'])+(8000 if stopped_child else 600000)}
     write_root(Path(RUNTIME_ROOT)/'job.json', json.dumps(job).encode())
     # PID1 protects the root MAIN guardian; setpriv permanently drops its fixed child.
-    args = ['/usr/bin/systemd-run', '--quiet', '--wait', '--collect', '--pipe', '--unit='+WORKER_UNIT,
-        '--slice='+WORKER_SLICE, '-p', 'User=root', '-p', 'Group=root',
-        '-p', 'Type=exec', '-p', 'ExitType=main', '-p', 'RemainAfterExit=no', '-p', 'Restart=no',
-        '-p', 'KillMode=control-group', '-p', 'KillSignal=SIGKILL', '-p', 'SendSIGKILL=yes',
-        '-p', 'OOMPolicy=kill', '-p', 'MemoryAccounting=yes',
-        '-p', 'NoNewPrivileges=yes', '-p', 'CapabilityBoundingSet=CAP_KILL CAP_SETUID CAP_SETGID CAP_SETPCAP',
-        '-p', 'AmbientCapabilities=CAP_SETUID',
-        '-p', 'ProtectSystem=strict',
-        '-p', 'ProtectHome=yes', '-p', 'ProtectControlGroups=yes', '-p', 'RestrictNamespaces=yes',
-        '-p', 'PrivateDevices=yes', '-p', 'PrivateTmp=yes', '-p', 'InaccessiblePaths=/tmp /var/tmp /dev/shm',
-        '-p', 'ReadWritePaths='+str(stage), '-p', 'RuntimeMaxSec=610', '-p', 'TimeoutStopSec=1',
-        '/usr/bin/python3', '-I', '-B', str(LIB_ROOT/'guardian.py')]
+    args=list(refresh_argv(token))
     binding=MaterializedPolicy.fixed(policy_guard,token,WORKER,job['config_sha256']) if policy_guard is not None else None
     try:
         if binding is not None:binding.recheck()
@@ -919,6 +923,9 @@ for path in sys.argv[2:]:
             'full_rendered_policy_bound_during_worker_and_publication_verified':True,
             'fixed_refresh_service_new_durable_start_verified':True,
             'fixed_refresh_service_deadline_fault_verified':True,
+            'fixed_refresh_guardian_private_inputs_host_state_and_sockets_masked':True,
+            'fixed_refresh_guardian_required_nss_resolver_and_apt_file_binds_verified':True,
+            'external_dns_resolution_fit_proven':False,
             'worker_and_reporter_private_policy_key_read_denied':True,
             'exact_guardian_capability_masks_verified': True,
             'unadmitted_package_sibling_and_matching_bytecode_ignored': True,
