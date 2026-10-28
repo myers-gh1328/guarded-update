@@ -840,6 +840,184 @@ print(json.dumps({'fixed_publisher_refresh_transaction_verified':True,'fixed_pub
     return {'fixed_publisher_refresh_transaction_verified':True,'fixed_publisher_observation_transaction_verified':True,'fixed_publisher_inbox_dispatch_verified':True,'fixed_publisher_runtime_verified':True,'fixed_publisher_root_bootstrap_verified':True,'publisher_refresh_transaction_metrics':result['metrics']}
 
 
+
+REPORTER_INBOX_CODE=r"""import os,re,stat,sys
+assert len(sys.argv)==3 and sys.argv[1] in ('observation','release')
+nonce=sys.argv[2];assert re.fullmatch('[0-9a-f]{32}',nonce) and int(nonce[:16],16)>0
+fields=dict(line.split(':',1) for line in open('/proc/self/status').read().splitlines())
+assert all(fields[key].split()==['60002']*4 for key in ('Uid','Gid'))
+assert not fields['Groups'].split() and fields['NoNewPrivs'].split()==['1']
+assert all(int(fields[key].strip(),16)==0 for key in ('CapInh','CapPrm','CapEff','CapBnd','CapAmb'))
+directory=os.open('/run/command-center-inventory-refresh/'+sys.argv[1],os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+temporary='.actor-'+os.urandom(8).hex();fd=None;created=False
+try:
+ fd=os.open(temporary,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600,dir_fd=directory);created=True
+ raw=nonce.encode('ascii');offset=0
+ while offset<len(raw):
+  count=os.write(fd,raw[offset:]);assert count>0;offset+=count
+ info=os.fstat(fd)
+ assert stat.S_ISREG(info.st_mode) and info.st_uid==info.st_gid==60002 and stat.S_IMODE(info.st_mode)==0o600 and info.st_nlink==1
+ os.fsync(fd);closing,fd=fd,None;os.close(closing)
+ os.rename(temporary,'request',src_dir_fd=directory,dst_dir_fd=directory);created=False;os.fsync(directory)
+finally:
+ try:
+  if fd is not None:os.close(fd)
+ finally:
+  try:
+   if created:os.unlink(temporary,dir_fd=directory)
+  finally:os.close(directory)
+"""
+
+
+def prove_actual_coordinator_entry_loop():
+    """GHA-only actual entry, restricted inbox actor and controlled policy refusal."""
+    from inventory_refresh_publisher_profile import publisher_properties
+    from inventory_refresh_resources import UNIT,SELF_CGROUP
+    from inventory_refresh_unit_status import PROPERTIES,inert
+    from inventory_refresh_writer_exclusion import WriterExclusion
+    assert sys.platform=='linux' and os.geteuid()==0 and os.environ.get('GITHUB_ACTIONS')=='true'
+    source=LIB_ROOT/'coordinator.py';expected=(ROOT/'scripts/inventory_refresh_root_entry.py').read_bytes()
+    # Admit exact entry before starting it; self-validation is not its provenance.
+    root=os.open('/',os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW);ancestry=None
+    try:
+        from inventory_refresh_observation import _Ancestry,_stable
+        ancestry=_Ancestry.open(root,('usr','local','libexec','command-center-inventory-refresh'))
+        fd=os.open('coordinator.py',os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK,dir_fd=ancestry.fds[-1])
+        try:
+            info=os.fstat(fd);assert stat.S_ISREG(info.st_mode) and info.st_uid==0 and info.st_nlink==1 and not info.st_mode&0o022
+            assert 0<info.st_size<=65536
+            raw=os.read(fd,65537);assert raw==expected and len(raw)==info.st_size
+            assert _stable(os.fstat(fd))==_stable(info) and _stable(os.stat('coordinator.py',dir_fd=ancestry.fds[-1],follow_symlinks=False))==_stable(info)
+            ancestry.verify()
+        finally:os.close(fd)
+    finally:
+        try:
+            if ancestry is not None:ancestry.close()
+        finally:os.close(root)
+    def properties():
+        result=subprocess.run(['/bin/systemctl','show','--property='+','.join(PROPERTIES),UNIT],env=ENV,
+            stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,timeout=2)
+        assert result.returncode in (0,4) and len(result.stdout)<=4096
+        value={}
+        for line in result.stdout.decode('ascii').splitlines():
+            key,separator,item=line.partition('=');assert separator and key in PROPERTIES and key not in value;value[key]=item
+        assert set(value)==set(PROPERTIES);return value
+    assert properties()['LoadState']=='not-found'
+    nonce='0000000000000006'+'f'*16;description='Disposable inventory entry '+secrets.token_hex(16)
+    policy=Path(POLICY_ROOT)/'policy.json';original=policy.read_bytes();policy_info=policy.stat()
+    control=Path(STATE_ROOT)/'control.json';before=json.loads(control.read_bytes())
+    prior_success=before['last_success'];prior_refresh=before['capabilities']['refresh']
+    status_path=Path(RUNTIME_ROOT)/'status/status.json'
+    def public():
+        with status_path.open('rb') as status:raw=status.read(65537)
+        assert len(raw)<=65536;return json.loads(raw)
+    def actor(capability):
+        result=subprocess.run(list(worker_argv(READER,READER)[:-1])+['-S','-c',REPORTER_INBOX_CODE,capability,nonce],
+            env=ENV,stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=5)
+        assert result.returncode==0,'Restricted synthetic inbox actor failed'
+    def write_policy(data):
+        fd=os.open(policy,os.O_WRONLY|os.O_TRUNC|os.O_NOFOLLOW)
+        try:
+            info=os.fstat(fd);assert info.st_uid==policy_info.st_uid==0 and stat.S_IMODE(info.st_mode)==stat.S_IMODE(policy_info.st_mode)==0o600
+            offset=0
+            while offset<len(data):
+                count=os.write(fd,data[offset:]);assert count>0;offset+=count
+            os.fsync(fd)
+        finally:os.close(fd)
+        directory=os.open(policy.parent,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+        try:os.fsync(directory)
+        finally:os.close(directory)
+    args=['/usr/bin/systemd-run','--quiet','--wait','--pipe','--unit='+UNIT,'--slice='+PARENT_SLICE,'--description='+description]
+    for item in publisher_properties():args+=['-p',item]
+    args+=['-p','CollectMode=inactive','-p','RuntimeMaxSec=30','/usr/bin/python3','-I','-B','-S',str(source)]
+    launcher=subprocess.Popen(args,env=ENV,stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+    invocation=None;group=None;group_identity=None;changed=False;receipt=None;proved=False
+    def invalidate_policy():
+        nonlocal changed
+        changed=True  # O_TRUNC/write/fsync can mutate before reporting failure.
+        write_policy(b'{}')
+    def pin(value):
+        nonlocal invocation,group,group_identity
+        assert value['LoadState']=='loaded' and value['Transient']=='yes' and value['Description']==description
+        assert re.fullmatch('[0-9a-f]{32}',value['InvocationID'])
+        if invocation is None:invocation=value['InvocationID']
+        assert value['InvocationID']==invocation and value['ControlGroup'] in (SELF_CGROUP,'')
+        if group is None and value['ControlGroup']==SELF_CGROUP:
+            group=os.open('/sys/fs/cgroup'+SELF_CGROUP,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+            info=os.fstat(group);group_identity=(info.st_dev,info.st_ino)
+    def confirm_inert():
+        value=properties();pin(value);assert inert(value)
+        assert group is not None and (os.fstat(group).st_dev,os.fstat(group).st_ino)==group_identity
+        try:named=os.stat('/sys/fs/cgroup'+SELF_CGROUP,follow_symlinks=False)
+        except FileNotFoundError:pass
+        else:
+            assert (named.st_dev,named.st_ino)==group_identity
+            fd=os.open('cgroup.events',os.O_RDONLY|os.O_NOFOLLOW,dir_fd=group)
+            try:assert b'populated 0' in os.read(fd,4096).splitlines()
+            finally:os.close(fd)
+        final=properties();assert final['Description']==description and final['InvocationID']==invocation and inert(final)
+        guard=WriterExclusion.fixed(WORKER)
+        try:guard.check()
+        finally:guard.close()
+        state=os.open(STATE_ROOT,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+        try:
+            journal=Journal(state)
+            with journal.exclusive():
+                frozen=journal._decode_snapshot(journal._read('initialized-epoch'),journal._read('control.json'))
+                assert frozen['unconfirmed']  # Main must fence before this verification barrier.
+                assert journal.startup_ready() is False
+                value=journal.snapshot();assert value['unconfirmed'] and value['last_success']==prior_success
+                assert value['capabilities']['refresh']==prior_refresh
+                if receipt is not None:assert value['last_observation']['receipt']==receipt
+        finally:os.close(state)
+        assert public()['observation_lease'] is None
+        return final
+    try:
+        limit=time.monotonic()+5
+        while True:
+            value=properties()
+            if value['LoadState']=='loaded':pin(value);break
+            assert launcher.poll() is None and time.monotonic()<limit;time.sleep(.02)
+        assert group is not None
+        actor('observation');limit=time.monotonic()+10
+        while True:
+            value=public();offer=value['observation_lease']
+            if offer is not None and offer['nonce']==nonce:break
+            assert launcher.poll() is None and time.monotonic()<limit;time.sleep(.02)
+        cache=os.open(CACHE_ROOT,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+        try:
+            with Store(cache,0,READER,WORKER).lease_current() as lease:
+                assert lease.manifest['cache_generation']==offer['cache_generation']
+                for item in lease.manifest['files']:lease.verify_index(item['path'])
+        finally:os.close(cache)
+        actor('release');limit=time.monotonic()+10
+        while True:
+            value=public();receipt=value['observation_receipt']
+            if receipt is not None and receipt['nonce']==nonce:break
+            receipt=None;assert launcher.poll() is None and time.monotonic()<limit;time.sleep(.02)
+        assert value['observation_lease'] is None and all(receipt[key]==item for key,item in offer.items())
+        assert receipt['installed_before_sha256']==receipt['installed_after_sha256']
+        invalidate_policy()
+        assert launcher.wait(timeout=35)==74
+        final=confirm_inert();assert final['ExecMainCode']=='1' and final['ExecMainStatus']=='74' and final['Result']=='exit-code'
+        proved=True
+    finally:
+        try:
+            if launcher.poll() is None:
+                if not changed:invalidate_policy()
+                launcher.wait(timeout=35)
+            if changed:
+                confirm_inert()  # Never restore into an unknown/live invocation.
+                write_policy(original);changed=False
+            if invocation is not None:
+                value=properties();assert value['Description']==description and value['InvocationID']==invocation and inert(value)
+                command(['/bin/systemctl','reset-failed',UNIT],timeout=3)
+        finally:
+            if group is not None:os.close(group)
+    assert proved
+    return {'fixed_coordinator_entry_loop_and_controlled_policy_refusal_verified':True,
+        'restricted_reporter_actual_entry_observation_receipt_verified':True}
+
 def is_live_worker(raw,*,parent=None):
     try:
         validate_kernel_identity(raw,WORKER,WORKER)
@@ -1264,6 +1442,7 @@ for path in sys.argv[2:]:
         recovered,_,_=run_worker(good,8,policy_guard=private_policy_guard)
         assert recovered==0, 'Owned failed refresh unit was not acknowledged for the next job'
         assert (Path(CACHE_ROOT)/'current.json').read_bytes()==previous
+        resource_proof.update(prove_actual_coordinator_entry_loop())
         proof = {'schema_version': 1, 'scope': 'fixed_worker_trusted_policy',
             'synthetic_repository_only': True, 'target_repository_fit_proven': False,
             'coordinator_exercised': False, 'apt_refresh_exercised': True,

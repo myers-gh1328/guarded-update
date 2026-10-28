@@ -1040,3 +1040,23 @@ loader and a finite actual-runtime proof under `-I -B -S`.
 `fixed_publisher_root_bootstrap_verified` covers that loader path; it does not
 claim that the fixture ran production main/profile admission or its infinite loop.
 Those entry/provisioning and target/client rollout gates remain separate.
+
+### Actual entry loop disposable proof
+
+A separate GHA-only proof launches the pre-admitted exact coordinator entry under
+its fixed CAP3 profile with `-I -B -S`. A real restricted reporter process validates
+its numeric UID/GID, empty groups/capabilities and NoNewPrivs, then writes only
+atomic bounded nonce files in the two existing observation/release inboxes. The
+proof requires an actual opened lease, verified cache indexes and accepted receipt
+before changing the disposable synthetic policy to invalid data. This exercises
+ordinary policy refusal and exit 74, without new signals or pressure workloads.
+
+Restoration is latched before any truncating policy write. Exact invocation,
+retained inert unit, pinned empty cgroup, writer exclusion and journal lock release
+must be confirmed before restoring/fsyncing the synthetic policy; a wrapper exit
+alone is insufficient. The main must already have persisted uncertainty while
+preserving successful refresh and accepted receipt. Only that same owned inert
+unit may then be acknowledged. The proof's
+`fixed_coordinator_entry_loop_and_controlled_policy_refusal_verified` flag covers
+actual main, polling and controlled refusal; it is not a successful normal-shutdown
+or complete provisioning/startup-allocation/target-fit readiness claim.
