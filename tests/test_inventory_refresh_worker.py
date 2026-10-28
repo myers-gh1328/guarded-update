@@ -25,7 +25,8 @@ class RefreshWorkerTests(unittest.TestCase):
         self.job = {'schema_version': 1, 'staging_token': 'a'*32, 'config_sha256': 'b'*64,
                     'policy_generation': 'c'*64, 'operation_nonce': '0000000000000001'+'d'*16,
                     'helper_sequence': 1, 'boot_id': '11111111-1111-4111-8111-111111111111',
-                    'accepted_boottime_ms': 100, 'started_boottime_ms': 101}
+                    'accepted_boottime_ms': 100, 'started_boottime_ms': 101,
+                    'deadline_boottime_ms': 600101}
 
     def test_job_admits_only_fixed_bounded_identifiers_and_exact_config_digest(self):
         self.assertEqual(self.p.parse_job(json.dumps(self.job).encode())['helper_sequence'], 1)
@@ -39,6 +40,37 @@ class RefreshWorkerTests(unittest.TestCase):
                 self.p.parse_job(json.dumps(changed).encode())
         with self.assertRaises(ValueError):
             self.p.parse_job(b'{"schema_version":1,"schema_version":1}')
+
+    def test_job_freezes_a_positive_bounded_absolute_boottime_deadline(self):
+        self.assertEqual(self.p.parse_job(json.dumps(self.job).encode())['deadline_boottime_ms'], 600101)
+        for deadline in [None, True, 101, 100, 600102, self.p.MAX_SAFE+1]:
+            with self.subTest(deadline=deadline), self.assertRaises(ValueError):
+                self.p.parse_job(json.dumps(dict(self.job, deadline_boottime_ms=deadline)).encode())
+        missing = dict(self.job)
+        del missing['deadline_boottime_ms']
+        with self.assertRaises(ValueError):
+            self.p.parse_job(json.dumps(missing).encode())
+
+    def test_kernel_credentials_require_all_four_ids_zero_caps_and_no_new_privileges(self):
+        valid = ('Uid:\t60001\t60001\t60001\t60001\n'
+                 'Gid:\t60002\t60002\t60002\t60002\nGroups:\t\n'
+                 'CapInh:\t0000000000000000\nCapPrm:\t0000000000000000\n'
+                 'CapEff:\t0000000000000000\nCapBnd:\t0000000000000000\n'
+                 'CapAmb:\t0000000000000000\nNoNewPrivs:\t1\n').encode()
+        self.p.validate_kernel_identity(valid, 60001, 60002)
+        for bad in [valid.replace(b'60001\n', b'0\n', 1),
+                    valid.replace(b'60002\n', b'0\n', 1),
+                    valid.replace(b'Groups:\t\n', b'Groups:\t0\n'),
+                    valid.replace(b'NoNewPrivs:\t1', b'NoNewPrivs:\t0'),
+                    valid + b'Uid:\t60001\t60001\t60001\t60001\n',
+                    valid.replace(b'CapBnd:', b'Unknown:'),
+                    b'x'*65537]:
+            with self.subTest(bad=bad[:60]), self.assertRaises(ValueError):
+                self.p.validate_kernel_identity(bad, 60001, 60002)
+        for cap in ['CapInh', 'CapPrm', 'CapEff', 'CapBnd', 'CapAmb']:
+            bad=valid.replace((cap+':\t0000000000000000').encode(), (cap+':\t0000000000000001').encode())
+            with self.subTest(cap=cap), self.assertRaises(ValueError):
+                self.p.validate_kernel_identity(bad, 60001, 60002)
 
     def test_worker_environment_is_fixed_and_contains_no_inherited_secret_or_options(self):
         with patch.dict(os.environ, {'APT_CONFIG': '/untrusted', 'HTTP_PROXY': 'untrusted',

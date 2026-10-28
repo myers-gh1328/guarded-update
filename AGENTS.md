@@ -73,3 +73,12 @@ No credentials are packaged; no services or updates activate on package install.
 Every transaction requires exact manifest approval, fresh one-use controller
 claim, root state/archive verification and the mandatory APT hook. No reboot.
 Interrupted execution is held for manual reconciliation and never replayed.
+
+## Explicit inventory metadata helper
+
+The owner separately authorized the opt-in Linux inventory metadata helper in
+`docs/inventory-refresh-contract.md`. Its fixed root publisher/guardian/native
+reader supervise isolated read-only collection and a separate unprivileged
+APT metadata worker. This scoped path does not authorize package installation,
+upgrades, reboots, arbitrary commands, or changes to the legacy no-root CLI.
+Artifacts install no enabled service, account, policy or key automatically.

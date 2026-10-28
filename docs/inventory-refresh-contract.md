@@ -442,3 +442,40 @@ and caps the actual observation identity to the earlier of that deadline and
 `lock_open + 120 seconds`. Active lease and release receipt carry this same bound.
 This prevents a delayed launch from advertising a fresh full interval. Independent
 guardian/process containment remains a separate required integration proof.
+
+### Fixed root guardian and worker privilege transition
+
+The staged refresh guardian is a separate root MAIN process. It accepts no
+command-line arguments and reads the fixed root-owned job only. The job freezes
+`deadline_boottime_ms`, strictly after the recorded start and at most 600 seconds
+later. Missing or oversized deadlines fail closed. Its independent
+CLOCK_BOOTTIME loop uses nonblocking child polling; deadline expiry kills the
+owned direct child and exits without waiting on a stopped descendant. PID1 must
+then kill the entire service cgroup. The coordinator must still independently
+prove empty cgroup and all-four-UID writer exclusion before publication; a
+successful guardian exit is not cleanup evidence.
+
+The fixed worker transition uses `/usr/bin/setpriv` with numeric admitted
+ccrefresh IDs, cleared supplementary groups, empty inheritable, ambient and
+bounding capability sets, and no-new-privileges. No direct-exec fallback exists.
+The guardian retains only KILL, SETUID, SETGID and SETPCAP capabilities in its
+service profile; SETPCAP is needed to drop the child's bounding set. Before any
+job or APT work, the worker verifies the actual four kernel UID/GID columns,
+empty supplementary groups, all five capability sets zero and NNP=1. See the
+[util-linux source](https://github.com/util-linux/util-linux/blob/master/sys-utils/setpriv.c)
+and [option contract](https://github.com/util-linux/util-linux/blob/master/sys-utils/setpriv.1.adoc).
+
+The guardian runs with isolated Python and executes only bounded source bytes
+read from its admitted root-owned, single-link, nofollow `worker.py` descriptor,
+with metadata and named-reference continuity checks. It does not add the project
+library to module search or load project bytecode. The disposable signed-repo
+proof plants a conflicting package, sibling module and matching malicious
+bytecode to exercise this distinction. The exact service profile uses
+Type=exec, ExitType=main, RemainAfterExit=no, Restart=no, KillMode=control-group,
+KillSignal=SIGKILL, TimeoutStopSec=1, SendSIGKILL=yes and OOMPolicy=kill.
+
+This source remains opt-in and unactivated. Native signed-repository CI runs the
+actual guardian, but independent stopped-child deadline, signal-isolation and
+OOM fault proofs remain separate required integration evidence. No coordinator,
+observation guardian, installed helper artifact or real-device resource fit is
+implied by these unit tests or by a worker exit code.

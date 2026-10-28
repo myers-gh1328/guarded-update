@@ -13,6 +13,7 @@ import re
 import stat
 import subprocess
 import sys
+import time
 
 POLICY_ROOT = '/etc/command-center-inventory-refresh'
 CACHE_ROOT = '/var/cache/command-center-inventory-refresh'
@@ -55,7 +56,7 @@ def parse_job(raw):
         raise invalid() from None
     fields = {'schema_version', 'staging_token', 'config_sha256', 'policy_generation',
               'operation_nonce', 'helper_sequence', 'boot_id',
-              'accepted_boottime_ms', 'started_boottime_ms'}
+              'accepted_boottime_ms', 'started_boottime_ms', 'deadline_boottime_ms'}
     if (type(value) is not dict or set(value) != fields or
             type(value['schema_version']) is not int or value['schema_version'] != 1 or
             not _hex(value['staging_token'], 32) or not _hex(value['config_sha256'], 64) or
@@ -65,9 +66,46 @@ def parse_job(raw):
             type(value['boot_id']) is not str or not re.fullmatch(
                 '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}', value['boot_id']) or
             not _integer(value['accepted_boottime_ms']) or not _integer(value['started_boottime_ms']) or
-            value['started_boottime_ms'] < value['accepted_boottime_ms']):
+            value['started_boottime_ms'] < value['accepted_boottime_ms'] or
+            not _integer(value['deadline_boottime_ms']) or
+            not value['started_boottime_ms'] < value['deadline_boottime_ms'] <= value['started_boottime_ms']+600000):
         raise invalid()
     return value
+
+
+def validate_kernel_identity(raw, uid, gid):
+    """Check Linux's actual real/effective/saved/filesystem IDs and exec privileges."""
+    if (type(raw) is not bytes or not 0 < len(raw) <= LIMIT or
+            type(uid) is not int or type(gid) is not int or uid <= 0 or gid <= 0):
+        raise invalid()
+    needed = {'Uid', 'Gid', 'Groups', 'CapInh', 'CapPrm', 'CapEff', 'CapBnd', 'CapAmb', 'NoNewPrivs'}
+    fields = {}
+    try:
+        for line in raw.decode('ascii').splitlines():
+            name, separator, value = line.partition(':')
+            if name in needed:
+                if not separator or name in fields:
+                    raise invalid()
+                fields[name] = value.split()
+        if (set(fields) != needed or fields['Uid'] != [str(uid)]*4 or
+                fields['Gid'] != [str(gid)]*4 or fields['Groups'] != [] or
+                fields['NoNewPrivs'] != ['1']):
+            raise invalid()
+        for name in ['CapInh', 'CapPrm', 'CapEff', 'CapBnd', 'CapAmb']:
+            if len(fields[name]) != 1 or re.fullmatch('0{16}', fields[name][0]) is None:
+                raise invalid()
+    except (UnicodeError, KeyError):
+        raise invalid() from None
+
+
+def kernel_identity_ready(uid, gid):
+    # /proc/self is the kernel-selected current process, not a caller-selected PID.
+    with open('/proc/self/status', 'rb') as source:
+        validate_kernel_identity(source.read(LIMIT+1), uid, gid)
+
+
+def boottime_ms():
+    return time.clock_gettime_ns(time.CLOCK_BOOTTIME)//1_000_000
 
 
 def worker_environment(staging_token):
@@ -163,6 +201,7 @@ def worker_main():
         if (not hasattr(os, 'getresuid') or not hasattr(os, 'getresgid') or
                 os.getresuid() != (user.pw_uid,)*3 or os.getresgid() != (user.pw_gid,)*3):
             return EXIT_UNSUPPORTED
+        kernel_identity_ready(user.pw_uid, user.pw_gid)
         job = parse_job(root_file(RUNTIME_ROOT+'/job.json', user.pw_gid))
         config = root_file(RUNTIME_ROOT+'/worker-apt.conf', user.pw_gid)
         if hashlib.sha256(config).hexdigest() != job['config_sha256']:
@@ -170,10 +209,13 @@ def worker_main():
         with open('/proc/sys/kernel/random/boot_id', 'r', encoding='ascii') as source:
             if source.read(64).strip() != job['boot_id']:
                 return EXIT_UNSUPPORTED
+        now = boottime_ms()
+        if not job['started_boottime_ms'] <= now < job['deadline_boottime_ms']:
+            return EXIT_TIMEOUT
         stage_ready(job['staging_token'], user)
         result = subprocess.run(APT_COMMAND, env=worker_environment(job['staging_token']),
                                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                                stderr=subprocess.DEVNULL, timeout=570, check=False)
+                                stderr=subprocess.DEVNULL, timeout=min(570, (job['deadline_boottime_ms']-now)/1000), check=False)
         return 0 if result.returncode == 0 else EXIT_REPOSITORY
     except subprocess.TimeoutExpired:
         # Root coordinator must still stop/prove the entire owned cgroup empty.

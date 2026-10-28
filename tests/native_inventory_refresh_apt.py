@@ -13,12 +13,14 @@ import hashlib
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 import importlib.util
 import json
+import marshal
 import os
 from pathlib import Path
 import pwd
 import secrets
 import shutil
 import ssl
+import struct
 import subprocess
 import sys
 import threading
@@ -80,7 +82,7 @@ def empty_worker():
             continue
         try:
             fields = dict(line.split(':', 1) for line in (entry/'status').read_text().splitlines())
-            if int(fields['Uid'].split()[0]) == WORKER:
+            if WORKER in [int(value) for value in fields['Uid'].split()]:
                 assert fields['State'].strip().startswith('Z'), 'Refresh UID writer escaped its owned cgroup'
         except (FileNotFoundError, ProcessLookupError):
             pass
@@ -172,16 +174,20 @@ def run_worker(policy, number):
            'policy_generation': policy_generation(b'k'*32, policy),
            'operation_nonce': nonce, 'helper_sequence': number,
            'boot_id': Path('/proc/sys/kernel/random/boot_id').read_text().strip(),
-           'accepted_boottime_ms': now, 'started_boottime_ms': now}
+           'accepted_boottime_ms': now, 'started_boottime_ms': now, 'deadline_boottime_ms': now+600000}
     write_root(Path(RUNTIME_ROOT)/'job.json', json.dumps(job).encode())
-    # The real worker is UID-dropped by PID1; only its exact staging path is writable.
+    # PID1 protects the root MAIN guardian; setpriv permanently drops its fixed child.
     args = ['/usr/bin/systemd-run', '--quiet', '--wait', '--collect', '--pipe', '--unit='+WORKER_UNIT,
-        '--slice='+WORKER_SLICE, '-p', 'User=ccrefresh', '-p', 'Group=ccrefresh',
-        '-p', 'NoNewPrivileges=yes', '-p', 'CapabilityBoundingSet=', '-p', 'ProtectSystem=strict',
+        '--slice='+WORKER_SLICE, '-p', 'User=root', '-p', 'Group=root',
+        '-p', 'Type=exec', '-p', 'ExitType=main', '-p', 'RemainAfterExit=no', '-p', 'Restart=no',
+        '-p', 'KillMode=control-group', '-p', 'KillSignal=SIGKILL', '-p', 'SendSIGKILL=yes',
+        '-p', 'OOMPolicy=kill', '-p', 'MemoryAccounting=yes',
+        '-p', 'NoNewPrivileges=yes', '-p', 'CapabilityBoundingSet=CAP_KILL CAP_SETUID CAP_SETGID CAP_SETPCAP',
+        '-p', 'ProtectSystem=strict',
         '-p', 'ProtectHome=yes', '-p', 'ProtectControlGroups=yes', '-p', 'RestrictNamespaces=yes',
         '-p', 'PrivateDevices=yes', '-p', 'PrivateTmp=yes', '-p', 'InaccessiblePaths=/tmp /var/tmp /dev/shm',
-        '-p', 'ReadWritePaths='+str(stage), '-p', 'RuntimeMaxSec=590', '-p', 'TimeoutStopSec=10',
-        '/usr/bin/python3', '-I', str(LIB_ROOT/'worker.py')]
+        '-p', 'ReadWritePaths='+str(stage), '-p', 'RuntimeMaxSec=610', '-p', 'TimeoutStopSec=1',
+        '/usr/bin/python3', '-I', '-B', str(LIB_ROOT/'guardian.py')]
     result = subprocess.run(args, env=ENV, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=610)
     status = result.returncode
     empty_worker()
@@ -232,6 +238,23 @@ def main():
             path.mkdir(parents=True, mode=0o755)
         shutil.copyfile(ROOT/'scripts/inventory_refresh_worker.py', LIB_ROOT/'worker.py')
         (LIB_ROOT/'worker.py').chmod(0o444)
+        shutil.copyfile(ROOT/'scripts/inventory_refresh_guardian.py', LIB_ROOT/'guardian.py')
+        (LIB_ROOT/'guardian.py').chmod(0o444)
+        # Root loader must execute admitted worker.py bytes, never these other
+        # matching project import candidates. -B alone would still read pycache.
+        poison=b"raise RuntimeError('Unadmitted project import executed')\n"
+        (LIB_ROOT/'json.py').write_bytes(poison)
+        package=LIB_ROOT/'worker'
+        package.mkdir()
+        (package/'__init__.py').write_bytes(poison)
+        package.chmod(0o777)
+        bytecode=Path(importlib.util.cache_from_source(str(LIB_ROOT/'worker.py')))
+        bytecode.parent.mkdir()
+        source_metadata=(LIB_ROOT/'worker.py').stat()
+        bytecode.write_bytes(importlib.util.MAGIC_NUMBER+struct.pack('<III',0,
+            int(source_metadata.st_mtime)&0xffffffff,source_metadata.st_size&0xffffffff)+
+            marshal.dumps(compile(poison,str(LIB_ROOT/'worker.py'),'exec')))
+        bytecode.chmod(0o666)
         for file, limit in zip(unit_files, [True, False]):
             file.write_text('[Unit]\nDescription=Disposable trusted-policy proof\nStopWhenUnneeded=no\n'
                             '[Slice]\nMemoryAccounting=yes\n'+
@@ -313,6 +336,9 @@ def main():
         proof = {'schema_version': 1, 'scope': 'fixed_worker_trusted_policy',
             'synthetic_repository_only': True, 'target_repository_fit_proven': False,
             'coordinator_exercised': False, 'apt_refresh_exercised': True,
+            'root_guardian_fixed_privilege_drop_exercised': True,
+            'unadmitted_package_sibling_and_matching_bytecode_ignored': True,
+            'independent_deadline_fault_proof': False,
             'binary_packages_acquired': True, 'valid_tls_gpg_auth_accepted': True,
             'wrong_ca_rejected': True, 'wrong_gpg_key_rejected': True,
             'wrong_auth_rejected': True, 'expired_metadata_rejected': True,
