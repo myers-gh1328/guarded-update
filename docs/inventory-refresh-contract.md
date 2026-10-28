@@ -1138,3 +1138,12 @@ native boot-relative time, pin the exact generation, and require both hashes to
 match both final root receipt hashes with the entire interval inside confirmed
 lock coverage. No receipt, mismatch or uncertainty can become fresh evidence.
 This data seam alone does not enable a reporting capability.
+
+The native restricted-reader proof now admits the actual fixed shared hash module
+from root-owned stable source descriptors without a project search path. It
+brackets both fingerprint computations and the isolated candidate query with the
+same kernel boot/BOOTTIME clock, retains its own generation lease, and returns
+only a bounded internal hash/timing envelope. The parent requires exact context,
+all four reporter/root hashes equal, and the entire interval within the final
+root-held endpoint before recording success. This is a native proof prerequisite
+for the still-disconnected production collector/adapter, not device activation.

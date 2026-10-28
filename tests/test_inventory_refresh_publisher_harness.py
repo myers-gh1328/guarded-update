@@ -107,5 +107,23 @@ class PublisherHarnessTests(unittest.TestCase):
         self.assertEqual(result.exception.code,74);self.assertNotIn('synthetic-private-value',output.getvalue())
         self.assertIn('"stage": "identity"',output.getvalue());self.assertIn('"kind": "ValueError"',output.getvalue())
 
+    def test_reporter_fingerprints_require_exact_root_receipt_and_complete_lock_interval(self):
+        tree=ast.parse((Path(__file__).parent/'native_inventory_refresh_apt.py').read_bytes())
+        matcher=next(node for node in tree.body if isinstance(node,ast.FunctionDef) and node.name=='match_projected_reader_receipt')
+        scope={'re':re};exec(compile(ast.Module(body=[matcher],type_ignores=[]),'<reader-match>','exec'),scope)
+        offer={'nonce':'0000000000000006'+'f'*16,'boot_id':'11111111-1111-4111-8111-111111111111',
+            'cache_generation':'a'*32,'policy_generation':'b'*64,'lock_open_boottime_ms':100,'expires_boottime_ms':120100}
+        reader={'schema_version':1,'observation_nonce':offer['nonce'],'boot_id':offer['boot_id'],'cache_generation':offer['cache_generation'],
+            'policy_generation':offer['policy_generation'],'scan_started_boottime_ms':101,'scan_finished_boottime_ms':110,
+            'installed_before_sha256':'c'*64,'installed_after_sha256':'c'*64}
+        receipt={**offer,'lock_held_until_boottime_ms':111,'released_boottime_ms':112,'outcome':'released',
+            'installed_before_sha256':'c'*64,'installed_after_sha256':'c'*64}
+        self.assertTrue(scope['match_projected_reader_receipt'](offer,reader,receipt))
+        for field,value in (('installed_after_sha256','d'*64),('scan_started_boottime_ms',99),
+                            ('scan_finished_boottime_ms',112),('cache_generation','d'*32),('schema_version',True)):
+            changed={**reader,field:value}
+            with self.assertRaises((ValueError,AssertionError)):scope['match_projected_reader_receipt'](offer,changed,receipt)
+        with self.assertRaises((ValueError,AssertionError)):scope['match_projected_reader_receipt'](offer,reader,{**receipt,'outcome':'expired'})
+
 
 if __name__=='__main__':unittest.main()

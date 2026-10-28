@@ -870,8 +870,18 @@ finally:
 
 
 
-PROJECTED_READER_CODE=r"""import fcntl,hashlib,json,os,re,stat,subprocess,sys
-assert len(sys.argv)==3 and re.fullmatch('[0-9a-f]{32}',sys.argv[1]) and re.fullmatch('[0-9a-f]{64}',sys.argv[2])
+PROJECTED_READER_CODE=r"""import fcntl,hashlib,json,os,re,stat,subprocess,sys,time,types
+assert len(sys.argv)==6 and re.fullmatch('[0-9a-f]{32}',sys.argv[1]) and re.fullmatch('[0-9a-f]{64}',sys.argv[2])
+assert re.fullmatch('[0-9a-f-]{36}',sys.argv[3]) and re.fullmatch('[0-9]+',sys.argv[4]) and re.fullmatch('[0-9a-f]{32}',sys.argv[5])
+deadline=int(sys.argv[4]);assert 0<deadline<=9007199254740991
+assert open('/proc/sys/kernel/random/boot_id').read().strip()==sys.argv[3]
+previous=None
+def clock():
+ global previous
+ now=time.clock_gettime_ns(time.CLOCK_BOOTTIME)//1000000
+ assert (previous is None or now>=previous) and now<=deadline
+ previous=now;return now
+scan_started=clock()
 fields=dict(line.split(':',1) for line in open('/proc/self/status').read().splitlines())
 assert all(fields[key].split()==['60002']*4 for key in ('Uid','Gid'))
 assert fields['Groups'].split() in ([],['60002']) and fields['NoNewPrivs'].split()==['1']
@@ -883,7 +893,7 @@ for path in ('/etc/command-center-inventory-refresh/policy.json','/etc/command-c
  except PermissionError:pass
  else:
   os.close(fd);raise ValueError('Root private reader boundary failed')
-stage='generation';fds=[];lease=None
+stage='generation';fds=[];lease=None;dpkg=None
 try:
  fd=os.open('/',os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW);fds.append(fd)
  for part in ('var','cache','command-center-inventory-refresh','generation-'+sys.argv[1]):
@@ -914,6 +924,34 @@ try:
   raw=read(reader,name,4*1024*1024);rows=[row for row in manifest['files'] if row['path']=='_inventory-reader/'+name]
   assert len(rows)==1 and rows[0]['sha256']==hashlib.sha256(raw).hexdigest() and rows[0]['size']==len(raw)
   assert b'synthetic-proof-password' not in raw and b'password ' not in raw
+ stage='helper_source';source_refs=[]
+ fd=fds[0]
+ for part in ('usr','local','libexec','command-center-inventory-refresh'):
+  child=os.open(part,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW,dir_fd=fd);fds.append(child);source_refs.append((fd,part,child));fd=child
+  info=os.fstat(fd);assert stat.S_ISDIR(info.st_mode) and info.st_uid==0 and not info.st_mode&0o022
+ source='inventory_refresh_observation.py';source_fd=os.open(source,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK,dir_fd=fd)
+ def stable(info):return (info.st_dev,info.st_ino,info.st_uid,info.st_gid,info.st_mode,info.st_nlink,info.st_size,info.st_mtime_ns,info.st_ctime_ns)
+ try:
+  info=os.fstat(source_fd);assert stat.S_ISREG(info.st_mode) and info.st_uid==0 and not info.st_mode&0o022 and info.st_nlink==1 and 0<info.st_size<=65536
+  raw=b''
+  while True:
+   chunk=os.read(source_fd,65537-len(raw))
+   if not chunk:break
+   raw+=chunk;assert len(raw)<=65536
+  assert len(raw)==info.st_size
+  path='/usr/local/libexec/command-center-inventory-refresh/'+source
+  compiled=compile(raw,path,'exec',dont_inherit=True)
+  assert stable(os.fstat(source_fd))==stable(info)==stable(os.stat(source,dir_fd=fd,follow_symlinks=False))
+  for parent,part,child in source_refs:
+   named=os.stat(part,dir_fd=parent,follow_symlinks=False);opened=os.fstat(child)
+   assert stat.S_ISDIR(named.st_mode) and named.st_uid==0 and not named.st_mode&0o022 and (named.st_dev,named.st_ino)==(opened.st_dev,opened.st_ino)
+  name='inventory_refresh_observation';assert name not in sys.modules
+  observation=types.ModuleType(name);observation.__file__=path;sys.modules[name]=observation
+  exec(compiled,observation.__dict__)
+ finally:os.close(source_fd)
+ dpkg=observation._Ancestry.open(fds[0],('var','lib','dpkg'));dpkg.verify()
+ stage='installed_before'
+ installed_before=observation.installed_fingerprint(dpkg.fds[-1],0,deadline,clock)
  config='/var/cache/command-center-inventory-refresh/generation-'+sys.argv[1]+'/_inventory-reader/apt.conf'
  env={'PATH':'/usr/sbin:/usr/bin:/sbin:/bin','LC_ALL':'C','LANG':'C','APT_CONFIG':config}
  stage='query'
@@ -924,17 +962,27 @@ try:
  assert re.search(rb'(?m)^\s*Candidate: 1\.0\s*$',result.stdout)
  stage='pin'
  assert re.search(rb'(?m)^\s*(?:\*\*\*\s+)?1\.0\s+123\s*$',result.stdout)
+ stage='installed_after'
+ installed_after=observation.installed_fingerprint(dpkg.fds[-1],0,deadline,clock);dpkg.verify()
+ assert installed_before==installed_after
+ scan_finished=clock()
+ print(json.dumps({'schema_version':1,'observation_nonce':sys.argv[5],'boot_id':sys.argv[3],
+  'cache_generation':sys.argv[1],'policy_generation':sys.argv[2],'scan_started_boottime_ms':scan_started,
+  'scan_finished_boottime_ms':scan_finished,'installed_before_sha256':installed_before,'installed_after_sha256':installed_after},sort_keys=True))
 finally:
  try:
-  if lease is not None:os.close(lease)
+  if dpkg is not None:dpkg.close()
  finally:
-  for fd in reversed(fds):os.close(fd)
+  try:
+   if lease is not None:os.close(lease)
+  finally:
+   for fd in reversed(fds):os.close(fd)
 """
 
 
 def projected_reader_program():
     # Controlled stage/kind only: no exception text, APT output or policy bytes.
-    return "import json,sys\nstage='identity'\ntry:\n"+''.join(' '+line+'\n' for line in PROJECTED_READER_CODE.splitlines())+"except BaseException as error:\n allowed=('identity','private_inputs','generation','manifest','config','query','query_result','candidate','pin')\n kind=type(error).__name__\n print('projected_reader_failure='+json.dumps({'stage':stage if stage in allowed else 'unknown','kind':kind if kind in ('AssertionError','OSError','ValueError','PermissionError','FileNotFoundError','TimeoutExpired') else 'unclassified'},sort_keys=True),file=sys.stderr)\n raise SystemExit(74)\n"
+    return "import json,sys\nstage='identity'\ntry:\n"+''.join(' '+line+'\n' for line in PROJECTED_READER_CODE.splitlines())+"except BaseException as error:\n allowed=('identity','private_inputs','generation','manifest','config','query','query_result','candidate','pin','helper_source','installed_before','installed_after')\n kind=type(error).__name__\n print('projected_reader_failure='+json.dumps({'stage':stage if stage in allowed else 'unknown','kind':kind if kind in ('AssertionError','OSError','ValueError','PermissionError','FileNotFoundError','TimeoutExpired') else 'unclassified'},sort_keys=True),file=sys.stderr)\n raise SystemExit(74)\n"
 
 
 def prove_projected_reader_query(offer):
@@ -946,12 +994,28 @@ def prove_projected_reader_query(offer):
         'MemoryAccounting=yes','TasksMax=8','NoNewPrivileges=yes','CapabilityBoundingSet=','AmbientCapabilities=',
         'ProtectSystem=strict','ProtectHome=yes','ProtectControlGroups=yes','PrivateDevices=yes','PrivateTmp=yes','PrivateNetwork=yes'):
         args+=['-p',value]
-    args+=['/usr/bin/python3','-I','-B','-S','-c',projected_reader_program(),offer['cache_generation'],offer['policy_generation']]
-    result=subprocess.run(args,env=ENV,stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.PIPE,timeout=20)
+    args+=['/usr/bin/python3','-I','-B','-S','-c',projected_reader_program(),offer['cache_generation'],offer['policy_generation'],offer['boot_id'],str(offer['expires_boottime_ms']),offer['nonce']]
+    result=subprocess.run(args,env=ENV,stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=20)
     if result.returncode:
         lines=[line.decode('ascii') for line in result.stderr.splitlines() if line.startswith(b'projected_reader_failure=') and len(line)<=256]
         raise ValueError('Projected native reader failed: '+str(result.returncode)+' '+(' '.join(lines[:1])))
+    assert len(result.stdout)<=2048
+    return json.loads(result.stdout)
+
+def match_projected_reader_receipt(offer,reader,receipt):
+    fields={'schema_version','observation_nonce','boot_id','cache_generation','policy_generation',
+        'scan_started_boottime_ms','scan_finished_boottime_ms','installed_before_sha256','installed_after_sha256'}
+    assert type(reader) is dict and set(reader)==fields and type(reader['schema_version']) is int and reader['schema_version']==1
+    for field in ('boot_id','cache_generation','policy_generation'):assert reader[field]==offer[field]
+    assert reader['observation_nonce']==offer['nonce'] and all(receipt[key]==value for key,value in offer.items())
+    assert receipt['outcome']=='released'
+    values=[reader['installed_before_sha256'],reader['installed_after_sha256'],receipt['installed_before_sha256'],receipt['installed_after_sha256']]
+    assert all(type(value) is str and re.fullmatch('[0-9a-f]{64}',value) for value in values) and len(set(values))==1
+    times=[reader['scan_started_boottime_ms'],reader['scan_finished_boottime_ms']]
+    assert all(type(value) is int and 0<=value<=9007199254740991 for value in times)
+    assert offer['lock_open_boottime_ms']<=times[0]<=times[1]<=receipt['lock_held_until_boottime_ms']<=receipt['released_boottime_ms']<=offer['expires_boottime_ms']
     return True
+
 
 def prove_actual_coordinator_entry_loop():
     """GHA-only actual entry, restricted inbox actor and controlled policy refusal."""
@@ -1080,7 +1144,7 @@ def prove_actual_coordinator_entry_loop():
             with Store(cache,0,READER,WORKER).lease_current() as lease:
                 assert lease.manifest['cache_generation']==offer['cache_generation']
                 for item in lease.manifest['files']:lease.verify_index(item['path'])
-                assert prove_projected_reader_query(offer)
+                reader_proof=prove_projected_reader_query(offer)
         finally:os.close(cache)
         actor('release');limit=time.monotonic()+10
         while True:
@@ -1088,7 +1152,7 @@ def prove_actual_coordinator_entry_loop():
             if receipt is not None and receipt['nonce']==nonce:break
             receipt=None;assert launcher.poll() is None and time.monotonic()<limit;time.sleep(.02)
         assert value['observation_lease'] is None and all(receipt[key]==item for key,item in offer.items())
-        assert receipt['installed_before_sha256']==receipt['installed_after_sha256']
+        assert match_projected_reader_receipt(offer,reader_proof,receipt)
         invalidate_policy()
         assert launcher.wait(timeout=35)==74
         final=confirm_inert();assert final['ExecMainCode']=='1' and final['ExecMainStatus']=='74' and final['Result']=='exit-code'
@@ -1109,7 +1173,8 @@ def prove_actual_coordinator_entry_loop():
     assert proved
     return {'fixed_coordinator_entry_loop_and_controlled_policy_refusal_verified':True,
         'restricted_reporter_actual_entry_observation_receipt_verified':True,
-        'projected_reader_policy_native_query_verified':True}
+        'projected_reader_policy_native_query_verified':True,
+        'restricted_reporter_fingerprint_matches_root_receipt_verified':True}
 
 def is_live_worker(raw,*,parent=None):
     try:
