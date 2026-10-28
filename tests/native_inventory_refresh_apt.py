@@ -179,12 +179,34 @@ def prove_privilege_transition():
         raise AssertionError('Fixed source admission rejected; component ownership/mode/link checks='+repr(checks)) from None
     code="import sys;sys.stdout.buffer.write(open('/proc/self/status','rb').read(65537))"
     fixed=list(worker_argv(WORKER,WORKER)[:-1])+['-c',code]
+    probe=LIB_ROOT/'transition-probe.py'
+    # A diagnostic-only nested Python launch reproduces the guardian's process
+    # boundary and exact sandbox. Its child only reads /proc/self/status.
+    errors=['keep process capabilities failed','activate capabilities','reactivate capabilities',
+            'apply bounding set','apply capabilities','setresuid failed','setresgid failed',
+            'setgroups failed','disallow granting new privileges failed','failed to execute']
+    source=('import subprocess,sys\n'
+            'result=subprocess.run('+repr(fixed)+',env='+repr(ENV)+',stdin=subprocess.DEVNULL,'
+            'stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=5)\n'
+            'if result.returncode:\n'
+            ' labels=[label for label in '+repr(errors)+' if label.encode() in result.stderr]\n'
+            ' print("transition_failure="+str(result.returncode)+":"+(",".join(labels) if labels else "unclassified"),file=sys.stderr)\n'
+            'sys.stdout.buffer.write(result.stdout)\n'
+            'raise SystemExit(result.returncode)\n')
+    probe.write_text(source)
+    probe.chmod(0o444)
     args=['/usr/bin/systemd-run','--quiet','--wait','--collect','--pipe',
         '--unit=command-center-inventory-privilege-proof','--slice='+WORKER_SLICE,
         '-p','User=root','-p','Group=root','-p','NoNewPrivileges=yes',
-        '-p','CapabilityBoundingSet=CAP_KILL CAP_SETUID CAP_SETGID CAP_SETPCAP']+fixed
-    result=subprocess.run(args,env=ENV,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,timeout=10)
-    assert result.returncode==0, 'Fixed privilege transition failed (no native output published)'
+        '-p','CapabilityBoundingSet=CAP_KILL CAP_SETUID CAP_SETGID CAP_SETPCAP',
+        '-p','ProtectSystem=strict','-p','ProtectHome=yes','-p','ProtectControlGroups=yes',
+        '-p','RestrictNamespaces=yes','-p','PrivateDevices=yes','-p','PrivateTmp=yes',
+        '-p','InaccessiblePaths=/tmp /var/tmp /dev/shm',
+        '/usr/bin/python3','-I','-B',str(probe)]
+    result=subprocess.run(args,env=ENV,stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=10)
+    if result.returncode!=0:
+        labels=re.findall(rb'transition_failure=[0-9]{1,3}:[a-z ,]+',result.stderr)
+        raise AssertionError('Fixed full-sandbox privilege transition failed: '+repr(labels[:1]))
     assert is_live_worker(result.stdout), 'Kernel privilege state rejected after fixed transition'
 
 
