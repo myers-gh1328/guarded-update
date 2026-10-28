@@ -976,7 +976,14 @@ def prove_actual_coordinator_entry_loop():
         limit=time.monotonic()+5
         while True:
             value=properties()
-            if value['LoadState']=='loaded':pin(value);break
+            if value['LoadState']=='loaded':
+                assert value['Transient']=='yes' and value['Description']==description
+                # StartTransientUnit can expose the registered object before
+                # its start job assigns InvocationID. Waiting grants no ownership.
+                if value['InvocationID']:
+                    pin(value)
+                    if group is not None:break
+            else:assert value['LoadState']=='not-found'
             assert launcher.poll() is None and time.monotonic()<limit;time.sleep(.02)
         assert group is not None
         actor('observation');limit=time.monotonic()+10

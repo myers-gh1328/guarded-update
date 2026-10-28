@@ -63,5 +63,21 @@ class PublisherHarnessTests(unittest.TestCase):
         write=Mock(side_effect=OSError('synthetic post-truncate fsync failure'))
         self.assertTrue(scope['exercise'](write));write.assert_called_once_with(b'{}')
 
+    def test_entry_start_waits_for_invocation_instead_of_claiming_loaded_object(self):
+        tree=ast.parse((Path(__file__).parent/'native_inventory_refresh_apt.py').read_bytes())
+        proof=next(node for node in tree.body if isinstance(node,ast.FunctionDef) and node.name=='prove_actual_coordinator_entry_loop')
+        attempt=next(node for node in proof.body if isinstance(node,ast.Try) and any(isinstance(child,ast.While) for child in node.body))
+        loop=next(node for node in attempt.body if isinstance(node,ast.While))
+        pending={'LoadState':'loaded','InvocationID':'','Transient':'yes','Description':'synthetic-owned'}
+        ready={**pending,'InvocationID':'a'*32}
+        properties=Mock(side_effect=[pending,ready]);clock=Mock();clock.monotonic.return_value=0
+        scope={'properties':properties,'description':'synthetic-owned','group':None,'limit':1,
+               'launcher':SimpleNamespace(poll=lambda:None),'time':clock}
+        def pin(value):
+            self.assertEqual(value['InvocationID'],'a'*32);scope['group']=object()
+        claiming=Mock(side_effect=pin);scope['pin']=claiming
+        exec(compile(ast.Module(body=[loop],type_ignores=[]),'<entry-start>','exec'),scope)
+        claiming.assert_called_once_with(ready);clock.sleep.assert_called_once_with(.02)
+
 
 if __name__=='__main__':unittest.main()
