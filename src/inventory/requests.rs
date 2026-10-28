@@ -1051,6 +1051,27 @@ impl Journal {
         }
         Ok(())
     }
+    fn historical_collection_safe(&self) -> Result<()> {
+        require(!self.collection.last_terminal.as_ref().is_some_and(|last| {
+            !last.proof.ready()
+                && (last.submitted
+                    || matches!(
+                        last.pending_status,
+                        ClientStatus::Running | ClientStatus::Unconfirmed
+                    ))
+        }))
+    }
+    fn collection_only_safe(&self) -> Result<()> {
+        self.historical_collection_safe()?;
+        require(
+            self.manual.active.is_none()
+                && !self
+                    .manual
+                    .last_terminal
+                    .as_ref()
+                    .is_some_and(|e| e.submitted && !e.proof.ready()),
+        )
+    }
     fn encode(&self) -> Result<Vec<u8>> {
         self.validate()?;
         let bytes = serde_json::to_vec(self).map_err(|_| "Cannot encode request journal")?;
@@ -1063,6 +1084,21 @@ pub enum Admission {
     New,
     Duplicate,
     Terminal,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CollectionRecovery {
+    Idle,
+    Waiting,
+    Unfinished,
+    Ready,
+    Superseded,
+}
+/// Descriptor derived from the actual protected latest report bytes, never a receipt.
+pub struct RetainedInventory {
+    pub enrollment_id: String,
+    pub report_id: String,
+    pub sequence: u64,
+    pub sha256: String,
 }
 /// All access borrows the existing inventory process lock. No second scheduler
 /// or independent writer is introduced. Failed/uncertain persistence poisons
@@ -1218,6 +1254,9 @@ impl<'a> RequestJournal<'a> {
             if let Delivery::Collection(d) = &delivery {
                 require(d.source_revision == source_revision)?;
             }
+            // New admission must not prune the only retained evidence of an
+            // older physical operation whose logical request already ended.
+            j.historical_collection_safe()?;
             let nonce = j.counters.reserve(
                 match cap {
                     Capability::Manual => OperationDomain::Helper,
@@ -1298,6 +1337,62 @@ impl<'a> RequestJournal<'a> {
             .map(|e| e.status(&self.journal.enrollment_id))
             .transpose()
     }
+    pub fn recover_collection(
+        &mut self,
+        latest: Option<&RetainedInventory>,
+    ) -> Result<CollectionRecovery> {
+        if let Some(latest) = latest {
+            require(
+                latest.enrollment_id == self.journal.enrollment_id
+                    && uuid(&latest.report_id)
+                    && positive(latest.sequence)
+                    && hex(&latest.sha256, 64),
+            )?;
+        }
+        self.change(|j| {
+            // Logical cancellation/source failure is not a native cleanup receipt.
+            // Retain the physical-work fence even after canonical terminal state.
+            if let Some(last) = j.collection.last_terminal.as_ref()
+                && !last.proof.ready()
+                && (last.submitted
+                    || matches!(
+                        last.pending_status,
+                        ClientStatus::Running | ClientStatus::Unconfirmed
+                    ))
+            {
+                return Ok(CollectionRecovery::Unfinished);
+            }
+            let Some(entry) = j.collection.active.as_mut() else {
+                return Ok(CollectionRecovery::Idle);
+            };
+            if entry.pending_status == ClientStatus::ResultSuperseded {
+                return Ok(CollectionRecovery::Superseded);
+            }
+            if let Some(report) = &entry.report {
+                if latest.is_some_and(|latest| {
+                    latest.report_id == report.id
+                        && latest.sequence == report.sequence
+                        && latest.sha256 == report.sha256
+                }) {
+                    return Ok(CollectionRecovery::Ready);
+                }
+                entry.pending_status = ClientStatus::ResultSuperseded;
+                entry.reason = Some("result_superseded".into());
+                return Ok(CollectionRecovery::Superseded);
+            }
+            if entry.submitted
+                || matches!(
+                    entry.pending_status,
+                    ClientStatus::Running | ClientStatus::Unconfirmed
+                )
+            {
+                entry.pending_status = ClientStatus::Unconfirmed;
+                entry.reason = Some("unavailable".into());
+                return Ok(CollectionRecovery::Unfinished);
+            }
+            Ok(CollectionRecovery::Waiting)
+        })
+    }
     pub fn begin(
         &mut self,
         cap: Capability,
@@ -1327,6 +1422,72 @@ impl<'a> RequestJournal<'a> {
                 entry.pending_status = ClientStatus::Running;
             }
             Ok(entry.proof.nonce().into())
+        })
+    }
+    /// Notice intentional replacement before discarding the single retained body.
+    pub fn before_daily_collection(&mut self) -> Result<()> {
+        self.change(|j| {
+            // Manual work needs the verified helper/cleanup adapter before this
+            // collection-only lifecycle can safely replace its retained evidence.
+            j.collection_only_safe()?;
+            if let Some(entry) = j.collection.active.as_mut() {
+                if entry.report.is_some() && entry.proof.ready() {
+                    entry.pending_status = ClientStatus::ResultSuperseded;
+                    entry.reason = Some("result_superseded".into());
+                } else {
+                    require(
+                        !entry.submitted
+                            && !matches!(
+                                entry.pending_status,
+                                ClientStatus::Running | ClientStatus::Unconfirmed
+                            ),
+                    )?;
+                }
+            }
+            Ok(())
+        })
+    }
+    /// Atomically freeze a requested scan before any native process may start.
+    pub fn start_collection(
+        &mut self,
+        report_id: &str,
+        sequence: u64,
+        source_revision: u64,
+        clock: &Clock,
+        session: &Negotiated,
+    ) -> Result<CollectionProof> {
+        clock.validate()?;
+        self.change(|j| {
+            j.collection_only_safe()?;
+            let entry = j
+                .collection
+                .active
+                .as_mut()
+                .ok_or("No active collection request")?;
+            require(
+                entry.pending_status == ClientStatus::Received
+                    && !entry.submitted
+                    && session.allows(Capability::Collection)
+                    && entry.acknowledged_nonce.as_deref() == Some(entry.proof.nonce())
+                    && entry.source_revision == source_revision
+                    && entry.proof.boot() == clock.boot_id
+                    && clock.boottime_ms >= entry.proof.accepted(),
+            )?;
+            let Proof::Collection(mut proof) = entry.proof.clone() else {
+                return Err("Invalid collection proof".into());
+            };
+            proof.scan = Some(ScanProof {
+                report_id: report_id.into(),
+                sequence,
+                source_revision,
+                started_boottime_ms: clock.boottime_ms,
+                finished_boottime_ms: None,
+            });
+            proof.validate()?;
+            entry.proof = entry.proof.merge(&Proof::Collection(proof.clone()))?;
+            entry.submitted = true;
+            entry.pending_status = ClientStatus::Running;
+            Ok(proof)
         })
     }
     pub fn progress(
@@ -1640,6 +1801,211 @@ impl<'a> RequestJournal<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn collection_only_start_refuses_unreconciled_manual_work_even_after_source_failure() {
+        for terminal in [false, true] {
+            let fixture = Fixture::new();
+            let mut journal = fixture.open();
+            journal
+                .admit(
+                    manual_delivery(1),
+                    1,
+                    &clock(1000),
+                    "aaaaaaaaaaaaaaaa",
+                    &session(),
+                )
+                .unwrap();
+            let manual = journal.pending(Capability::Manual).unwrap().unwrap();
+            journal
+                .canonical(
+                    Capability::Manual,
+                    &canonical(&manual, CanonicalStatus::Delivered, None),
+                )
+                .unwrap();
+            journal
+                .begin(Capability::Manual, &clock(1001), &session())
+                .unwrap();
+            if terminal {
+                journal
+                    .canonical(
+                        Capability::Manual,
+                        &canonical(&manual, CanonicalStatus::Failed, None),
+                    )
+                    .unwrap();
+            }
+            journal
+                .admit(delivery(1), 1, &clock(1002), "bbbbbbbbbbbbbbbb", &session())
+                .unwrap();
+            let collection = journal.pending(Capability::Collection).unwrap().unwrap();
+            journal
+                .canonical(
+                    Capability::Collection,
+                    &canonical(&collection, CanonicalStatus::Delivered, None),
+                )
+                .unwrap();
+            assert!(
+                journal
+                    .start_collection(REPORT, 1, 1, &clock(1003), &session())
+                    .is_err()
+            );
+            assert_eq!(
+                journal
+                    .pending(Capability::Collection)
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                ClientStatus::Received
+            );
+        }
+    }
+    #[test]
+    fn canonical_source_failure_does_not_prove_submitted_native_work_stopped() {
+        let fixture = Fixture::new();
+        let mut journal = fixture.open();
+        journal
+            .admit(delivery(1), 1, &clock(1000), "aaaaaaaaaaaaaaaa", &session())
+            .unwrap();
+        let accepted = journal.pending(Capability::Collection).unwrap().unwrap();
+        journal
+            .canonical(
+                Capability::Collection,
+                &canonical(&accepted, CanonicalStatus::Delivered, None),
+            )
+            .unwrap();
+        journal
+            .begin(Capability::Collection, &clock(1001), &session())
+            .unwrap();
+        let mut failed = canonical(&accepted, CanonicalStatus::Failed, None);
+        failed.request.reason = Some("inventory_authority_changed".into());
+        journal.canonical(Capability::Collection, &failed).unwrap();
+        drop(journal);
+        let mut reopened = fixture.open();
+        assert_eq!(
+            reopened.recover_collection(None).unwrap(),
+            CollectionRecovery::Unfinished
+        );
+    }
+    #[test]
+    fn storage_recovery_distinguishes_idle_waiting_and_matching_ready_bytes() {
+        let fixture = Fixture::new();
+        let mut journal = fixture.open();
+        assert_eq!(
+            journal.recover_collection(None).unwrap(),
+            CollectionRecovery::Idle
+        );
+        journal
+            .admit(delivery(1), 1, &clock(1000), "aaaaaaaaaaaaaaaa", &session())
+            .unwrap();
+        assert_eq!(
+            journal.recover_collection(None).unwrap(),
+            CollectionRecovery::Waiting
+        );
+        assert_eq!(
+            journal
+                .pending(Capability::Collection)
+                .unwrap()
+                .unwrap()
+                .status,
+            ClientStatus::Received
+        );
+        drop(journal);
+        let fixture = Fixture::new();
+        let mut journal = fixture.open();
+        ready_collection(&mut journal, 1);
+        let descriptor = RetainedInventory {
+            enrollment_id: BOOT.into(),
+            report_id: REPORT.into(),
+            sequence: 1,
+            sha256: "c".repeat(64),
+        };
+        assert_eq!(
+            journal.recover_collection(Some(&descriptor)).unwrap(),
+            CollectionRecovery::Ready
+        );
+        let mut foreign = descriptor;
+        foreign.enrollment_id = "00000000-0000-4000-8000-000000000099".into();
+        assert!(journal.recover_collection(Some(&foreign)).is_err());
+        assert_eq!(
+            journal
+                .pending(Capability::Collection)
+                .unwrap()
+                .unwrap()
+                .status,
+            ClientStatus::Running
+        );
+    }
+    #[test]
+    fn reopened_submitted_work_is_unconfirmed_and_never_authorizes_duplicate_collection() {
+        let fixture = Fixture::new();
+        let mut journal = fixture.open();
+        journal
+            .admit(delivery(1), 1, &clock(1000), "aaaaaaaaaaaaaaaa", &session())
+            .unwrap();
+        let accepted = journal.pending(Capability::Collection).unwrap().unwrap();
+        journal
+            .canonical(
+                Capability::Collection,
+                &canonical(&accepted, CanonicalStatus::Delivered, None),
+            )
+            .unwrap();
+        journal
+            .begin(Capability::Collection, &clock(1001), &session())
+            .unwrap();
+        drop(journal);
+        let mut reopened = fixture.open();
+        assert_eq!(
+            reopened.recover_collection(None).unwrap(),
+            CollectionRecovery::Unfinished
+        );
+        assert_eq!(
+            reopened
+                .pending(Capability::Collection)
+                .unwrap()
+                .unwrap()
+                .status,
+            ClientStatus::Unconfirmed
+        );
+        assert!(
+            reopened
+                .begin(Capability::Collection, &clock(1002), &session())
+                .is_err()
+        );
+        assert!(
+            reopened
+                .admit(delivery(2), 1, &clock(1003), "bbbbbbbbbbbbbbbb", &session())
+                .is_err()
+        );
+    }
+    #[test]
+    fn missing_ready_body_becomes_absorbing_supersession_with_metadata_only_recovery() {
+        let fixture = Fixture::new();
+        let mut journal = fixture.open();
+        ready_collection(&mut journal, 1);
+        assert_eq!(
+            journal.recover_collection(None).unwrap(),
+            CollectionRecovery::Superseded
+        );
+        let descriptor = RetainedInventory {
+            enrollment_id: BOOT.into(),
+            report_id: REPORT.into(),
+            sequence: 1,
+            sha256: "c".repeat(64),
+        };
+        assert_eq!(
+            journal.recover_collection(Some(&descriptor)).unwrap(),
+            CollectionRecovery::Superseded
+        );
+        assert_eq!(
+            journal
+                .pending(Capability::Collection)
+                .unwrap()
+                .unwrap()
+                .status,
+            ClientStatus::ResultSuperseded
+        );
+        assert!(!fixture.dir.join("latest.json").exists());
+        assert_eq!(std::fs::read_dir(&fixture.dir).unwrap().count(), 2);
+    }
     #[test]
     fn supersession_is_absorbing_even_through_generic_error_handlers() {
         for intermediate in ["failed", "unconfirmed"] {
