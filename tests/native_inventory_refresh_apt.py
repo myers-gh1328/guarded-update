@@ -399,14 +399,19 @@ finally:
                     'separate_process_observation_receipt':receipt}
     finally:
         try:
-            subprocess.run(['/bin/systemctl','stop',unit],env=ENV,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=10)
-            if launcher is not None:
-                if launcher.poll() is None:launcher.kill()
-                launcher.wait(timeout=5)
-                if launcher.stderr is not None:launcher.stderr.close()
+            try:
+                subprocess.run(['/bin/systemctl','stop',unit],env=ENV,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=10)
+            finally:
+                if launcher is not None:
+                    try:
+                        if launcher.poll() is None:launcher.kill()
+                        launcher.wait(timeout=5)
+                    finally:
+                        if launcher.stderr is not None:launcher.stderr.close()
         finally:
-            if parent is not None:parent.close()
-            os.close(fd)
+            try:
+                if parent is not None:parent.close()
+            finally:os.close(fd)
 
 
 def is_live_worker(raw,*,parent=None):
