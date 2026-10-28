@@ -869,6 +869,76 @@ finally:
 """
 
 
+
+PROJECTED_READER_CODE=r"""import fcntl,hashlib,json,os,re,stat,subprocess,sys
+assert len(sys.argv)==3 and re.fullmatch('[0-9a-f]{32}',sys.argv[1]) and re.fullmatch('[0-9a-f]{64}',sys.argv[2])
+fields=dict(line.split(':',1) for line in open('/proc/self/status').read().splitlines())
+assert all(fields[key].split()==['60002']*4 for key in ('Uid','Gid'))
+assert fields['Groups'].split() in ([],['60002']) and fields['NoNewPrivs'].split()==['1']
+assert all(int(fields[key].strip(),16)==0 for key in ('CapInh','CapPrm','CapEff','CapBnd','CapAmb'))
+assert open('/proc/self/cgroup').read()=='0::/command.slice/command-center.slice/command-center-inventory.slice/command-center-inventory-reader-proof.service\n'
+for path in ('/etc/command-center-inventory-refresh/policy.json','/etc/command-center-inventory-refresh/policy-commitment.key','/etc/command-center-inventory-refresh/apt/auth.conf'):
+ try:fd=os.open(path,os.O_RDONLY|os.O_NOFOLLOW)
+ except PermissionError:pass
+ else:
+  os.close(fd);raise ValueError('Root private reader boundary failed')
+fds=[];lease=None
+try:
+ fd=os.open('/',os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW);fds.append(fd)
+ for part in ('var','cache','command-center-inventory-refresh','generation-'+sys.argv[1]):
+  child=os.open(part,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW,dir_fd=fd);fds.append(child);fd=child
+  info=os.fstat(fd);assert stat.S_ISDIR(info.st_mode) and info.st_uid==0 and not info.st_mode&0o022
+ generation=fd;device=os.fstat(generation).st_dev
+ def read(directory,name,limit):
+  fd=os.open(name,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK,dir_fd=directory)
+  try:
+   info=os.fstat(fd);assert stat.S_ISREG(info.st_mode) and info.st_uid==0 and not info.st_mode&0o022 and info.st_nlink==1 and info.st_dev==device and info.st_size<=limit
+   raw=b''
+   while True:
+    part=os.read(fd,min(65536,limit+1-len(raw)))
+    if not part:break
+    raw+=part;assert len(raw)<=limit
+   assert len(raw)==info.st_size;return raw
+  finally:os.close(fd)
+ lease=os.open('_inventory-lease',os.O_RDONLY|os.O_NOFOLLOW,dir_fd=generation)
+ info=os.fstat(lease);assert stat.S_ISREG(info.st_mode) and info.st_uid==0 and not info.st_mode&0o022 and info.st_nlink==1 and info.st_dev==device
+ fcntl.flock(lease,fcntl.LOCK_SH|fcntl.LOCK_NB)
+ manifest=json.loads(read(generation,'_inventory-manifest.json',4*1024*1024))
+ assert manifest['cache_generation']==sys.argv[1] and manifest['policy_generation']==sys.argv[2]
+ reader=os.open('_inventory-reader',os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW,dir_fd=generation);fds.append(reader)
+ info=os.fstat(reader);assert info.st_uid==0 and not info.st_mode&0o022 and info.st_dev==device
+ for name in ('apt.conf','sources.sources','preferences','empty-main.conf','empty-trusted.gpg','empty-auth.conf'):
+  raw=read(reader,name,4*1024*1024);rows=[row for row in manifest['files'] if row['path']=='_inventory-reader/'+name]
+  assert len(rows)==1 and rows[0]['sha256']==hashlib.sha256(raw).hexdigest() and rows[0]['size']==len(raw)
+  assert b'synthetic-proof-password' not in raw and b'password ' not in raw
+ config='/var/cache/command-center-inventory-refresh/generation-'+sys.argv[1]+'/_inventory-reader/apt.conf'
+ env={'PATH':'/usr/sbin:/usr/bin:/sbin:/bin','LC_ALL':'C','LANG':'C','APT_CONFIG':config}
+ result=subprocess.run(['/usr/bin/apt-cache','policy','inventory-proof'],env=env,cwd='/',stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,timeout=10)
+ assert result.returncode==0 and len(result.stdout)<=65536
+ assert re.search(rb'(?m)^\s*Candidate: 1\.0\s*$',result.stdout)
+ assert re.search(rb'(?m)^\s*(?:\*\*\*\s+)?1\.0\s+123\s*$',result.stdout)
+finally:
+ try:
+  if lease is not None:os.close(lease)
+ finally:
+  for fd in reversed(fds):os.close(fd)
+"""
+
+
+def prove_projected_reader_query(offer):
+    """Actual non-acquiring apt-cache under the aggregate and restricted UID."""
+    unit='command-center-inventory-reader-proof.service'
+    args=['/usr/bin/systemd-run','--quiet','--wait','--collect','--pipe','--unit='+unit,'--slice='+PARENT_SLICE]
+    for value in ('User=60002','Group=60002','Type=exec','ExitType=main','Restart=no','RemainAfterExit=no',
+        'KillMode=control-group','KillSignal=SIGKILL','TimeoutStopSec=1','RuntimeMaxSec=15','OOMPolicy=kill',
+        'MemoryAccounting=yes','TasksMax=8','NoNewPrivileges=yes','CapabilityBoundingSet=','AmbientCapabilities=',
+        'ProtectSystem=strict','ProtectHome=yes','ProtectControlGroups=yes','PrivateDevices=yes','PrivateTmp=yes','PrivateNetwork=yes'):
+        args+=['-p',value]
+    args+=['/usr/bin/python3','-I','-B','-S','-c',PROJECTED_READER_CODE,offer['cache_generation'],offer['policy_generation']]
+    result=subprocess.run(args,env=ENV,stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=20)
+    assert result.returncode==0,'Projected native candidate/pin or private-policy boundary failed'
+    return True
+
 def prove_actual_coordinator_entry_loop():
     """GHA-only actual entry, restricted inbox actor and controlled policy refusal."""
     from inventory_refresh_publisher_profile import publisher_properties
@@ -996,6 +1066,7 @@ def prove_actual_coordinator_entry_loop():
             with Store(cache,0,READER,WORKER).lease_current() as lease:
                 assert lease.manifest['cache_generation']==offer['cache_generation']
                 for item in lease.manifest['files']:lease.verify_index(item['path'])
+                assert prove_projected_reader_query(offer)
         finally:os.close(cache)
         actor('release');limit=time.monotonic()+10
         while True:
@@ -1023,7 +1094,8 @@ def prove_actual_coordinator_entry_loop():
             if group is not None:os.close(group)
     assert proved
     return {'fixed_coordinator_entry_loop_and_controlled_policy_refusal_verified':True,
-        'restricted_reporter_actual_entry_observation_receipt_verified':True}
+        'restricted_reporter_actual_entry_observation_receipt_verified':True,
+        'projected_reader_policy_native_query_verified':True}
 
 def is_live_worker(raw,*,parent=None):
     try:
@@ -1367,7 +1439,7 @@ def main():
                 'trust': {'keys': [{'id': 'fixture', 'format': 'gpg',
                                     'content_base64': base64.b64encode(signing_key).decode()}],
                           'tls_ca_base64': base64.b64encode(certificate_path.read_bytes()).decode()},
-                'pins': [], 'proxy': {'http': 'DIRECT', 'https': 'DIRECT'},
+                'pins': [{'package':'inventory-proof','match':{'version':'1.0'},'priority':123}], 'proxy': {'http': 'DIRECT', 'https': 'DIRECT'},
                 'auth': [{'machine': uri, 'login': 'fixture', 'password': password}]}
             if missing:
                 extra = dict(value['sources'][0], id='missing', uri=uri+'/missing')

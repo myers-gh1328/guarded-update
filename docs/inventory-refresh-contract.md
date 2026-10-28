@@ -1091,3 +1091,33 @@ disabled provisioning workflow. Initial namespaces/unit provenance, reserved
 identities, complete startup resource charging, real repository/headroom fit,
 client/helper integration, enrollment/pilot and explicit source handoff remain
 activation gates. Building this archive does not satisfy them.
+
+### Generation-bound noncredential reader policy
+
+A refreshed index alone is insufficient for trustworthy candidate comparison.
+The reader must also use the admitted architectures, source definitions and pins,
+rather than host APT defaults. The root policy guard renders an immutable
+noncredential projection for exactly one chosen cache generation and opaque policy
+commitment. Storage rejects cross-generation/policy substitution before sealing.
+Worker-created `_inventory-reader` entries are rejected; only root adds the fixed
+readonly reader files/empty directory, counted inside existing byte/inode limits
+and hashed into the completed generation before pointer publication.
+
+The fixed reader APT_CONFIG redirects both config parts and main before normal
+loading, clears binary overrides, selects that generation's lists/source/pins and
+actual native installed status, and disables binary cache/log writes. Source and
+pin definitions are reporting operational metadata; auth, proxies, commitment key
+and private credentials are omitted. No update/install command is added.
+
+The internal framed policy-commitment schema now includes the static reader
+template and reserved namespace (schema 2). Expanded random generation paths are
+not part of policy identity. Template/namespace changes therefore invalidate prior
+policy generations; old cache evidence cannot silently adopt new semantics. Public
+status and private journal schemas remain unchanged. Projectionless legacy/test
+generations are unsupported by the new reader, with Unknown candidate reliability.
+
+Pure/descriptor tests cover exact bytes, credential exclusion, immutable bindings,
+worker collision and resource bounds. Native candidate/pin and config-loading
+behavior must pass under the restricted reader identity before any freshness claim.
+The executable reporting client remains disconnected from this projection until
+its native scan/receipt and durable lifecycle integration passes.

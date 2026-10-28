@@ -2,6 +2,7 @@
 import ast
 import io
 import stat
+import re
 import sys
 from types import SimpleNamespace
 from pathlib import Path
@@ -78,6 +79,21 @@ class PublisherHarnessTests(unittest.TestCase):
         claiming=Mock(side_effect=pin);scope['pin']=claiming
         exec(compile(ast.Module(body=[loop],type_ignores=[]),'<entry-start>','exec'),scope)
         claiming.assert_called_once_with(ready);clock.sleep.assert_called_once_with(.02)
+
+    def test_projected_reader_native_candidate_and_pin_assertions_accept_real_format(self):
+        tree=ast.parse((Path(__file__).parent/'native_inventory_refresh_apt.py').read_bytes())
+        code=next(node.value.value for node in tree.body if isinstance(node,ast.Assign) and
+            any(isinstance(target,ast.Name) and target.id=='PROJECTED_READER_CODE' for target in node.targets))
+        body=ast.parse(code)
+        checks=[node for node in ast.walk(body) if isinstance(node,ast.Assert) and isinstance(node.test,ast.Call) and
+            isinstance(node.test.func,ast.Attribute) and node.test.func.attr=='search']
+        self.assertEqual(len(checks),2)
+        sample=b'inventory-proof:\n  Installed: (none)\n  Candidate: 1.0\n  Version table:\n     1.0 123\n        500 https://127.0.0.1/repo proof/main arm64 Packages\n'
+        exec(compile(ast.Module(body=checks,type_ignores=[]),'<native-candidate>','exec'),{'re':re,'result':SimpleNamespace(stdout=sample)})
+        cgroups=[node.test.comparators[0] for node in ast.walk(body) if isinstance(node,ast.Assert) and
+            isinstance(node.test,ast.Compare) and isinstance(node.test.comparators[0],ast.Constant) and
+            isinstance(node.test.comparators[0].value,str) and node.test.comparators[0].value.startswith('0::/')]
+        self.assertEqual(len(cgroups),1);self.assertTrue(cgroups[0].value.endswith('\n'))
 
 
 if __name__=='__main__':unittest.main()
