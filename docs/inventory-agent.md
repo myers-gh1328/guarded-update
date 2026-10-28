@@ -26,6 +26,10 @@ restarts, SSH, sudo or macOS system-update installation. Metadata refresh is
 explicitly `deferred/not_configured`; cached metadata may miss newer updates.
 Only an explicit installed-version match in Homebrew outdated data establishes
 an available update. Every other latest-version comparison remains unknown.
+Multiple installed Homebrew versions are retained together in one package row;
+the active version and latest-version comparison remain Unknown. Malformed or
+duplicate Homebrew installed-package evidence makes the scan partial instead
+of silently dropping rows or publishing duplicate identities.
 System Information failure preserves independently readable Homebrew inventory
 as partial. Manual/portable applications and other users' inaccessible apps
 remain coverage gaps. System updates, CVEs, service telemetry and logs are not
