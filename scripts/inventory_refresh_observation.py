@@ -368,6 +368,21 @@ class Observation:
         self._last_time=current
         return current
 
+    def lease(self):
+        if self._used:
+            raise ObservationError('state_inconsistent')
+        identity=self._identity
+        try:
+            self._guard.verify()
+            _deadline(identity.expires_boottime_ms,self._time)
+            return {'nonce':identity.nonce,'boot_id':identity.boot_id,
+                    'cache_generation':identity.cache_generation,'policy_generation':identity.policy_generation,
+                    'lock_open_boottime_ms':identity.lock_open_boottime_ms,
+                    'expires_boottime_ms':identity.expires_boottime_ms}
+        except BaseException:
+            self.abort()
+            raise
+
     def finish(self, nonce):
         if self._used:
             raise ObservationError('state_inconsistent')

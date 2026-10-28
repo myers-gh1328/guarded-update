@@ -14,6 +14,7 @@ import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]/'scripts'))
 from inventory_refresh_observation import NativeReadLocks, Observation
+from inventory_refresh_status import PublicStatus
 
 TRY_LOCK = '''import fcntl, os, sys
 fd=os.open(sys.argv[1],os.O_RDWR|os.O_NOFOLLOW)
@@ -48,16 +49,24 @@ def main():
     try:
         observation = Observation.begin(guard, '0000000000000001'+'a'*16, boot,
                                         'b'*32, 'c'*64, accepted, clock)
+        active=observation.lease()
         for path, namespace in LOCKS:
             assert attempt(path, namespace) == 75, 'Native writer exclusion failed'
         receipt = observation.finish('0000000000000001'+'a'*16)
         assert receipt['outcome'] == 'released'
+        assert all(receipt[field]==value for field,value in active.items())
+        document={'schema_version':1,'operation_nonce':None,'phase':'unconfirmed','reason':'cache_unavailable',
+                  'policy_generation':None,'cache_generation':None,'successful_checked_at':None,
+                  'started_at':None,'finished_at':None,'attempt':None,'observation_lease':None,
+                  'observation_receipt':receipt}
+        assert json.loads(PublicStatus.create(document).encoded())['observation_receipt']==receipt
         assert receipt['installed_before_sha256'] == receipt['installed_after_sha256']
         for path, namespace in LOCKS:
             assert attempt(path, namespace) == 0, 'Owned lock release failed'
         return {'schema_version': 1, 'scope': 'native_observation_primitives',
                 'cache_policy_identities': 'synthetic', 'native_package_writer_exclusion': True,
                 'actual_executor_guard_exclusion': True, 'fixed_ancestry_verified': True,
+                'active_open_matches_released_receipt': True, 'typed_public_status_validated': True,
                 'installed_state_unchanged_during_observation': True, 'receipt': receipt,
                 'independent_deadline_enforcement_verified': False,
                 'durable_coordinator_verified': False, 'cache_pin_verified': False}

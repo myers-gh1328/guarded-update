@@ -11,6 +11,7 @@ import sys
 
 from inventory_refresh_observation import _Ancestry, _identity, _stable
 from inventory_refresh_protocol import correlator
+from inventory_refresh_status import PublicStatus
 
 CAPABILITIES = ('refresh', 'observation', 'release')
 
@@ -176,7 +177,7 @@ def _status_directory(fd, owner, reader_gid):
 
 
 class StatusPublisher:
-    """Trusted root byte sink only; strict status builder is an integration gate."""
+    """Typed public status publisher; byte sink is private to the coordinator."""
     def __init__(self, directory, journal, reader_gid, *, owner=0):
         self._directory=None
         self._ancestry=None
@@ -244,6 +245,11 @@ class StatusPublisher:
                 os.close(fd)
         except OSError:
             raise IOErrorState('state_inconsistent') from None
+
+    def publish(self, status):
+        if type(status) is not PublicStatus:
+            raise IOErrorState('invalid_request')
+        self._publish(status.encoded())
 
     def _publish(self, raw):
         self._journal._locked()

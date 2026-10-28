@@ -239,6 +239,24 @@ class NativeObservationTests(unittest.TestCase):
         finally:
             guard.close()
 
+    def test_active_lease_reports_actual_frozen_open_time_before_any_scan(self):
+        nonce='0000000000000001'+'a'*16
+        boot='11111111-1111-4111-8111-111111111111'
+        guard=p.NativeReadLocks.acquire(self.dpkg_fd,self.runtime_fd,owner=os.getuid())
+        observation=p.Observation.begin(guard,nonce,boot,'b'*32,'c'*64,99,lambda:(boot,100))
+        try:
+            lease=observation.lease()
+            self.assertEqual(lease,{'nonce':nonce,'boot_id':boot,'cache_generation':'b'*32,
+                                    'policy_generation':'c'*64,'lock_open_boottime_ms':100,
+                                    'expires_boottime_ms':120100})
+            lease['lock_open_boottime_ms']=0
+            self.assertEqual(observation.lease()['lock_open_boottime_ms'],100)
+            observation.finish(nonce)
+            with self.assertRaises(p.ObservationError):
+                observation.lease()
+        finally:
+            observation.abort()
+
     def test_installed_fingerprint_is_stable_and_distinguishes_missing_empty_and_changed_state(self):
         guard = p.NativeReadLocks.acquire(self.dpkg_fd, self.runtime_fd, owner=os.getuid())
         try:

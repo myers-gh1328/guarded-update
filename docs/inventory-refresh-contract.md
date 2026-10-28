@@ -73,7 +73,8 @@ attempt: null | {
 }
 observation_lease: null | {
   nonce: hex[32], boot_id: UUID, cache_generation: hex[32],
-  policy_generation: lowercase sha256, expires_boottime_ms: safe integer
+  policy_generation: lowercase sha256, lock_open_boottime_ms: safe integer,
+  expires_boottime_ms: safe integer
 }
 observation_receipt: null | {
   nonce: hex[32], boot_id: UUID, cache_generation: hex[32],
@@ -361,3 +362,31 @@ fsync failure does not promise rollback to old bytes. The strict public-status
 schema builder and coordinator ordering remain mandatory before exposing this
 trusted byte sink through an operational helper. There is no executable I/O
 entrypoint or enabled capability in this slice.
+
+The active observation lease includes the actual frozen native lock-opening time.
+This staged-contract field lets the agent persist its observation and scan-start
+identity before native collection; it must not infer opening from expiry or attach
+it retroactively from the later release receipt. No active client capability was
+in use when this local schema was clarified.
+
+## Strict public status construction
+
+Operational publication accepts an immutable `PublicStatus` constructed from the
+exact documented fields. A normal constructor cannot wrap arbitrary bytes. The
+builder copies known fields, validates typed phases/reasons, UTC calendar values,
+positive bounded nonce counters, safe integers and helper identity/time ordering,
+then freezes the encoded bytes. Unknown fields, private policy objects, arrays in
+scalar fields and nonfinite values produce a static rejection. A successful helper
+requires its correlated start/finish attempt, bounded interval and successful
+cache evidence. Non-success states can retain prior successful cache metadata.
+
+Observation leases and last receipts form a separate domain from refresh attempts.
+An active lease must bind the available cache/policy and actual opening/deadline;
+a retained older receipt can remain historical. A released receipt requires equal
+fingerprints and release within its bounded lock interval. Expired/unconfirmed
+outcomes never pass those success checks. A current lease and terminal receipt
+cannot claim the same observation nonce simultaneously.
+
+This builder validates public data; it does not infer lifecycle outcomes or
+attest OS/cache evidence. The root coordinator must still derive each value from
+its durable journal, pinned policy/cache, native handles and confirmed publication.

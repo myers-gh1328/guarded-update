@@ -13,6 +13,7 @@ spec = importlib.util.spec_from_file_location('inventory_refresh_io', ROOT/'scri
 p = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(p)
 from inventory_refresh_state import Journal
+from inventory_refresh_status import PublicStatus
 
 
 class HelperIOTests(unittest.TestCase):
@@ -257,6 +258,19 @@ class HelperIOTests(unittest.TestCase):
             self.assertFalse(failed.exception.may_be_visible)
         self.assertEqual((self.public/'status.json').read_bytes(),old)
         self.assertFalse(any(path.name.startswith('.status-') for path in self.public.iterdir()))
+
+    def test_public_publisher_requires_validated_status_instead_of_raw_private_bytes(self):
+        value={'schema_version':1,'operation_nonce':None,'phase':'deferred','reason':'cache_unavailable',
+               'policy_generation':None,'cache_generation':None,'successful_checked_at':None,
+               'started_at':None,'finished_at':None,'attempt':None,
+               'observation_lease':None,'observation_receipt':None}
+        status=PublicStatus.create(value)
+        with self.journal.exclusive():
+            with self.assertRaises(p.IOErrorState):
+                self.publisher.publish(b'{"private":"synthetic-sensitive-material"}')
+            self.assertFalse((self.public/'status.json').exists())
+            self.publisher.publish(status)
+        self.assertEqual((self.public/'status.json').read_bytes(),status.encoded())
 
     def test_fixed_nonce_read_is_exact_bounded_and_preserves_original_request(self):
         self.assertIsNone(self.reader.read())
