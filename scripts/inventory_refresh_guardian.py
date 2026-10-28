@@ -19,6 +19,19 @@ MAX_SAFE=9_007_199_254_740_991
 ENV={'PATH':'/usr/sbin:/usr/bin:/sbin:/bin','LC_ALL':'C','LANG':'C'}
 
 
+def diagnostic(stage,code=None):
+    # Fixed stages and bounded integers only. Never native stderr or exceptions.
+    if stage not in ('identity','library','accounts','job','boot','spawn','clock','child'):
+        return
+    if code is not None and (type(code) is not int or not -127<=code<=255):
+        return
+    raw='inventory_guardian_stage='+stage+(':'+str(code) if code is not None else '')+'\n'
+    try:
+        os.write(2,raw.encode('ascii'))
+    except OSError:
+        pass
+
+
 def _safe(value):
     return type(value) is int and 0<=value<=MAX_SAFE
 
@@ -43,6 +56,7 @@ def supervise(started,deadline,spawn,clock=boottime_ms,sleep=time.sleep):
     must independently prove cgroup empty and worker-UID exclusion afterwards.
     """
     child=None
+    phase='clock'
     try:
         if not _safe(started) or not _safe(deadline) or not started<deadline<=started+600000:
             return 74
@@ -51,7 +65,9 @@ def supervise(started,deadline,spawn,clock=boottime_ms,sleep=time.sleep):
             return 74
         if previous>=deadline:
             return 76
+        phase='spawn'
         child=spawn()
+        phase='clock'
         while True:
             now=clock()
             if not _safe(now) or now<previous:
@@ -62,9 +78,12 @@ def supervise(started,deadline,spawn,clock=boottime_ms,sleep=time.sleep):
                 return 76
             result=child.poll()
             if result is not None:
+                if result!=0:
+                    diagnostic('child',result)
                 return result if type(result) is int and result in (0,74,75,76) else 74
             sleep(min(0.05,(deadline-now)/1000))
     except (OSError,ValueError,OverflowError):
+        diagnostic(phase)
         if child is not None:
             try:
                 child.kill()
@@ -125,20 +144,28 @@ def load_worker():
 
 
 def guardian_main():
+    phase='identity'
     try:
         if (sys.platform!='linux' or len(sys.argv)!=1 or not sys.flags.isolated or
                 os.getresuid()!=(0,0,0) or os.getresgid()!=(0,0,0)):
+            diagnostic(phase)
             return 74
+        phase='library'
         worker=load_worker()
+        phase='accounts'
         user=pwd.getpwnam('ccrefresh')
         reporter=pwd.getpwnam('ccinventory')
         if (user.pw_uid<=0 or user.pw_gid<=0 or reporter.pw_uid<=0 or reporter.pw_gid<=0 or
                 user.pw_uid==reporter.pw_uid or user.pw_gid==reporter.pw_gid or
                 user.pw_gid in os.getgrouplist('ccinventory',reporter.pw_gid)):
+            diagnostic(phase)
             return 74
+        phase='job'
         job=worker.parse_job(worker.root_file(RUNTIME_ROOT+'/job.json',user.pw_gid))
+        phase='boot'
         with open('/proc/sys/kernel/random/boot_id','r',encoding='ascii') as source:
             if source.read(64).strip()!=job['boot_id']:
+                diagnostic(phase)
                 return 74
         argv=worker_argv(user.pw_uid,user.pw_gid)
         def spawn():
@@ -146,6 +173,7 @@ def guardian_main():
                 stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
         return supervise(job['started_boottime_ms'],job['deadline_boottime_ms'],spawn)
     except (OSError,ValueError,KeyError,ImportError,AttributeError):
+        diagnostic(phase)
         return 74
 
 

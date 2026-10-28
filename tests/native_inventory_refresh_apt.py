@@ -17,8 +17,10 @@ import marshal
 import os
 from pathlib import Path
 import pwd
+import re
 import secrets
 import shutil
+import signal
 import ssl
 import struct
 import subprocess
@@ -150,10 +152,14 @@ def write_root(path, data, mode=0o640):
     temporary.replace(path)
 
 
-def is_live_worker(raw):
+def is_live_worker(raw,*,parent=None):
     try:
         validate_kernel_identity(raw,WORKER,WORKER)
         states=[line.split(b':',1)[1].strip() for line in raw.splitlines() if line.startswith(b'State:')]
+        if parent is not None:
+            parents=[line.split(b':',1)[1].strip() for line in raw.splitlines() if line.startswith(b'PPid:')]
+            if parents!=[str(parent).encode('ascii')]:
+                return False
         return len(states)==1 and not states[0].startswith((b'Z',b'X',b'x'))
     except ValueError:
         return False
@@ -182,7 +188,67 @@ def prove_privilege_transition():
     assert is_live_worker(result.stdout), 'Kernel privilege state rejected after fixed transition'
 
 
-def run_worker(policy, number):
+def stop_owned_child(pid,recheck):
+    # Pin the kernel task before the final membership/identity check; never use
+    # a numeric signal fallback if it exits or pidfds are unavailable.
+    pidfd=os.pidfd_open(pid)
+    try:
+        assert recheck(), 'Fixture child changed before signal'
+        signal.pidfd_send_signal(pidfd,signal.SIGSTOP)
+    finally:
+        os.close(pidfd)
+
+
+def stopped_child_proof(args,job):
+    """CI-owned transient service only; never callable on a user endpoint."""
+    if not (sys.platform=='linux' and os.geteuid()==0 and os.environ.get('GITHUB_ACTIONS')=='true'):
+        raise RuntimeError('Disposable hosted Linux root runner required')
+    # main() has refused existing installations/accounts and created this exact
+    # fixture. Check both its fixed identities before any fixture-owned signal.
+    assert pwd.getpwnam('ccrefresh').pw_uid==WORKER
+    assert pwd.getpwnam('ccinventory').pw_uid==READER
+    assert args[0]=='/usr/bin/systemd-run' and '--unit='+WORKER_UNIT in args
+    launcher=subprocess.Popen(args,env=ENV,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+    try:
+        limit=time.monotonic()+5
+        worker=None
+        while time.monotonic()<limit and launcher.poll() is None:
+            try:
+                owned=cgroup(WORKER_UNIT)
+                transient=command(['/bin/systemctl','show','--property=Transient','--value',WORKER_UNIT]).strip()
+                assert transient==b'yes', 'Refuse non-fixture persistent service'
+                guardian=int(command(['/bin/systemctl','show','--property=MainPID','--value',WORKER_UNIT]))
+                for pid in (owned/'cgroup.procs').read_text().split():
+                    if is_live_worker(Path('/proc',pid,'status').read_bytes(),parent=guardian):
+                        worker=int(pid)
+                        break
+                if worker is not None:
+                    break
+            except (AssertionError,FileNotFoundError,ProcessLookupError,ValueError):
+                pass
+            time.sleep(0.01)
+        assert worker is not None, 'No live fixture worker found'
+        # Recheck cgroup membership and complete unprivileged kernel identity
+        # immediately before stopping only the disposable owned child.
+        def recheck():
+            return (str(worker) in (owned/'cgroup.procs').read_text().split() and
+                    is_live_worker(Path('/proc',str(worker),'status').read_bytes(),parent=guardian))
+        stop_owned_child(worker,recheck)
+        status=launcher.wait(timeout=12)
+        released=time.clock_gettime_ns(time.CLOCK_BOOTTIME)//1_000_000
+        assert status==76 and job['deadline_boottime_ms']<=released<=job['deadline_boottime_ms']+3000
+        empty_worker()
+        return status
+    finally:
+        try:
+            empty_worker()
+        finally:
+            if launcher.poll() is None:
+                launcher.kill()
+            launcher.wait(timeout=5)
+
+
+def run_worker(policy, number, *, stopped_child=False):
     empty_worker()
     token = f'{number:032x}'
     stage = Path(CACHE_ROOT)/('staging-'+token)
@@ -208,7 +274,7 @@ def run_worker(policy, number):
            'policy_generation': policy_generation(b'k'*32, policy),
            'operation_nonce': nonce, 'helper_sequence': number,
            'boot_id': Path('/proc/sys/kernel/random/boot_id').read_text().strip(),
-           'accepted_boottime_ms': now, 'started_boottime_ms': now, 'deadline_boottime_ms': now+600000}
+           'accepted_boottime_ms': now, 'started_boottime_ms': now, 'deadline_boottime_ms': now+(8000 if stopped_child else 600000)}
     write_root(Path(RUNTIME_ROOT)/'job.json', json.dumps(job).encode())
     # PID1 protects the root MAIN guardian; setpriv permanently drops its fixed child.
     args = ['/usr/bin/systemd-run', '--quiet', '--wait', '--collect', '--pipe', '--unit='+WORKER_UNIT,
@@ -222,6 +288,8 @@ def run_worker(policy, number):
         '-p', 'PrivateDevices=yes', '-p', 'PrivateTmp=yes', '-p', 'InaccessiblePaths=/tmp /var/tmp /dev/shm',
         '-p', 'ReadWritePaths='+str(stage), '-p', 'RuntimeMaxSec=610', '-p', 'TimeoutStopSec=1',
         '/usr/bin/python3', '-I', '-B', str(LIB_ROOT/'guardian.py')]
+    if stopped_child:
+        return stopped_child_proof(args,job),token,job['policy_generation']
     result = subprocess.run(args, env=ENV, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=610)
     status = result.returncode
     empty_worker()
@@ -230,6 +298,10 @@ def run_worker(policy, number):
         collision = b'already exists' in result.stderr or b'already loaded' in result.stderr
         reason = 'unit_name_in_use' if collision else 'unclassified_launcher_failure'
         raise AssertionError(f'Fixed worker failed outside its safe exit contract (iteration={number}, exit={status}, reason={reason})')
+    if status!=0:
+        stages=re.findall(rb'inventory_guardian_stage=(?:identity|library|accounts|job|boot|spawn|clock|child)(?::[0-9-]{1,4})?',result.stderr)
+        if stages:
+            print('Native fixture diagnostic: '+b' '.join(stages[:4]).decode('ascii'),file=sys.stderr)
     return status, token, job['policy_generation']
 
 
@@ -308,7 +380,11 @@ def main():
         authorization = 'Basic '+base64.b64encode(('fixture:'+PASSWORD).encode()).decode()
         class Handler(SimpleHTTPRequestHandler):
             requests = 0
+            hold = False
             def do_GET(self):
+                if Handler.hold:
+                    time.sleep(10)
+                    return
                 if self.headers.get('Authorization') != authorization:
                     self.send_response(401)
                     self.send_header('WWW-Authenticate', 'Basic realm="synthetic-fixture"')
@@ -368,12 +444,18 @@ def main():
                 assert lease.manifest['policy_generation'] == generation
         finally:
             os.close(cache)
+        Handler.hold=True
+        run_worker(good,7,stopped_child=True)
+        Handler.hold=False
         proof = {'schema_version': 1, 'scope': 'fixed_worker_trusted_policy',
             'synthetic_repository_only': True, 'target_repository_fit_proven': False,
             'coordinator_exercised': False, 'apt_refresh_exercised': True,
             'root_guardian_fixed_privilege_drop_exercised': True,
             'unadmitted_package_sibling_and_matching_bytecode_ignored': True,
-            'independent_deadline_fault_proof': False,
+            'independent_deadline_fault_proof': True,
+            'native_fault_job_budget_ms': 8000,
+            'stopped_child_killed_by_boottime_deadline': True,
+            'guardian_death_and_oom_fault_proof': False,
             'binary_packages_acquired': True, 'valid_tls_gpg_auth_accepted': True,
             'wrong_ca_rejected': True, 'wrong_gpg_key_rejected': True,
             'wrong_auth_rejected': True, 'expired_metadata_rejected': True,

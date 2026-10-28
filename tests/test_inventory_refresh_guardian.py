@@ -12,6 +12,15 @@ SPEC.loader.exec_module(guardian)
 
 
 class GuardianTests(unittest.TestCase):
+    def test_diagnostics_emit_only_static_stages_and_bounded_numeric_exit(self):
+        with patch.object(guardian.os,'write') as write:
+            guardian.diagnostic('child',127)
+            self.assertEqual(write.call_args.args,(2,b'inventory_guardian_stage=child:127\n'))
+            write.reset_mock()
+            guardian.diagnostic('untrusted secret',127)
+            guardian.diagnostic('child','untrusted secret')
+            write.assert_not_called()
+
     def test_expired_or_invalid_job_never_spawns(self):
         for started,deadline,now in [(100,100,100),(100,600101,101),(100,200,200),(100,200,99)]:
             spawn=Mock()

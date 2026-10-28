@@ -4,7 +4,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import patch, Mock
 
 ROOT = Path(__file__).resolve().parents[1]
 SPEC = importlib.util.spec_from_file_location('native_refresh_apt', ROOT/'tests/native_inventory_refresh_apt.py')
@@ -18,11 +18,24 @@ class NativeRefreshFixtureTests(unittest.TestCase):
                'Gid:\t60001\t60001\t60001\t60001\nGroups:\t\n'
                'CapInh:\t0000000000000000\nCapPrm:\t0000000000000000\n'
                'CapEff:\t0000000000000000\nCapBnd:\t0000000000000000\n'
-               'CapAmb:\t0000000000000000\nNoNewPrivs:\t1\nState:\tS (sleeping)\n').encode()
+               'CapAmb:\t0000000000000000\nNoNewPrivs:\t1\nState:\tS (sleeping)\nPPid:\t1234\n').encode()
         self.assertTrue(native.is_live_worker(valid))
+        self.assertTrue(native.is_live_worker(valid,parent=1234))
+        self.assertFalse(native.is_live_worker(valid,parent=5678))
         self.assertFalse(native.is_live_worker(valid.replace(b'60001\n',b'0\n',1)))
         self.assertFalse(native.is_live_worker(valid.replace(b'S (sleeping)',b'Z (zombie)')))
         self.assertFalse(native.is_live_worker(b'Uid: 60001'))
+
+    def test_stopping_exited_child_never_falls_back_to_recycled_numeric_pid(self):
+        with patch.object(native.os,'pidfd_open',return_value=42,create=True), \
+             patch.object(native.signal,'pidfd_send_signal',side_effect=ProcessLookupError,create=True) as send, \
+             patch.object(native.os,'close') as close, \
+             patch.object(native.os,'kill') as numeric:
+            with self.assertRaises(ProcessLookupError):
+                native.stop_owned_child(123,Mock(return_value=True))
+            send.assert_called_once_with(42,native.signal.SIGSTOP)
+            numeric.assert_not_called()
+            close.assert_called_once_with(42)
 
     def test_multiple_rejected_workers_do_not_reuse_a_retained_failed_unit(self):
         # systemd retains failed transient units by default. Stopping the unit and
