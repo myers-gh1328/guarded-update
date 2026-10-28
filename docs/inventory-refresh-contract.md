@@ -728,3 +728,27 @@ before reading/parsing policy and must hold its current cache/lifecycle guards.
 Policy admission alone proves no service readiness or target resource fit. The
 native fixture uses synthetic inputs and verifies that neither the worker nor
 reporter UID can read either private input.
+
+### Current resource-profile admission
+
+`RuntimeResources.fixed()` checks current membership in the fixed coordinator
+service beneath the inventory aggregate. It pins full root-owned cache/cgroup
+ancestry and binds kernel mount IDs and devices to those descriptors. The cache
+must be a dedicated writable tmpfs with nodev/nosuid/noexec, exactly 128 MiB and
+32,768 inodes; duplicate paths, child mounts and whole/subtree bind aliases are
+unsupported. The cgroup2 mount must expose its full root at the fixed mountpoint.
+
+The aggregate must enforce the initial 256 MiB memory, zero swap and 64-task
+profile. Stricter ancestor settings fail with `resource_limit`; this describes a
+configured-profile mismatch, not observed free headroom. Rechecks validate mount
+flags/identity, byte/inode totals, named references, current membership and limits.
+Failed or closed contexts cannot return retained metrics. Checks perform no
+mount, cgroup, sysctl or pressure-workload writes.
+
+Current membership cannot prove that earlier allocations were charged there.
+The trusted unit must enter the aggregate before Python, policy parsing and cache
+activity. The new disposable probe does that before admitting synthetic policy;
+other existing fixture work outside the aggregate remains explicitly excluded
+from an all-allocators claim. Current/free metrics establish neither repository
+fit nor available capacity. Full coordinator, UID/namespace writer exclusion,
+sensitive-path coverage and real target headroom remain separate gates.

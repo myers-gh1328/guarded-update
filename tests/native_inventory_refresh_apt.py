@@ -416,6 +416,89 @@ finally:
             finally:os.close(fd)
 
 
+def prove_resource_admission(expected_generation):
+    """Read-only new probe starts inside the fixed aggregate before Python."""
+    from inventory_refresh_resources import UNIT
+    assert sys.platform=='linux' and os.geteuid()==0 and os.environ.get('GITHUB_ACTIONS')=='true'
+    show=subprocess.run(['/bin/systemctl','show','--property=LoadState','--value',UNIT],
+        env=ENV,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,timeout=3)
+    assert show.returncode in (0,4) and show.stdout.strip()==b'not-found', 'Refuse existing coordinator unit'
+    modules=('inventory_refresh_protocol','inventory_refresh_observation','inventory_refresh_policy',
+             'inventory_refresh_policy_admission','inventory_refresh_resources')
+    for name in modules:
+        shutil.copyfile(ROOT/'scripts'/(name+'.py'),LIB_ROOT/(name+'.py'))
+        (LIB_ROOT/(name+'.py')).chmod(0o444)
+    # Test-only fixed entry. Admit the whole literal source batch before any
+    # projectexec, with no project sys.path or package/bytecode lookup.
+    source=r"""import json,os,stat,sys,types
+assert sys.platform=='linux' and len(sys.argv)==1 and sys.flags.isolated and sys.flags.dont_write_bytecode
+assert os.getresuid()==(0,0,0) and os.getresgid()==(0,0,0)
+base='/usr/local/libexec/command-center-inventory-refresh'
+names=('inventory_refresh_protocol','inventory_refresh_observation','inventory_refresh_policy','inventory_refresh_policy_admission','inventory_refresh_resources')
+def stable(info):return (info.st_dev,info.st_ino,info.st_uid,info.st_gid,info.st_mode,info.st_nlink,info.st_size,info.st_mtime_ns,info.st_ctime_ns)
+fds=[];refs=[];sources={}
+try:
+ fd=os.open('/',os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW);fds.append(fd)
+ for part in ('usr','local','libexec','command-center-inventory-refresh'):
+  child=os.open(part,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW,dir_fd=fd)
+  fds.append(child);refs.append((fd,part,child));fd=child
+ for opened in fds:
+  info=os.fstat(opened);assert info.st_uid==0 and not info.st_mode&0o022 and stat.S_ISDIR(info.st_mode)
+ for name in names:
+  filename=name+'.py';opened=os.open(filename,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK,dir_fd=fd)
+  try:
+   info=os.fstat(opened)
+   assert info.st_uid==0 and not info.st_mode&0o022 and info.st_nlink==1 and stat.S_ISREG(info.st_mode) and 0<info.st_size<=65536
+   raw=b''
+   while True:
+    chunk=os.read(opened,65537-len(raw))
+    if not chunk:break
+    raw+=chunk;assert len(raw)<=65536
+   assert len(raw)==info.st_size and stable(info)==stable(os.fstat(opened))==stable(os.stat(filename,dir_fd=fd,follow_symlinks=False))
+   sources[name]=raw
+  finally:os.close(opened)
+ for parent,name,child in refs:
+  a=os.stat(name,dir_fd=parent,follow_symlinks=False);b=os.fstat(child)
+  assert stat.S_ISDIR(a.st_mode) and a.st_uid==0 and not a.st_mode&0o022 and (a.st_dev,a.st_ino)==(b.st_dev,b.st_ino)
+finally:
+ failure=None
+ for fd in reversed(fds):
+  try:os.close(fd)
+  except OSError as exc:failure=exc
+ if failure is not None:raise failure
+compiled={name:compile(raw,base+'/'+name+'.py','exec',dont_inherit=True) for name,raw in sources.items()}
+for name in names:
+ assert name not in sys.modules
+ module=types.ModuleType(name);module.__file__=base+'/'+name+'.py';sys.modules[name]=module
+ exec(compiled[name],module.__dict__)
+from inventory_refresh_resources import RuntimeResources
+from inventory_refresh_policy_admission import PolicyGuard
+with RuntimeResources.fixed() as resources:
+ before=resources.sample()
+ with PolicyGuard.fixed() as guard:
+  guard.recheck();generation=guard.generation
+ after=resources.sample()
+print(json.dumps({'fixed_resource_profile_currently_admitted':True,'policy_admission_inside_fixed_aggregate_probe':True,
+ 'all_allocators_charged_from_startup_verified':False,'generation':generation,'metrics':after},sort_keys=True))
+"""
+    probe=LIB_ROOT/'resource-admission-proof.py'
+    probe.write_text(source);probe.chmod(0o444)
+    info=probe.lstat();assert info.st_uid==0 and info.st_nlink==1 and info.st_mode&0o777==0o444
+    args=['/usr/bin/systemd-run','--quiet','--wait','--collect','--pipe','--unit='+UNIT,'--slice='+PARENT_SLICE,
+        '-p','User=0','-p','Group=0','-p','Type=exec','-p','ExitType=main','-p','Restart=no',
+        '-p','KillMode=control-group','-p','KillSignal=SIGKILL','-p','TimeoutStopSec=1','-p','RuntimeMaxSec=30',
+        '-p','OOMPolicy=kill','-p','MemoryAccounting=yes','-p','NoNewPrivileges=yes',
+        '-p','CapabilityBoundingSet=','-p','AmbientCapabilities=','-p','ProtectSystem=full',
+        '-p','ProtectHome=yes','-p','PrivateDevices=yes','-p','RestrictNamespaces=yes',
+        '/usr/bin/python3','-I','-B',str(probe)]
+    result=json.loads(command(args,timeout=40))
+    assert result['generation']==expected_generation
+    assert result['fixed_resource_profile_currently_admitted'] and result['policy_admission_inside_fixed_aggregate_probe']
+    assert not result['all_allocators_charged_from_startup_verified']
+    return {'fixed_resource_profile_currently_admitted':True,'policy_admission_inside_fixed_aggregate_probe':True,
+        'all_allocators_charged_from_startup_verified':False,'aggregate_resource_probe_metrics':result['metrics']}
+
+
 def is_live_worker(raw,*,parent=None):
     try:
         validate_kernel_identity(raw,WORKER,WORKER)
@@ -714,6 +797,7 @@ def main():
             target=Path(POLICY_ROOT)/name;target.write_bytes(data);os.chown(target,0,0);target.chmod(0o600)
         private_policy_guard=PolicyGuard.fixed()
         assert private_policy_guard.generation==policy_generation(b'k'*32,good)
+        resource_proof=prove_resource_admission(private_policy_guard.generation)
         # Real low-privilege UIDs must not read either private root input. The
         # probe checks actual kernel IDs/capabilities before attempting access.
         probe="""import os,sys
@@ -785,7 +869,7 @@ for path in sys.argv[2:]:
             'wrong_auth_rejected': True, 'expired_metadata_rejected': True,
             'any_failed_repository_rejected': True, 'host_hook_excluded': True,
             'previous_current_retained_after_failure': True,
-            'worker_memory_peak': int((cgroup(PARENT_SLICE)/'memory.peak').read_text()),**observation}
+            'worker_memory_peak': int((cgroup(PARENT_SLICE)/'memory.peak').read_text()),**observation,**resource_proof}
     finally:
         try:
             if private_policy_guard is not None:private_policy_guard.close()
