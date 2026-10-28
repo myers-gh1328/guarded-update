@@ -541,3 +541,34 @@ This slice connects actual journal durability and atomic public-file I/O.
 Fixed OS admission, native child-result validation, policy/cache pinning across
 the physical lifecycle and the executable reporter adapter remain required
 before activation. The projection tests do not claim those integration gates.
+
+### Cache-pinned native observation and child metadata
+
+The staged observation reader session pins an actual immutable cache lease
+before acquiring native locks. Its strict schema1 job freezes an opaque job ID,
+operation nonce/sequence, boot, cache/policy/checked time and accepted/start/
+deadline times; start must precede the deadline, bounded by acceptance+120s.
+Fresh time is checked again after cache admission. No request paths, commands,
+URLs, credentials or options exist in this metadata.
+
+Typed child results contain that exact full job plus either an actual opened
+lease, an actual successful release receipt, or a static failure reason. Parsing
+revalidates nested types before comparing the expected job; numeric/boolean
+aliases cannot bypass identity checks. Result identity, actual open>=start,
+expiry<=job deadline, equal installed-state fingerprints and successful release
+ordering are mandatory. Results are immutable snapshots; expected-job matching
+alone does not establish child liveness or prevent same-job opened-result replay.
+The parent must enforce phase progression, current BOOTTIME and owned-child state.
+
+The session holds the cache pin through native unlock. Wrong release nonce
+preserves both scopes; owned failures abort native ownership before closing the
+cache pin, and cleanup failure cannot return success. Index verification uses
+the actual pinned cache and rechecks the native lease before and after reading.
+Root current policy admission/rechecks and durable parent coordination remain
+separate responsibilities.
+
+The disposable signed-repository proof now also exercises actual cache pinning,
+actual published Packages hashes, native installed-state fingerprints and typed
+release results together. Independent observation supervision, observation
+process containment, durable observation coordination and real target fit remain
+explicitly unproven. This library/source integration activates no capability.

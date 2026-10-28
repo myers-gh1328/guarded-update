@@ -34,6 +34,8 @@ from inventory_refresh_policy import parse_policy, render_policy, policy_generat
 from inventory_refresh_storage import Store
 from inventory_refresh_worker import validate_kernel_identity
 from inventory_refresh_guardian import worker_argv, load_worker
+from inventory_refresh_observation import prepare_fixed_executor_guard
+from inventory_refresh_cached_observation import ObservationJob, CachedObservation, ObservationResult
 
 WORKER = 60001
 READER = 60002
@@ -150,6 +152,40 @@ def write_root(path, data, mode=0o640):
     os.chown(temporary, 0, WORKER)
     temporary.chmod(mode)
     temporary.replace(path)
+
+
+def prove_cache_pinned_observation(store):
+    """Actual cache/native-FD integration; no child-process containment claim."""
+    assert sys.platform=='linux' and os.geteuid()==0 and os.environ.get('GITHUB_ACTIONS')=='true'
+    boot=Path('/proc/sys/kernel/random/boot_id').read_text().strip()
+    def clock():
+        return boot,time.clock_gettime_ns(time.CLOCK_BOOTTIME)//1_000_000
+    with store.lease_current() as lease:
+        manifest=lease.manifest
+        indexes=[row for row in manifest['files'] if '_Packages' in row['path']]
+        assert indexes, 'No actual package index in admitted cache'
+        accepted=clock()[1]
+        nonce='0000000000000001'+secrets.token_hex(8)
+        job=ObservationJob.parse(json.dumps({'schema_version':1,'job_id':secrets.token_hex(16),
+            'operation_nonce':nonce,'helper_sequence':1,'boot_id':boot,
+            'cache_generation':manifest['cache_generation'],'policy_generation':manifest['policy_generation'],
+            'successful_checked_at':manifest['successful_checked_at'],'accepted_boottime_ms':accepted,
+            'started_boottime_ms':accepted,'deadline_boottime_ms':accepted+120000}).encode())
+    prepare_fixed_executor_guard()
+    with CachedObservation.begin(store,job,clock) as session:
+        opened=ObservationResult.parse(session.opened_result().encoded(),expected_job=job)
+        for row in indexes:
+            count,digest=session.verify_cache_index(row['path'])
+            assert count==row['size'] and digest==row['sha256']
+        released=ObservationResult.parse(session.finish(nonce).encoded(),expected_job=job)
+    active=opened.document()['observation_lease']
+    receipt=released.document()['observation_receipt']
+    assert all(receipt[key]==value for key,value in active.items())
+    assert receipt['outcome']=='released' and receipt['installed_before_sha256']==receipt['installed_after_sha256']
+    return {'cache_pinned_native_observation_verified':True,'actual_packages_verified_during_native_observation':True,
+            'typed_observation_child_job_and_result_verified':True,'observation_receipt':receipt,
+            'observation_independent_deadline_verified':False,'durable_observation_coordinator_verified':False,
+            'observation_process_containment_verified':False}
 
 
 def is_live_worker(raw,*,parent=None):
@@ -451,6 +487,7 @@ def main():
         store = Store(cache, 0, READER, WORKER)
         try:
             store.publish(stage, 'a'*32, generation, datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'))
+            observation=prove_cache_pinned_observation(store)
             previous = (Path(CACHE_ROOT)/'current.json').read_bytes()
             for number, candidate in [(2, policy(certificate_path=wrong_ca)),
                                       (3, policy(signing_key=wrong_public)),
@@ -485,7 +522,7 @@ def main():
             'wrong_auth_rejected': True, 'expired_metadata_rejected': True,
             'any_failed_repository_rejected': True, 'host_hook_excluded': True,
             'previous_current_retained_after_failure': True,
-            'worker_memory_peak': int((cgroup(PARENT_SLICE)/'memory.peak').read_text())}
+            'worker_memory_peak': int((cgroup(PARENT_SLICE)/'memory.peak').read_text()),**observation}
     finally:
         if server is not None:
             server.shutdown()
