@@ -20,7 +20,7 @@ def publisher_properties():
         'ProtectSystem=strict','ProtectHome=yes','ProtectControlGroups=yes','RestrictNamespaces=yes',
         'PrivateDevices=yes','PrivateTmp=yes','PrivateNetwork=yes',
         'InaccessiblePaths=/tmp /var/tmp /dev/shm -/opt -/srv -/var/opt -/usr/local/etc -/usr/local/var',
-        'TemporaryFileSystem=/etc:ro /var/lib:ro /run:ro',
+        'TemporaryFileSystem=/etc:ro /var/lib:ro /run:ro /run/systemd/system:ro,nodev,nosuid,noexec,size=4k,nr_inodes=16',
         'BindReadOnlyPaths='+POLICY+' /etc/passwd /etc/group /etc/nsswitch.conf /etc/hosts '+
             '/run/systemd/private /var/lib/dpkg /run/guarded-update-executor.lock',
         'BindPaths='+writable,'ReadWritePaths='+writable)

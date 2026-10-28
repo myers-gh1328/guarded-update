@@ -566,9 +566,16 @@ with resources:
    os.unlink(path)
   stage='masked_sentinel'
   assert not os.path.exists(@SENTINEL@)
+  stage='manager_marker'
+  with os.scandir('/run/systemd/system') as entries:assert next(entries,None) is None
+  try:fd=os.open('/run/systemd/system/synthetic-create',os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
+  except OSError as error:assert error.errno==errno.EROFS
+  else:
+   os.close(fd);raise AssertionError('Private marker is writable')
+  assert not os.path.exists('/run/systemd/system/.publisher-profile-synthetic')
   stage='manager_socket'
   result=subprocess.run(('/bin/systemctl','show','--property=LoadState','--value','command-center-inventory-refresh-worker.service'),env={'PATH':'/usr/sbin:/usr/bin:/sbin:/bin','LC_ALL':'C'},stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,close_fds=True,timeout=3)
-  assert result.returncode in (0,4) and len(result.stdout)<=4096
+  assert result.returncode in (0,4) and result.stdout.strip()==b'not-found'
   stage='sealing'
   cache=os.open(CACHE,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
   try:
@@ -590,7 +597,10 @@ print(json.dumps({'publisher_cap3_sealing_and_scoped_filesystem_verified':True,'
     args=['/usr/bin/systemd-run','--quiet','--wait','--collect','--pipe','--unit='+UNIT,'--slice='+PARENT_SLICE]
     for property in publisher_properties():args+=['-p',property]
     args+=['-p','RuntimeMaxSec=30','/usr/bin/python3','-I','-B',str(probe)]
-    completed=subprocess.run(args,env=ENV,stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=40)
+    host_marker=Path('/run/systemd/system/.publisher-profile-synthetic')
+    with host_marker.open('xb') as output:output.write(b'synthetic host unit directory sentinel')
+    try:completed=subprocess.run(args,env=ENV,stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=40)
+    finally:host_marker.unlink()
     if completed.returncode:
         diagnostics=[]
         for line in (completed.stdout+b'\n'+completed.stderr).splitlines():
@@ -599,7 +609,7 @@ print(json.dumps({'publisher_cap3_sealing_and_scoped_filesystem_verified':True,'
         raise RuntimeError('Publisher probe exit='+str(completed.returncode)+' '+ ' '.join(diagnostics[:2]))
     result=json.loads(completed.stdout)
     assert result['generation']==expected_generation and result['publisher_cap3_sealing_and_scoped_filesystem_verified']
-    return {'publisher_cap3_sealing_and_scoped_filesystem_verified':True,'publisher_fixed_pid1_socket_query_verified':True,
+    return {'publisher_cap3_sealing_and_scoped_filesystem_verified':True,'publisher_fixed_pid1_socket_query_verified':True,'publisher_empty_systemd_marker_verified':True,
             'publisher_profile_probe_metrics':result['metrics']}
 
 

@@ -12,11 +12,13 @@ class PublisherProfileTests(unittest.TestCase):
                       'AmbientCapabilities=','NoNewPrivileges=yes','ProtectSystem=strict','PrivateNetwork=yes',
                       'KillMode=control-group','KillSignal=SIGKILL','OOMPolicy=kill','TasksMax=8'):
             self.assertIn(value,props)
+        self.assertIn('TemporaryFileSystem=/etc:ro /var/lib:ro /run:ro /run/systemd/system:ro,nodev,nosuid,noexec,size=4k,nr_inodes=16',props)
         write=set(next(value for value in props if value.startswith('ReadWritePaths=')).split('=',1)[1].split())
         self.assertEqual(write,{'/var/cache/command-center-inventory-refresh','/var/lib/command-center-inventory-refresh',
                                '/run/command-center-inventory-refresh','/etc/command-center-inventory-refresh/apt'})
         read=next(value for value in props if value.startswith('BindReadOnlyPaths=')).split('=',1)[1].split()
         self.assertIn('/run/systemd/private',read)
+        self.assertNotIn('/run/systemd/system',read)
         self.assertNotIn('/run',read);self.assertNotIn('/var/lib',read)
         self.assertNotIn('/etc',read)
         with self.assertRaises(TypeError):publisher_properties('caller command')

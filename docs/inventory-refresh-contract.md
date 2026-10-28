@@ -840,6 +840,9 @@ Root access to PID1's private socket confers broad service-management authority.
 The trusted fixed wrapper and data-only nonce protocol limit the operations;
 these filesystem masks and capabilities do not sandbox malicious root code with
 that socket. The profile itself supplies no launcher or activation entrypoint.
+A private empty read-only tmpfs supplies systemd's existence-only boot marker,
+bounded to 4 KiB and 16 inodes. Host runtime unit files remain hidden; the marker
+is compatibility for the fixed client, not evidence of host/PID1 provenance.
 
 The disposable publisher probe checks exact kernel capability sets, current
 resource admission, read-only/writeable bindings, hidden synthetic host state,
