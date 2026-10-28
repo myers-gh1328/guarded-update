@@ -42,6 +42,7 @@ from inventory_refresh_state import Journal
 from inventory_refresh_io import Inbox
 from inventory_refresh_policy_admission import PolicyGuard
 from inventory_refresh_materialized_policy import MaterializedPolicy
+from inventory_refresh_worker_service import RefreshService
 
 WORKER = 60001
 READER = 60002
@@ -83,10 +84,7 @@ def cgroup(unit):
     return Path('/sys/fs/cgroup')/raw.lstrip('/')
 
 
-def empty_worker():
-    result = subprocess.run(['/bin/systemctl', 'stop', WORKER_UNIT], env=ENV,
-                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
-    assert result.returncode in [0, 5]
+def assert_worker_empty():
     values = dict(line.split() for line in (cgroup(WORKER_SLICE)/'cgroup.events').read_text().splitlines())
     assert values['populated'] == '0', 'Owned worker cgroup cleanup unconfirmed'
     for entry in Path('/proc').iterdir():
@@ -98,6 +96,13 @@ def empty_worker():
                 assert fields['State'].strip().startswith('Z'), 'Refresh UID writer escaped its owned cgroup'
         except (FileNotFoundError, ProcessLookupError):
             pass
+
+
+def empty_worker():
+    result = subprocess.run(['/bin/systemctl', 'stop', WORKER_UNIT], env=ENV,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
+    assert result.returncode in [0, 5]
+    assert_worker_empty()
 
 
 def certificate(directory, identity):
@@ -569,7 +574,7 @@ def stop_owned_child(pid,recheck):
         os.close(pidfd)
 
 
-def stopped_child_proof(args,job):
+def stopped_child_proof(args,job,*,owner=None):
     """CI-owned transient service only; never callable on a user endpoint."""
     if not (sys.platform=='linux' and os.geteuid()==0 and os.environ.get('GITHUB_ACTIONS')=='true'):
         raise RuntimeError('Disposable hosted Linux root runner required')
@@ -578,7 +583,7 @@ def stopped_child_proof(args,job):
     assert pwd.getpwnam('ccrefresh').pw_uid==WORKER
     assert pwd.getpwnam('ccinventory').pw_uid==READER
     assert args[0]=='/usr/bin/systemd-run' and '--unit='+WORKER_UNIT in args
-    launcher=subprocess.Popen(args,env=ENV,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+    launcher=owner if owner is not None else subprocess.Popen(args,env=ENV,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
     try:
         limit=time.monotonic()+5
         worker=None
@@ -601,24 +606,55 @@ def stopped_child_proof(args,job):
         # Recheck cgroup membership and complete unprivileged kernel identity
         # immediately before stopping only the disposable owned child.
         def recheck():
+            if owner is not None:
+                from inventory_refresh_worker_service import show_unit
+                owner._same_invocation(show_unit())
             return (str(worker) in (owned/'cgroup.procs').read_text().split() and
                     is_live_worker(Path('/proc',str(worker),'status').read_bytes(),parent=guardian))
         stop_owned_child(worker,recheck)
         status=launcher.wait(timeout=12)
         released=time.clock_gettime_ns(time.CLOCK_BOOTTIME)//1_000_000
         assert status==76 and job['deadline_boottime_ms']<=released<=job['deadline_boottime_ms']+3000
-        empty_worker()
+        if owner is None:empty_worker()
+        else:assert_worker_empty()
         return status
     finally:
-        try:
-            empty_worker()
-        finally:
-            if launcher.poll() is None:
-                launcher.kill()
-            launcher.wait(timeout=5)
+        if owner is not None:
+            try:owner.close()
+            finally:assert_worker_empty()
+        else:
+            try:
+                empty_worker()
+            finally:
+                if launcher.poll() is None:
+                    launcher.kill()
+                launcher.wait(timeout=5)
 
 
-def run_worker(policy, number, *, stopped_child=False, policy_guard=None):
+def run_worker(policy,number,*,stopped_child=False,policy_guard=None):
+    if policy_guard is None:
+        return _run_worker(policy,number,stopped_child=stopped_child)
+    # This fixture proves real durable start admission, not a complete deployed
+    # coordinator. Publication/other fixtures still have separate journal scope.
+    state=Path(RUNTIME_ROOT)/('refresh-admission-proof-'+f'{number:032x}')
+    state.mkdir(mode=0o700)
+    fd=os.open(state,os.O_RDONLY|os.O_DIRECTORY);journal=Journal(fd)
+    try:
+        with journal.exclusive():
+            journal.initialize(secrets.token_hex(16))
+            boot=Path('/proc/sys/kernel/random/boot_id').read_text().strip()
+            accepted=time.clock_gettime_ns(time.CLOCK_BOOTTIME)//1_000_000
+            nonce=f'{number:016x}'+secrets.token_hex(8)
+            assert journal.receive('refresh',nonce,boot,accepted,policy_guard.generation)=='new'
+            started=time.clock_gettime_ns(time.CLOCK_BOOTTIME)//1_000_000
+            assert journal.start('refresh',nonce,boot,started,policy=policy_guard.generation)
+            context={'boot':boot,'accepted':accepted,'started':started,'nonce':nonce}
+            return _run_worker(policy,number,stopped_child=stopped_child,policy_guard=policy_guard,
+                               journal=journal,admission=context)
+    finally:os.close(fd)
+
+
+def _run_worker(policy, number, *, stopped_child=False, policy_guard=None,journal=None,admission=None):
     if policy_guard is not None:policy_guard.recheck()
     empty_worker()
     token = f'{number:032x}'
@@ -639,13 +675,15 @@ def run_worker(policy, number, *, stopped_child=False, policy_guard=None):
     empty.chmod(0o550)
     assert not any(empty.iterdir())
     now = time.clock_gettime_ns(time.CLOCK_BOOTTIME)//1_000_000
-    nonce = f'{number:016x}'+secrets.token_hex(8)
+    nonce = f'{number:016x}'+secrets.token_hex(8) if admission is None else admission['nonce']
     job = {'schema_version': 1, 'staging_token': token,
            'config_sha256': hashlib.sha256(rendered['apt.conf']).hexdigest(),
            'policy_generation': policy_generation(b'k'*32, policy) if policy_guard is None else policy_guard.generation,
            'operation_nonce': nonce, 'helper_sequence': number,
-           'boot_id': Path('/proc/sys/kernel/random/boot_id').read_text().strip(),
-           'accepted_boottime_ms': now, 'started_boottime_ms': now, 'deadline_boottime_ms': now+(8000 if stopped_child else 600000)}
+           'boot_id': Path('/proc/sys/kernel/random/boot_id').read_text().strip() if admission is None else admission['boot'],
+           'accepted_boottime_ms': now if admission is None else admission['accepted'],
+           'started_boottime_ms': now if admission is None else admission['started'],
+           'deadline_boottime_ms': (now if admission is None else admission['started'])+(8000 if stopped_child else 600000)}
     write_root(Path(RUNTIME_ROOT)/'job.json', json.dumps(job).encode())
     # PID1 protects the root MAIN guardian; setpriv permanently drops its fixed child.
     args = ['/usr/bin/systemd-run', '--quiet', '--wait', '--collect', '--pipe', '--unit='+WORKER_UNIT,
@@ -664,11 +702,22 @@ def run_worker(policy, number, *, stopped_child=False, policy_guard=None):
     try:
         if binding is not None:binding.recheck()
         if stopped_child:
-            return stopped_child_proof(args,job),token,job['policy_generation']
+            owner=RefreshService(journal,policy_guard).launch() if journal is not None else None
+            return stopped_child_proof(args,job,owner=owner),token,job['policy_generation']
         if policy_guard is not None:policy_guard.recheck()
-        result = subprocess.run(args, env=ENV, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=610)
-        status = result.returncode
-        empty_worker()
+        if journal is not None:
+            owned=RefreshService(journal,policy_guard).launch()
+            try:
+                status=owned.wait(timeout=610)
+                assert_worker_empty()
+                owned.verify_current_inputs()
+            finally:owned.close()
+            # No native output is used as authority or leaked on this path.
+            result=subprocess.CompletedProcess((),status,stdout=b'',stderr=b'')
+        else:
+            result = subprocess.run(args, env=ENV, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=610)
+            status = result.returncode
+            empty_worker()
         if binding is not None:binding.recheck()
         if policy_guard is not None:policy_guard.recheck()
         if status not in [0, 74, 75, 76]:
@@ -860,7 +909,7 @@ for path in sys.argv[2:]:
         finally:
             os.close(cache)
         Handler.hold=True
-        run_worker(good,7,stopped_child=True)
+        run_worker(good,7,stopped_child=True,policy_guard=private_policy_guard)
         Handler.hold=False
         proof = {'schema_version': 1, 'scope': 'fixed_worker_trusted_policy',
             'synthetic_repository_only': True, 'target_repository_fit_proven': False,
@@ -868,6 +917,8 @@ for path in sys.argv[2:]:
             'root_guardian_fixed_privilege_drop_exercised': True,
             'fixed_root_policy_guard_and_current_commitment_verified':True,
             'full_rendered_policy_bound_during_worker_and_publication_verified':True,
+            'fixed_refresh_service_new_durable_start_verified':True,
+            'fixed_refresh_service_deadline_fault_verified':True,
             'worker_and_reporter_private_policy_key_read_denied':True,
             'exact_guardian_capability_masks_verified': True,
             'unadmitted_package_sibling_and_matching_bytecode_ignored': True,

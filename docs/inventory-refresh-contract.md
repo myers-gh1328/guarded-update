@@ -775,3 +775,28 @@ publication/observation, exposing only a bounded verification flag. It does not
 publish raw auxiliary hashes or private bytes. Byte binding alone does not prove
 worker traversal through every ancestor, namespace readiness or UID exclusion;
 those remain fixed-service/provisioning gates before activation.
+
+### Fixed refresh service adapter (source only)
+
+`RefreshService` consumes the new durable refresh-start permission before
+preparing a launch and binds that handle to the journal's current lock epoch.
+It admits both fixed worker/guardian sources before executing any project source,
+pins the strict root job file and verifies its nonce, times, boot and policy
+against the held journal. Full rendered-input binding, fixed account identities,
+source/job continuity and BOOTTIME are rechecked before PID1 starts the worker.
+
+The adapter reuses the tested guardian privilege-drop profile. Its only writable
+cache path comes from a strict root-job staging token; no caller command, UID,
+path or option interface exists. Service ownership requires the exact root-job
+marker, InvocationID and pinned cgroup identity. Unknown creation or replacement
+never permits stopping an encountered unit; cleanup reaps only its own launcher
+and attempts all owned binding/job/source descriptors. The borrowed PolicyGuard
+remains caller-owned.
+
+Disposable acquisition and stopped-unprivileged-child tests now use the actual
+adapter after fsynced journal start admission. These fixture journals remain
+separate from later publication fixtures, and the existing fixture parent still
+runs outside the aggregate. This establishes neither a complete executable
+coordinator nor all-allocator accounting. Whole-cgroup/UID exclusion, actual
+worker ancestry traversal, filesystem key masks, namespace provenance and real
+target readiness remain mandatory caller/provisioning gates before activation.
