@@ -1,10 +1,15 @@
+// Disconnected request foundation; runtime integration is separately gated.
 #[cfg(any(target_os = "macos", test))]
 mod brew;
+#[cfg(test)]
+mod clock;
 #[cfg(any(target_os = "linux", test))]
 mod linux;
 #[cfg(any(target_os = "macos", test))]
 mod macos;
 mod process;
+#[cfg(test)]
+mod requests;
 mod state;
 mod transport;
 use process::{SystemTools, Tools};
@@ -82,6 +87,8 @@ fn pass(
     };
     if let Some(response) = &response
         && (response.status != 200
+            || !response.json_content_type
+            || response.raw_body.len() > 65_536
             || response.body["schema_version"] != 1
             || response.body["reporting_enabled"] != true)
     {
@@ -178,6 +185,8 @@ fn pass(
     match result {
         Ok(response)
             if matches!(response.status, 200 | 201)
+                && response.json_content_type
+                && response.raw_body.len() <= 65_536
                 && state::matches_receipt(&report, &digest, &response.body) =>
         {
             store.schedule.acknowledged_sha256 = Some(digest);
@@ -322,6 +331,8 @@ mod tests {
                 status: 200,
                 body: json!({"schema_version":1,"reporting_enabled":true,"source_revision":1,"receipt":null}),
                 retry_after: 0,
+                raw_body: Vec::new(),
+                json_content_type: true,
             })
         }
     }
