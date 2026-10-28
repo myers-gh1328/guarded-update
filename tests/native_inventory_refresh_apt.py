@@ -182,19 +182,14 @@ def prove_privilege_transition():
     probe=LIB_ROOT/'transition-probe.py'
     # A diagnostic-only nested Python launch reproduces the guardian's process
     # boundary and exact sandbox. Its child only reads /proc/self/status.
-    errors=['keep process capabilities failed','activate capabilities','reactivate capabilities',
-            'apply bounding set','apply capabilities','setresuid failed','setresgid failed',
-            'setgroups failed','disallow granting new privileges failed','failed to execute',
-            'Operation not permitted','Invalid argument','Permission denied']
     source=('import subprocess,sys\n'
             'state=dict(line.split(":",1) for line in open("/proc/self/status") if ":" in line)\n'
-            'uidmap=open("/proc/self/uid_map").read().split()\n'
-            'print("parent_state="+str(bool(int(state["CapEff"],16)&128))+":"+str(uidmap==["0","0","4294967295"]),file=sys.stderr)\n'
+            'assert all(state[key].split()==["0"]*4 for key in ["Uid","Gid"])\n'
+            'assert all(int(state[key],16)==480 for key in ["CapPrm","CapEff","CapBnd"])\n'
+            'assert all(int(state[key],16)==128 for key in ["CapInh","CapAmb"])\n'
+            'assert state["NoNewPrivs"].strip()=="1"\n'
             'result=subprocess.run('+repr(fixed)+',env='+repr(ENV)+',stdin=subprocess.DEVNULL,'
-            'stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=5)\n'
-            'if result.returncode:\n'
-            ' labels=[label for label in '+repr(errors)+' if label.encode() in result.stderr]\n'
-            ' print("transition_failure="+str(result.returncode)+":"+(",".join(labels) if labels else "unclassified"),file=sys.stderr)\n'
+            'stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,timeout=5)\n'
             'sys.stdout.buffer.write(result.stdout)\n'
             'raise SystemExit(result.returncode)\n')
     probe.write_text(source)
@@ -203,29 +198,13 @@ def prove_privilege_transition():
         '--unit=command-center-inventory-privilege-proof','--slice='+WORKER_SLICE,
         '-p','User=root','-p','Group=root','-p','NoNewPrivileges=yes',
         '-p','CapabilityBoundingSet=CAP_KILL CAP_SETUID CAP_SETGID CAP_SETPCAP',
+        '-p','AmbientCapabilities=CAP_SETUID',
         '-p','ProtectSystem=strict','-p','ProtectHome=yes','-p','ProtectControlGroups=yes',
         '-p','RestrictNamespaces=yes','-p','PrivateDevices=yes','-p','PrivateTmp=yes',
         '-p','InaccessiblePaths=/tmp /var/tmp /dev/shm',
         '/usr/bin/python3','-I','-B',str(probe)]
-    result=subprocess.run(args,env=ENV,stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=10)
-    if result.returncode!=0:
-        labels=re.findall(rb'(?:transition_failure=[0-9]{1,3}:[a-zA-Z ,]+|parent_state=(?:True|False):(?:True|False))',result.stderr)
-        # Diagnostic-only read-only bisection on this disposable VM. No helper
-        # metadata, APT operation, signal or persistent unit is involved.
-        sandbox=['ProtectSystem=strict','ProtectHome=yes','ProtectControlGroups=yes','RestrictNamespaces=yes',
-                 'PrivateDevices=yes','PrivateTmp=yes','InaccessiblePaths=/tmp /var/tmp /dev/shm']
-        for index,property_value in enumerate(sandbox):
-            isolated=args[:]
-            for value in sandbox:
-                location=isolated.index(value)
-                del isolated[location-1:location+1]
-            location=isolated.index('/usr/bin/python3')
-            isolated[location:location]=['-p',property_value]
-            check=subprocess.run(isolated,env=ENV,stdout=subprocess.DEVNULL,stderr=subprocess.PIPE,timeout=10)
-            details=re.findall(rb'(?:transition_failure=[0-9]{1,3}:[a-zA-Z ,]+|parent_state=(?:True|False):(?:True|False))',check.stderr)
-            labels.append(('property_'+str(index)+'_exit_'+str(check.returncode)).encode())
-            labels.extend(details[:2])
-        raise AssertionError('Fixed full-sandbox privilege transition failed: '+repr(labels))
+    result=subprocess.run(args,env=ENV,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,timeout=10)
+    assert result.returncode==0, 'Exact guardian capability profile or fixed transition rejected'
     assert is_live_worker(result.stdout), 'Kernel privilege state rejected after fixed transition'
 
 
@@ -324,6 +303,7 @@ def run_worker(policy, number, *, stopped_child=False):
         '-p', 'KillMode=control-group', '-p', 'KillSignal=SIGKILL', '-p', 'SendSIGKILL=yes',
         '-p', 'OOMPolicy=kill', '-p', 'MemoryAccounting=yes',
         '-p', 'NoNewPrivileges=yes', '-p', 'CapabilityBoundingSet=CAP_KILL CAP_SETUID CAP_SETGID CAP_SETPCAP',
+        '-p', 'AmbientCapabilities=CAP_SETUID',
         '-p', 'ProtectSystem=strict',
         '-p', 'ProtectHome=yes', '-p', 'ProtectControlGroups=yes', '-p', 'RestrictNamespaces=yes',
         '-p', 'PrivateDevices=yes', '-p', 'PrivateTmp=yes', '-p', 'InaccessiblePaths=/tmp /var/tmp /dev/shm',
@@ -492,6 +472,7 @@ def main():
             'synthetic_repository_only': True, 'target_repository_fit_proven': False,
             'coordinator_exercised': False, 'apt_refresh_exercised': True,
             'root_guardian_fixed_privilege_drop_exercised': True,
+            'exact_guardian_capability_masks_verified': True,
             'unadmitted_package_sibling_and_matching_bytecode_ignored': True,
             'independent_deadline_fault_proof': True,
             'native_fault_job_budget_ms': 8000,

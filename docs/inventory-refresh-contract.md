@@ -479,3 +479,14 @@ actual guardian, but independent stopped-child deadline, signal-isolation and
 OOM fault proofs remain separate required integration evidence. No coordinator,
 observation guardian, installed helper artifact or real-device resource fit is
 implied by these unit tests or by a worker exit code.
+
+The guardian service explicitly requests AmbientCapabilities=CAP_SETUID inside
+its existing KILL/SETUID/SETGID/SETPCAP bounding set. systemd's seccomp setup drops
+SETUID unless it is requested in the ambient set; both PrivateDevices and
+RestrictNamespaces exercise this path. A disposable read-only property matrix
+reproduced missing effective SETUID and setresuid EPERM. See the
+[systemd implementation](https://github.com/systemd/systemd/blob/v255/src/core/exec-invoke.c#L4484-L4490).
+The full-sandbox preflight verifies actual root UID/GID, effective/permitted/
+bounding masks exactly those four capabilities, inherited/ambient SETUID only,
+and NNP=1. After setpriv, all five worker capability masks must be zero. The
+namespace and device restrictions remain part of the service profile.
