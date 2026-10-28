@@ -748,6 +748,7 @@ from inventory_refresh_observation_transaction import ObservationTransaction
 from inventory_refresh_channel import ObservationChannel
 from inventory_refresh_io import Inbox
 from inventory_refresh_dispatch import RootDispatcher
+import secrets
 import time
 fields=dict(line.split(':',1) for line in open('/proc/self/status').read().splitlines())
 assert {name:int(fields[name].strip(),16) for name in ('CapPrm','CapEff','CapBnd','CapInh','CapAmb')}=={'CapPrm':3,'CapEff':3,'CapBnd':3,'CapInh':0,'CapAmb':0}
