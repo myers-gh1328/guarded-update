@@ -11,7 +11,7 @@ import unittest
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'scripts'))
 from inventory_refresh_storage import Store
 from inventory_refresh_observation import ObservationError
-from inventory_refresh_cached_observation import ObservationJob, CachedObservation, ObservationResult
+from inventory_refresh_cached_observation import ObservationJob, CachedObservation, ObservationResult, ReleaseGrant
 
 BOOT='11111111-1111-4111-8111-111111111111'
 NONCE='0000000000000001'+'a'*16
@@ -57,6 +57,24 @@ class CachedObservationTests(unittest.TestCase):
         (directory/'synthetic_Packages').write_bytes(b'synthetic-package-index')
     def job(self,**changes):
         return ObservationJob.parse(json.dumps(dict(self.job_data,**changes)).encode())
+
+    def test_only_exact_root_grant_after_native_open_can_release_the_session(self):
+        guard=Guard()
+        session=CachedObservation.begin(self.store,self.job(),self.clock,guard_factory=lambda **_:guard)
+        try:
+            for grant in [ReleaseGrant(self.job(job_id='d'*32),110),ReleaseGrant(self.job(),101),
+                          ReleaseGrant(self.job(),200)]:
+                with self.subTest(grant=grant),self.assertRaises(ValueError):
+                    session.finish_granted(grant)
+                self.assertFalse(guard.closed)
+            self.now=120
+            grant=ReleaseGrant(self.job(),115)
+            self.assertEqual(ReleaseGrant.parse(grant.encoded(),expected_job=self.job()),grant)
+            result=session.finish_granted(grant)
+            self.assertEqual(result.document()['phase'],'released')
+            self.assertTrue(guard.closed)
+        finally:
+            session.abort()
 
     def test_cache_identity_mismatch_never_opens_native_and_releases_its_pin(self):
         factory=Mock()

@@ -35,7 +35,10 @@ from inventory_refresh_storage import Store
 from inventory_refresh_worker import validate_kernel_identity
 from inventory_refresh_guardian import worker_argv, load_worker
 from inventory_refresh_observation import prepare_fixed_executor_guard
-from inventory_refresh_cached_observation import ObservationJob, CachedObservation, ObservationResult
+from inventory_refresh_cached_observation import ObservationJob, CachedObservation, ObservationResult, ReleaseGrant
+from inventory_refresh_channel import ObservationChannel
+from inventory_refresh_state import Journal
+from inventory_refresh_io import Inbox
 
 WORKER = 60001
 READER = 60002
@@ -142,7 +145,9 @@ def write_root(path, data, mode=0o640):
     current = path.parent
     while str(current).startswith(POLICY_ROOT) or str(current).startswith(RUNTIME_ROOT):
         os.chown(current, 0, WORKER)
-        current.chmod(0o750)
+        # Shared traversal only; worker payloads stay0640 and private channel
+        # siblings remain0700. Reporter has no write permission on this ancestor.
+        current.chmod(0o755 if str(current)==RUNTIME_ROOT else 0o750)
         current = current.parent
     temporary = path.with_name('.new-'+secrets.token_hex(8))
     with open(temporary, 'xb') as output:
@@ -154,36 +159,115 @@ def write_root(path, data, mode=0o640):
     temporary.replace(path)
 
 
-def prove_cache_pinned_observation(store):
-    """Actual cache/native-FD integration; no child-process containment claim."""
+def prove_cache_pinned_observation(store,base):
+    """Actual channel/cache/native-FD integration; no process containment claim."""
     assert sys.platform=='linux' and os.geteuid()==0 and os.environ.get('GITHUB_ACTIONS')=='true'
     boot=Path('/proc/sys/kernel/random/boot_id').read_text().strip()
     def clock():
         return boot,time.clock_gettime_ns(time.CLOCK_BOOTTIME)//1_000_000
-    with store.lease_current() as lease:
-        manifest=lease.manifest
-        indexes=[row for row in manifest['files'] if '_Packages' in row['path']]
-        assert indexes, 'No actual package index in admitted cache'
-        accepted=clock()[1]
-        nonce='0000000000000001'+secrets.token_hex(8)
-        job=ObservationJob.parse(json.dumps({'schema_version':1,'job_id':secrets.token_hex(16),
-            'operation_nonce':nonce,'helper_sequence':1,'boot_id':boot,
-            'cache_generation':manifest['cache_generation'],'policy_generation':manifest['policy_generation'],
-            'successful_checked_at':manifest['successful_checked_at'],'accepted_boottime_ms':accepted,
-            'started_boottime_ms':accepted,'deadline_boottime_ms':accepted+120000}).encode())
-    prepare_fixed_executor_guard()
-    with CachedObservation.begin(store,job,clock) as session:
-        opened=ObservationResult.parse(session.opened_result().encoded(),expected_job=job)
-        for row in indexes:
-            count,digest=session.verify_cache_index(row['path'])
-            assert count==row['size'] and digest==row['sha256']
-        released=ObservationResult.parse(session.finish(nonce).encoded(),expected_job=job)
-    active=opened.document()['observation_lease']
-    receipt=released.document()['observation_receipt']
-    assert all(receipt[key]==value for key,value in active.items())
-    assert receipt['outcome']=='released' and receipt['installed_before_sha256']==receipt['installed_after_sha256']
+    for capability in ['observation','release']:
+        path=Path(RUNTIME_ROOT)/capability
+        path.mkdir(mode=0o770)
+        os.chown(path,0,READER);path.chmod(0o770)
+    private=Path(RUNTIME_ROOT)/'observation-private'
+    private.mkdir(mode=0o700)
+    for name in ['control','results']:(private/name).mkdir(mode=0o700)
+    nonce='0000000000000001'+secrets.token_hex(8)
+    # Disposable fixture actor: write only permitted inbox bytes; private paths
+    # must reject traversal and replacement. No live endpoint is contacted.
+    probe='''import os,sys
+private=sys.argv[1]
+try:
+ fd=os.open(private+'/control/job.json',os.O_RDONLY)
+except PermissionError: pass
+else:
+ os.close(fd)
+ sys.exit(91)
+try: os.rename(private,private+'-replaced')
+except PermissionError: pass
+else: sys.exit(92)
+path=sys.argv[2]+'/request'
+fd=os.open(path,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
+try: os.write(fd,sys.argv[3].encode('ascii'))
+finally: os.close(fd)
+'''
+    prefix=list(worker_argv(READER,READER)[:-1])
+    result=subprocess.run(prefix+['-c',probe,str(private),str(Path(RUNTIME_ROOT)/'observation'),nonce],
+        env=ENV,stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=5)
+    assert result.returncode==0, 'Reporter inbox/private channel separation failed'
+    inbox=Inbox.fixed('observation')
+    try: incoming=inbox.read()
+    finally: inbox.close()
+    assert incoming==(nonce,1)
+    state=base/'observation-state'
+    state.mkdir(mode=0o700)
+    state_fd=os.open(state,os.O_RDONLY|os.O_DIRECTORY)
+    journal=Journal(state_fd)
+    parent=None;child=None
+    try:
+        with journal.exclusive():
+            journal.initialize(secrets.token_hex(16))
+            with store.lease_current() as lease:
+                manifest=lease.manifest
+                indexes=[row for row in manifest['files'] if '_Packages' in row['path']]
+                assert indexes, 'No actual package index in admitted cache'
+            accepted=clock()[1]
+            assert journal.receive('observation',nonce,boot,accepted,manifest['policy_generation'])=='new'
+            started=clock()[1]
+            assert journal.start('observation',nonce,boot,started,policy=manifest['policy_generation'])
+            job=ObservationJob.parse(json.dumps({'schema_version':1,'job_id':secrets.token_hex(16),
+                'operation_nonce':nonce,'helper_sequence':1,'boot_id':boot,
+                'cache_generation':manifest['cache_generation'],'policy_generation':manifest['policy_generation'],
+                'successful_checked_at':manifest['successful_checked_at'],'accepted_boottime_ms':accepted,
+                'started_boottime_ms':started,'deadline_boottime_ms':accepted+120000}).encode())
+            parent=ObservationChannel.fixed(journal=journal)
+            child=ObservationChannel.fixed()
+            parent.write_job(job)
+            assert child.read_job()==job
+            prepare_fixed_executor_guard()
+            with CachedObservation.begin(store,child.read_job(),clock) as session:
+                child.write_result(session.opened_result())
+                opened=parent.read_result(expected_job=job)
+                for row in indexes:
+                    count,digest=session.verify_cache_index(row['path'])
+                    assert count==row['size'] and digest==row['sha256']
+                # The actual reporter release inbox is still unprivileged. Only
+                # parent journal admission may produce the private root grant.
+                release_code="import os,sys;fd=os.open(sys.argv[1],os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600);os.write(fd,sys.argv[2].encode('ascii'));os.close(fd)"
+                result=subprocess.run(prefix+['-c',release_code,str(Path(RUNTIME_ROOT)/'release/request'),nonce],
+                    env=ENV,stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=5)
+                assert result.returncode==0, 'Reporter release inbox write failed'
+                release_inbox=Inbox.fixed('release')
+                try: request=release_inbox.read()
+                finally: release_inbox.close()
+                assert request==(nonce,1)
+                requested=clock()[1]
+                assert journal.receive('release',nonce,boot,requested,job.policy_generation)=='new'
+                granted=clock()[1]
+                assert journal.start('release',nonce,boot,granted,policy=job.policy_generation)
+                parent.write_release(ReleaseGrant(job,granted))
+                grant=child.read_release(expected_job=job)
+                child.write_result(session.finish_granted(grant))
+                released=parent.read_result(expected_job=job)
+            active=opened.document()['observation_lease']
+            receipt=released.document()['observation_receipt']
+            assert all(receipt[key]==value for key,value in active.items())
+            assert receipt['outcome']=='released' and receipt['installed_before_sha256']==receipt['installed_after_sha256']
+            journal.finish('observation',nonce,boot,receipt['released_boottime_ms'],'succeeded',
+                           cache=job.cache_generation,policy=job.policy_generation)
+            journal.finish('release',nonce,boot,receipt['released_boottime_ms'],'succeeded',
+                           cache=job.cache_generation,policy=job.policy_generation)
+    finally:
+        try:
+            if child is not None:child.close()
+        finally:
+            try:
+                if parent is not None:parent.close()
+            finally:os.close(state_fd)
     return {'cache_pinned_native_observation_verified':True,'actual_packages_verified_during_native_observation':True,
             'typed_observation_child_job_and_result_verified':True,'observation_receipt':receipt,
+            'root_observation_channel_roundtrip_verified':True,'reporter_private_channel_separation_verified':True,
+            'observation_admission_before_native_open_verified':True,
             'observation_independent_deadline_verified':False,'durable_observation_coordinator_verified':False,
             'observation_process_containment_verified':False}
 
@@ -487,7 +571,7 @@ def main():
         store = Store(cache, 0, READER, WORKER)
         try:
             store.publish(stage, 'a'*32, generation, datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'))
-            observation=prove_cache_pinned_observation(store)
+            observation=prove_cache_pinned_observation(store,base)
             previous = (Path(CACHE_ROOT)/'current.json').read_bytes()
             for number, candidate in [(2, policy(certificate_path=wrong_ca)),
                                       (3, policy(signing_key=wrong_public)),

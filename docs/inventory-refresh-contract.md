@@ -572,3 +572,37 @@ actual published Packages hashes, native installed-state fingerprints and typed
 release results together. Independent observation supervision, observation
 process containment, durable observation coordination and real target fit remain
 explicitly unproven. This library/source integration activates no capability.
+
+### Fixed root observation channel
+
+The observation process channel uses the separate root-only runtime sibling
+`observation-private/{control,results}`, each directory0700. It never nests
+privileged files below the reporter-writable observation inbox. The shared
+runtime ancestor permits traversal, while worker configurations stay0640 in
+worker group and private channel ancestry remains inaccessible to reporter.
+
+Fixed job/release files are root0400 and the result is root0600, each bounded to
+64KiB, single-link regular files with stable descriptor/named-reference checks.
+Parent job/grant writes require the same held, reconciled Journal and matching
+running observation/release records. A root grant binds the exact job and its
+frozen release-start time after actual lock opening. The native session's
+`finish_granted` checks that identity and timing before one-use release.
+Reporter inbox bytes cannot directly become a native-reader release.
+
+Atomic writes use owned exclusive temporaries, complete writes, file sync,
+rename and directory sync. Any attempted rename failure remains possibly visible;
+cleanup errors preserve that uncertainty. Identical acknowledgements perform an
+exact-file/directory durability barrier. Parent result acceptance also syncs the
+exact child file and directory before updating its in-memory progression.
+Released evidence requires its matching root grant on both writer and reader.
+Old lower-counter residue cannot match a new job; changed opened data,
+contradictory terminals and opened-after-terminal are rejected.
+
+This channel is metadata I/O, not service/execution authority. The parent must
+still enforce current owned-child state, actual deadline, release-issued state,
+policy/cache pins, durable receipt and cleanup before publishing completion.
+The in-memory tracker cannot authorize restart recovery or same-job regrant.
+The disposable native proof tests actual separate reporter UID permissions and
+inbox→journal→job→opened→root grant→released I/O with the real cache/native
+session. Observation process containment and independent guardian remain separate
+unactivated integration gates.

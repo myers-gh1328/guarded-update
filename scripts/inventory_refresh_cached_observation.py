@@ -66,6 +66,34 @@ class ObservationJob:
         return cls(**value)
 
 
+def _job_from_document(value):
+    _require(type(value) is dict and set(value)=={field.name for field in fields(ObservationJob)})
+    return ObservationJob(**value)
+
+
+@dataclass(frozen=True,slots=True)
+class ReleaseGrant:
+    job:ObservationJob
+    requested_boottime_ms:int
+
+    def __post_init__(self):
+        _require(type(self.job) is ObservationJob and safe_integer(self.requested_boottime_ms) and
+                 self.job.started_boottime_ms<=self.requested_boottime_ms<=self.job.deadline_boottime_ms)
+
+    def encoded(self):
+        return json.dumps({'schema_version':1,'job':asdict(self.job),
+            'requested_boottime_ms':self.requested_boottime_ms},sort_keys=True,separators=(',',':')).encode('ascii')
+
+    @classmethod
+    def parse(cls,raw,*,expected_job):
+        value=_decode(raw)
+        _require(cls is ReleaseGrant and type(value) is dict and set(value)=={'schema_version','job','requested_boottime_ms'} and
+                 type(value['schema_version']) is int and value['schema_version']==1 and type(expected_job) is ObservationJob)
+        actual_job=_job_from_document(value['job'])
+        _require(actual_job==expected_job)
+        return cls(actual_job,value['requested_boottime_ms'])
+
+
 class ObservationResult:
     __slots__=('_raw',)
     def __new__(cls,*args,**kwargs):
@@ -110,8 +138,7 @@ class ObservationResult:
         value=_decode(raw)
         _require(type(value) is dict and set(value)=={'schema_version','job','phase','observation_lease','observation_receipt','reason'})
         _require(type(value['schema_version']) is int and value['schema_version']==1 and type(expected_job) is ObservationJob)
-        _require(type(value['job']) is dict and set(value['job'])=={field.name for field in fields(ObservationJob)})
-        actual_job=ObservationJob(**value['job'])
+        actual_job=_job_from_document(value['job'])
         _require(actual_job==expected_job)
         return cls.create(expected_job,value['phase'],lease=value['observation_lease'],
                           receipt=value['observation_receipt'],reason=value['reason'])
@@ -207,6 +234,20 @@ class CachedObservation:
         except BaseException:
             self.abort()
             raise
+
+    def finish_granted(self,grant):
+        if self._closed:
+            raise ObservationError('state_inconsistent')
+        # Unrelated or premature grants cannot consume a live observation.
+        _require(type(grant) is ReleaseGrant and grant.job==self._job)
+        try:
+            lease=self._native.lease()
+            now=self._time()
+        except BaseException:
+            self.abort()
+            raise
+        _require(lease['lock_open_boottime_ms']<=grant.requested_boottime_ms<=now)
+        return self.finish(grant.job.operation_nonce)
 
     def finish(self,nonce):
         if self._closed:

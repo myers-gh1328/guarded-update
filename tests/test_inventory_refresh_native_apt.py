@@ -13,6 +13,19 @@ SPEC.loader.exec_module(native)
 
 
 class NativeRefreshFixtureTests(unittest.TestCase):
+    def test_shared_runtime_remains_traversable_without_exposing_worker_config_or_private_channel(self):
+        with TemporaryDirectory() as directory:
+            root=Path(directory);runtime=root/'runtime';policy=root/'policy'
+            runtime.mkdir();policy.mkdir()
+            private=runtime/'observation-private';private.mkdir(mode=0o700)
+            with patch.multiple(native,RUNTIME_ROOT=str(runtime),POLICY_ROOT=str(policy)),patch.object(native.os,'chown'):
+                native.write_root(runtime/'job.json',b'synthetic worker metadata')
+                native.write_root(policy/'apt/config',b'synthetic policy')
+            self.assertEqual(runtime.stat().st_mode&0o777,0o755)
+            self.assertEqual((runtime/'job.json').stat().st_mode&0o777,0o640)
+            self.assertEqual(private.stat().st_mode&0o777,0o700)
+            self.assertEqual(policy.stat().st_mode&0o777,0o750)
+
     def test_fault_probe_requires_a_live_matching_nonroot_kernel_identity(self):
         valid=('Uid:\t60001\t60001\t60001\t60001\n'
                'Gid:\t60001\t60001\t60001\t60001\nGroups:\t\n'
