@@ -884,3 +884,33 @@ uncertainty, replay started work or infer that a failed publication rolled back.
 Actual CAP3 transaction proof, full observation coordination, provisioning,
 repository fit and activation remain separate gates. No production entrypoint or
 enabled service is supplied by this source composition.
+
+### Private-manager transport and retained exit bookkeeping
+
+Production adapters launch through PID1's private socket without systemd-run's
+`--wait` or stdio-forwarding modes: those modes require the system bus. The
+publisher does not expose that bus. Adapters monitor the actual owned unit's
+InvocationID and typed terminal properties instead of treating launcher exit as
+worker completion.
+
+Both guardian entrypoints translate a supervised child success (0) into the
+internal exit sentinel 90. Workers/native readers and generic supervision still
+use 0; an unexpected child 90 is rejected. `RemainAfterExit=no` ensures every
+guardian exit triggers PID1's normal whole-cgroup stop path. Sentinel 90 is never
+a systemd SuccessExitStatus. Default failed-unit retention preserves its exit
+bookkeeping until the fixed owner acknowledges that exact failed incarnation.
+This is expected transient bookkeeping, not an operational success claim.
+
+Adapters return raw status 90/74/75/76 only from the same owned invocation's
+strict failed terminal. A trimmed cgroup can identify that inert retained unit
+for classification/acknowledgement, never establish kernel-empty state or permit
+publication. The transaction independently requires whole-slice emptiness, every
+thread's refresh-UID exclusion and current policy/resources/deadline before
+sealing. Actual manifest, durable success and typed status remain later barriers.
+
+Acknowledgement revalidates the same private job marker and InvocationID under
+the held journal immediately before resetting the failed unit. Unknown creation
+or replacement never grants reset/stop authority. Native tests require a failed
+attempt followed by a new job under each fixed unit name. Legacy negative-policy
+fixture wrappers may use the disposable host's system bus; production adapter
+proofs use the private-manager path and retain all activation/fit limitations.

@@ -18,6 +18,7 @@ class WorkerServiceTests(unittest.TestCase):
         value=object.__new__(service.RefreshService)
         value._closed=False;value._wrapper=Mock();value._wrapper.poll.return_value=None
         value._invocation='a'*32;value._cgroup=(1,2);value._cgroup_fd=None
+        value._journal=Mock()
         value._marker='Command Center inventory refresh '+'b'*32
         value._sources=Mock();value._input=Mock();value._binding=Mock()
         value.owned_inputs=(value._sources,value._input,value._binding)
@@ -25,7 +26,7 @@ class WorkerServiceTests(unittest.TestCase):
 
     def properties(self,value,**changes):
         result={'LoadState':'loaded','ActiveState':'active','Transient':'yes','Description':value._marker,
-                'InvocationID':value._invocation,'ControlGroup':service.CGROUP,'MainPID':'100'}
+                'InvocationID':value._invocation,'ControlGroup':service.CGROUP,'MainPID':'100','SubState':'running','ExecMainCode':'0','ExecMainStatus':'0','Result':'success'}
         result.update(changes);return result
 
     def test_new_start_permit_consumed_once_and_old_lock_handle_cannot_launch(self):
@@ -106,6 +107,48 @@ class WorkerServiceTests(unittest.TestCase):
         for forbidden in ('/etc/command-center-inventory-refresh','/var/lib','/run','/run/systemd/private',
                           '/etc/command-center-inventory-refresh/policy.json','/etc/command-center-inventory-refresh/policy-commitment.key'):
             self.assertNotIn(forbidden,binds)
+
+    def test_launch_uses_private_manager_without_system_bus_wait_or_stdio(self):
+        args=service.observation_argv() if hasattr(service,'observation_argv') else service.refresh_argv('a'*32)
+        for forbidden in ('--wait','--pipe','--collect'):self.assertNotIn(forbidden,args)
+        self.assertIn('RemainAfterExit=no',args);self.assertIn('SuccessExitStatus=',args)
+
+    def test_launcher_exit_zero_is_not_unit_completion_and_failed_sentinel_is_raw(self):
+        value=self.owned();value._wrapper.poll.return_value=0
+        running=self.properties(value)
+        terminal=self.properties(value,ActiveState='failed',SubState='failed',MainPID='0',ExecMainCode='1',ExecMainStatus='90',Result='exit-code')
+        with patch.object(service,'show_unit',return_value=running),patch.object(service,'cgroup_identity',return_value=(1,2)):
+            self.assertIsNone(value.poll())
+        with patch.object(service,'show_unit',return_value=terminal),patch.object(service,'cgroup_identity',return_value=(1,2)):
+            self.assertEqual(value.poll(),90)
+        foreign=dict(terminal,InvocationID='c'*32)
+        with patch.object(service,'show_unit',side_effect=[terminal,foreign]),patch.object(service,'cgroup_identity',return_value=(1,2)):
+            with self.assertRaises(ValueError):value.poll()
+
+    def test_trimmed_group_is_only_owned_failed_data_and_running_replacement_is_rejected(self):
+        value=self.owned();value._wrapper.poll.return_value=0
+        terminal=self.properties(value,ActiveState='failed',SubState='failed',MainPID='0',ExecMainCode='1',ExecMainStatus='90',Result='exit-code',ControlGroup='')
+        with tempfile.TemporaryDirectory() as directory:
+            value._cgroup_fd=os.open(directory,os.O_RDONLY|os.O_DIRECTORY)
+            info=os.fstat(value._cgroup_fd);value._cgroup=(info.st_dev,info.st_ino)
+            try:
+                with patch.object(service,'show_unit',return_value=terminal),patch.object(service,'cgroup_identity',side_effect=FileNotFoundError):
+                    self.assertEqual(value.poll(),90)
+                active=dict(terminal,ActiveState='active',SubState='running',MainPID='100')
+                with patch.object(service,'show_unit',return_value=active),patch.object(service,'cgroup_identity',side_effect=FileNotFoundError):
+                    with self.assertRaises(ValueError):value.poll()
+            finally:os.close(value._cgroup_fd);value._cgroup_fd=None
+
+    def test_owned_retained_failed_unit_is_acknowledged_without_stopping_replacement(self):
+        value=self.owned();value._wrapper.poll.return_value=0
+        terminal=self.properties(value,ActiveState='failed',SubState='failed',MainPID='0',ExecMainCode='1',ExecMainStatus='76',Result='exit-code')
+        with patch.object(service,'show_unit',side_effect=[terminal,terminal,terminal,{'LoadState':'not-found'}]),patch.object(service,'cgroup_identity',return_value=(1,2)),patch.object(service,'stop_unit') as stop,patch.object(service,'reset_unit',create=True) as reset:
+            value.close();reset.assert_called_once_with();stop.assert_not_called()
+        value=self.owned();value._wrapper.poll.return_value=0
+        foreign=dict(terminal,InvocationID='c'*32)
+        with patch.object(service,'show_unit',side_effect=[terminal,terminal,foreign]),patch.object(service,'cgroup_identity',return_value=(1,2)),patch.object(service,'stop_unit') as stop,patch.object(service,'reset_unit',create=True) as reset:
+            with self.assertRaises(ValueError):value.close()
+            reset.assert_not_called();stop.assert_not_called()
 
     def test_same_name_replacement_cannot_be_stopped(self):
         value=self.owned()

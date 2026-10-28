@@ -31,7 +31,7 @@ class RefreshTransactionTests(unittest.TestCase):
         self.publisher=StatusPublisher(self.fds[3],self.journal,os.getgid(),owner=os.getuid())
         self.resources=Mock();self.writers=Mock();self.events=[]
         self.boot='11111111-1111-4111-8111-111111111111';self.now=900000
-        self.native=Mock();self.service=Mock();self.service.launch.return_value=self.service;self.service.wait.return_value=0
+        self.native=Mock();self.service=Mock();self.service.launch.return_value=self.service;self.service.wait.return_value=90
         self.service.launch.side_effect=lambda:self.event('launch',self.service)
         self.service.close.side_effect=lambda:self.event('service_closed')
         self.writers.check.side_effect=lambda:self.event('writers_empty')
@@ -101,7 +101,7 @@ class RefreshTransactionTests(unittest.TestCase):
     def test_policy_change_after_service_exit_prevents_publication(self):
         def change(*args,**kwargs):
             (self.root/'policy/policy-commitment.key').write_bytes(b'x'*32)
-            return 0
+            return 90
         self.service.wait.side_effect=change
         with self.assertRaises(ValueError) as error:self.transaction.refresh(self.nonce)
         self.assertEqual(error.exception.stage,'publication_admission')

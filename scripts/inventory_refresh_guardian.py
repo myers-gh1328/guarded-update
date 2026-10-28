@@ -19,6 +19,15 @@ MAX_SAFE=9_007_199_254_740_991
 ENV={'PATH':'/usr/sbin:/usr/bin:/sbin:/bin','LC_ALL':'C','LANG':'C'}
 
 
+COMPLETED_EXIT=90
+
+
+def retained_exit(result):
+    """Guardian ENTRY only: every main exit must trigger PID1 group teardown."""
+    if type(result) is not int or result not in (0,74,75,76):return 74
+    return COMPLETED_EXIT if result==0 else result
+
+
 def diagnostic(stage,code=None):
     # Fixed stages and bounded integers only. Never native stderr or exceptions.
     if stage not in ('identity','library','accounts','job','boot','spawn','clock','child'):
@@ -171,7 +180,7 @@ def guardian_main():
         def spawn():
             return subprocess.Popen(argv,env=ENV,cwd='/',close_fds=True,
                 stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
-        return supervise(job['started_boottime_ms'],job['deadline_boottime_ms'],spawn)
+        return retained_exit(supervise(job['started_boottime_ms'],job['deadline_boottime_ms'],spawn))
     except (OSError,ValueError,KeyError,ImportError,AttributeError):
         diagnostic(phase)
         return 74

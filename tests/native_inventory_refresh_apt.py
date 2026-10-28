@@ -278,7 +278,7 @@ finally: os.close(fd)
             'observation_process_containment_verified':False}
 
 
-def prove_observation_process(store,base,*,stopped_child=False):
+def prove_observation_process(store,base,*,stopped_child=False,sequence=None):
     """Separate fixed guardian/native processes; no full parent activation."""
     from inventory_refresh_entry import SOURCES
     from inventory_refresh_observer import admit_profile
@@ -291,7 +291,9 @@ def prove_observation_process(store,base,*,stopped_child=False):
         (LIB_ROOT/filename).chmod(0o444)
     boot=Path('/proc/sys/kernel/random/boot_id').read_text().strip()
     now=lambda:time.clock_gettime_ns(time.CLOCK_BOOTTIME)//1_000_000
-    state=base/('observation-stopped-state' if stopped_child else 'observation-process-state');state.mkdir(mode=0o700)
+    sequence=(3 if stopped_child else 2) if sequence is None else sequence
+    assert type(sequence) is int and sequence in (2,3,4)
+    state=base/('observation-process-state-'+str(sequence));state.mkdir(mode=0o700)
     fd=os.open(state,os.O_RDONLY|os.O_DIRECTORY);journal=Journal(fd)
     unit=UNIT
     private=Path(RUNTIME_ROOT)/'observation-private'
@@ -301,7 +303,6 @@ def prove_observation_process(store,base,*,stopped_child=False):
             journal.initialize(secrets.token_hex(16))
             with store.lease_current() as pin:
                 manifest=pin.manifest
-                sequence=3 if stopped_child else 2
                 nonce=f'{sequence:016x}'+secrets.token_hex(8)
                 accepted=now()
                 assert journal.receive('observation',nonce,boot,accepted,manifest['policy_generation'])=='new'
@@ -385,6 +386,7 @@ finally:
                     command(['/usr/bin/python3','-I','-B','-c',writer_probe],timeout=5)
                     residue=parent.read_result(expected_job=job)
                     assert residue.document()['phase']=='opened'
+                    launcher.close();launcher=None
                     return {'observation_independent_deadline_verified':True,
                         'stopped_native_reader_cleanup_verified':True,
                         'native_exclusive_writer_locks_after_cleanup_verified':True,
@@ -398,13 +400,14 @@ finally:
                 else:raise AssertionError('Durable release admission reoffered old opened result')
                 granted=now();assert journal.start('release',nonce,boot,granted,policy=job.policy_generation)
                 parent.write_release(ReleaseGrant(job,granted))
-                assert launcher.wait(timeout=10)==0, 'Separate native/guardian rejected release'
+                assert launcher.wait(timeout=10)==90, 'Separate native/guardian rejected release'
                 # PID1 main exit tears down its descendants before completion.
                 assert dict(line.split() for line in (cgroup(WORKER_SLICE)/'cgroup.events').read_text().splitlines())['populated']=='0'
                 released=parent.read_result(expected_job=job);receipt=released.document()['observation_receipt']
                 assert released.document()['phase']=='released' and all(receipt[key]==value for key,value in opened.document()['observation_lease'].items())
                 assert receipt['installed_before_sha256']==receipt['installed_after_sha256']
                 with store.lease_current() as current:assert current.manifest==manifest
+                launcher.close();launcher=None
                 journal.finish_observation(receipt)
                 return {'observation_separate_native_process_verified':True,
                     'observation_native_zero_capabilities_verified':True,
@@ -416,7 +419,10 @@ finally:
                     'separate_process_observation_receipt':receipt}
     finally:
         try:
-            if launcher is not None:launcher.close()
+            if launcher is not None:
+                # Failure cleanup retains only the old owned scope, never a
+                # new launch; acknowledgement still requires the root lock.
+                with journal.exclusive():launcher.close()
         finally:
             try:
                 if parent is not None:parent.close()
@@ -620,7 +626,7 @@ def prove_root_refresh_transaction(expected_generation):
     modules=('inventory_refresh_protocol','inventory_refresh_receipt','inventory_refresh_state',
         'inventory_refresh_storage','inventory_refresh_status','inventory_refresh_observation',
         'inventory_refresh_cached_observation','inventory_refresh_channel','inventory_refresh_guardian',
-        'inventory_refresh_observer','inventory_refresh_entry','inventory_refresh_service',
+        'inventory_refresh_observer','inventory_refresh_entry','inventory_refresh_unit_status','inventory_refresh_service',
         'inventory_refresh_policy','inventory_refresh_policy_admission','inventory_refresh_materialized_policy',
         'inventory_refresh_worker_service','inventory_refresh_resources','inventory_refresh_materializer',
         'inventory_refresh_writer_exclusion','inventory_refresh_io','inventory_refresh_coordinator',
@@ -936,11 +942,16 @@ def _run_worker(policy, number, *, stopped_child=False, policy_guard=None,journa
             # No native output is used as authority or leaked on this path.
             result=subprocess.CompletedProcess((),status,stdout=b'',stderr=b'')
         else:
+            # Only legacy fault fixtures use host system-bus wait/stdio. The
+            # actual production adapters use private PID1 and raw retained status.
+            args=args[:1]+['--wait','--collect','--pipe']+args[1:]
             result = subprocess.run(args, env=ENV, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=610)
             status = result.returncode
             empty_worker()
         if binding is not None:binding.recheck()
         if policy_guard is not None:policy_guard.recheck()
+        # Physical empty/UID checks above precede this fixture-only translation.
+        if status==90:status=0
         if status not in [0, 74, 75, 76]:
             # Publish only a fixed classification and numeric fixture identity; never native output.
             collision = b'already exists' in result.stderr or b'already loaded' in result.stderr
@@ -1112,6 +1123,8 @@ for path in sys.argv[2:]:
                 observation=prove_cache_pinned_observation(store,base)
                 observation.update(prove_observation_process(store,base))
                 observation.update(prove_observation_process(store,base,stopped_child=True))
+                observation.update(prove_observation_process(store,base,sequence=4))
+                observation['observation_failed_unit_acknowledgement_and_reuse_verified']=True
                 private_policy_guard.recheck()
                 publication_binding.recheck()
             resource_proof.update(prove_root_refresh_transaction(generation))
@@ -1134,6 +1147,10 @@ for path in sys.argv[2:]:
         Handler.hold=True
         run_worker(good,7,stopped_child=True,policy_guard=private_policy_guard)
         Handler.hold=False
+        repository(web,home,architecture)
+        recovered,_,_=run_worker(good,8,policy_guard=private_policy_guard)
+        assert recovered==0, 'Owned failed refresh unit was not acknowledged for the next job'
+        assert (Path(CACHE_ROOT)/'current.json').read_bytes()==previous
         proof = {'schema_version': 1, 'scope': 'fixed_worker_trusted_policy',
             'synthetic_repository_only': True, 'target_repository_fit_proven': False,
             'coordinator_exercised': False, 'apt_refresh_exercised': True,
@@ -1142,6 +1159,7 @@ for path in sys.argv[2:]:
             'full_rendered_policy_bound_during_worker_and_publication_verified':True,
             'fixed_refresh_service_new_durable_start_verified':True,
             'fixed_refresh_service_deadline_fault_verified':True,
+            'fixed_refresh_failed_unit_acknowledgement_and_reuse_verified':True,
             'fixed_refresh_guardian_private_inputs_host_state_and_sockets_masked':True,
             'fixed_refresh_guardian_required_nss_resolver_and_apt_file_binds_verified':True,
             'external_dns_resolution_fit_proven':False,

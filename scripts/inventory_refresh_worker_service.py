@@ -14,6 +14,7 @@ import time
 import types
 
 from inventory_refresh_service import LIB_ROOT, ENV, PROPERTIES, SourceBundle
+from inventory_refresh_unit_status import terminal_status,inert
 from inventory_refresh_observation import _Ancestry, _stable
 from inventory_refresh_materialized_policy import MaterializedPolicy
 from inventory_refresh_observer import kernel_clock
@@ -31,7 +32,7 @@ def _require(condition):
 
 def refresh_argv(token):
     _require(type(token) is str and re.fullmatch('[0-9a-f]{32}',token) is not None)
-    properties=('User=0','Group=0','Type=exec','ExitType=main','RemainAfterExit=no','Restart=no',
+    properties=('User=0','Group=0','Type=exec','ExitType=main','RemainAfterExit=no','Restart=no','SuccessExitStatus=','CollectMode=inactive','StandardOutput=null','StandardError=null',
         'KillMode=control-group','KillSignal=SIGKILL','SendSIGKILL=yes','TimeoutStopSec=1',
         'OOMPolicy=kill','MemoryAccounting=yes','TasksMax=64','RuntimeMaxSec=610','NoNewPrivileges=yes',
         'CapabilityBoundingSet=CAP_KILL CAP_SETUID CAP_SETGID CAP_SETPCAP','AmbientCapabilities=CAP_SETUID',
@@ -43,7 +44,7 @@ def refresh_argv(token):
             RUNTIME_ROOT+'/worker-apt.conf /etc/passwd /etc/group /etc/nsswitch.conf /etc/hosts /etc/resolv.conf '+
             '-/etc/services -/etc/protocols -/etc/host.conf -/etc/gai.conf -/etc/ld.so.cache',
         'ReadWritePaths='+CACHE_ROOT+'/staging-'+token)
-    return ('/usr/bin/systemd-run','--quiet','--wait','--collect','--pipe','--unit='+UNIT,'--slice='+SLICE)+tuple(
+    return ('/usr/bin/systemd-run','--quiet','--unit='+UNIT,'--slice='+SLICE)+tuple(
         item for value in properties for item in ('-p',value))+('/usr/bin/python3','-I','-B',LIB_ROOT+'/guardian.py')
 
 
@@ -60,6 +61,12 @@ def show_unit():
 
 def stop_unit():
     result=subprocess.run(('/bin/systemctl','stop',UNIT),stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,env=ENV,close_fds=True,timeout=3)
+    _require(result.returncode==0)
+
+
+def reset_unit():
+    result=subprocess.run(('/bin/systemctl','reset-failed',UNIT),stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,env=ENV,close_fds=True,timeout=3)
     _require(result.returncode==0)
 
@@ -229,21 +236,43 @@ class RefreshService:
                         self._cgroup_fd=open_cgroup();info=os.fstat(self._cgroup_fd);self._cgroup=(info.st_dev,info.st_ino)
                         self._invocation=properties['InvocationID'];self._same_invocation(show_unit())
                         self.verify_current_inputs();return self
-                if self._wrapper.poll() is not None:break
+                if self._wrapper.poll() not in (None,0):break
                 time.sleep(0.02)
             raise ValueError('Inventory refresh service creation unconfirmed')
         except BaseException:
             self.close();raise
 
-    def _same_invocation(self,properties):
-        _require(properties['LoadState']=='loaded' and properties['Transient']=='yes' and properties['Description']==self._marker and
-                 properties['InvocationID']==self._invocation and properties['ControlGroup']==CGROUP and cgroup_identity()==self._cgroup)
+    def _same_invocation(self,properties,*,allow_trimmed=False):
+        _require(properties['LoadState']=='loaded' and properties['Transient']=='yes' and
+                 properties['Description']==self._marker and properties['InvocationID']==self._invocation)
+        terminal=allow_trimmed and inert(properties)
+        _require(properties['ControlGroup']==CGROUP or terminal and properties['ControlGroup']=='')
+        try:actual=cgroup_identity()
+        except FileNotFoundError:
+            # Same retained FAILED incarnation is bookkeeping data only. Its
+            # missing name is never kernel-empty or publication authority.
+            _require(terminal and self._cgroup_fd is not None)
+            info=os.fstat(self._cgroup_fd);actual=(info.st_dev,info.st_ino)
+        else:_require(properties['ControlGroup']==CGROUP)
+        _require(actual==self._cgroup)
 
     def poll(self):
-        _require(self._wrapper is not None);return self._wrapper.poll()
+        _require(self._wrapper is not None and self._invocation is not None)
+        properties=show_unit();result=terminal_status(properties)
+        self._same_invocation(properties,allow_trimmed=result is not None)
+        if result is not None:
+            final=show_unit();self._same_invocation(final,allow_trimmed=True)
+            _require(terminal_status(final)==result)
+        return result
 
     def wait(self,timeout):
-        _require(self._wrapper is not None);return self._wrapper.wait(timeout=timeout)
+        _require(type(timeout) in (int,float) and 0<timeout<=610)
+        deadline=time.monotonic()+timeout
+        while True:
+            result=self.poll()
+            if result is not None:return result
+            if time.monotonic()>=deadline:raise subprocess.TimeoutExpired(UNIT,timeout)
+            time.sleep(0.02)
 
     def close(self):
         if self._closed:return
@@ -251,7 +280,24 @@ class RefreshService:
         try:
             if self._invocation is not None:
                 properties=show_unit()
-                if properties['LoadState']!='not-found':self._same_invocation(properties);stop_unit()
+                if properties['LoadState']!='not-found':
+                    terminal=inert(properties)
+                    self._same_invocation(properties,allow_trimmed=terminal)
+                    if not terminal:stop_unit()
+                    properties=show_unit()
+                    if properties['LoadState']!='not-found':
+                        _require(inert(properties));self._same_invocation(properties,allow_trimmed=True)
+                        self._journal._held_lock()
+                        final=show_unit()
+                        _require(inert(final));self._same_invocation(final,allow_trimmed=True)
+                        reset_unit()
+                        deadline=time.monotonic()+2
+                        while True:
+                            remaining=show_unit()
+                            if remaining['LoadState']=='not-found':break
+                            _require(remaining['InvocationID']==self._invocation and remaining['Description']==self._marker)
+                            if time.monotonic()>=deadline:raise ValueError('Inventory owned unit acknowledgement unconfirmed')
+                            time.sleep(0.02)
         finally:
             try:
                 if self._wrapper is not None:

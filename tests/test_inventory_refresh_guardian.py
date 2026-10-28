@@ -3,7 +3,7 @@ import importlib.util
 from pathlib import Path
 from types import SimpleNamespace
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, patch, mock_open
 
 ROOT=Path(__file__).resolve().parents[1]
 SPEC=importlib.util.spec_from_file_location('refresh_guardian',ROOT/'scripts/inventory_refresh_guardian.py')
@@ -36,6 +36,20 @@ class GuardianTests(unittest.TestCase):
         child.kill.assert_called_once_with()
         child.wait.assert_not_called()
         spawn.assert_called_once_with()
+
+    def test_only_guardian_entry_maps_success_to_retained_sentinel(self):
+        self.assertEqual(guardian.retained_exit(0),90)
+        for result in (74,75,76):self.assertEqual(guardian.retained_exit(result),result)
+        child=SimpleNamespace(poll=Mock(return_value=90),kill=Mock())
+        self.assertEqual(guardian.supervise(100,200,lambda:child,lambda:101,Mock()),74)
+        self.assertEqual(guardian.retained_exit(90),74)
+
+    def test_guardian_entry_converts_only_normal_supervision_completion(self):
+        job={'boot_id':'11111111-1111-4111-8111-111111111111','started_boottime_ms':100,'deadline_boottime_ms':1000}
+        worker=Mock();worker.parse_job.return_value=job
+        accounts=[SimpleNamespace(pw_uid=60001,pw_gid=60001),SimpleNamespace(pw_uid=60002,pw_gid=60002)]
+        with patch.object(guardian.sys,'platform','linux'),patch.object(guardian.sys,'argv',['guardian.py']),patch.object(guardian.sys,'flags',SimpleNamespace(isolated=True)),patch.object(guardian.os,'getresuid',return_value=(0,0,0),create=True),patch.object(guardian.os,'getresgid',return_value=(0,0,0),create=True),patch.object(guardian,'load_worker',return_value=worker),patch.object(guardian.pwd,'getpwnam',side_effect=accounts),patch.object(guardian.os,'getgrouplist',return_value=[60002],create=True),patch('builtins.open',mock_open(read_data=job['boot_id'])),patch.object(guardian,'supervise',return_value=0):
+            self.assertEqual(guardian.guardian_main(),90)
 
     def test_early_exit_never_claims_descendant_cleanup(self):
         child=SimpleNamespace(poll=Mock(return_value=0),kill=Mock())

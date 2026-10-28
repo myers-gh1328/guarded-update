@@ -18,12 +18,13 @@ class ServiceTests(unittest.TestCase):
         value=object.__new__(service.ObservationService)
         value._closed=False;value._wrapper=Mock();value._wrapper.poll.return_value=None
         value._invocation='a'*32;value._cgroup=(1,2);value._cgroup_fd=None
+        value._journal=Mock()
         value._marker='Command Center inventory observation '+'b'*32
         return value
 
     def properties(self,value,**changes):
         result={'LoadState':'loaded','ActiveState':'active','Transient':'yes','Description':value._marker,
-                'InvocationID':value._invocation,'ControlGroup':service.CGROUP,'MainPID':'100'}
+                'InvocationID':value._invocation,'ControlGroup':service.CGROUP,'MainPID':'100','SubState':'running','ExecMainCode':'0','ExecMainStatus':'0','Result':'success'}
         result.update(changes);return result
 
     def test_fresh_adapter_object_cannot_relaunch_same_durable_running_job(self):
@@ -74,7 +75,7 @@ class ServiceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             fd=os.open(directory,os.O_RDONLY|os.O_DIRECTORY)
             try:
-                with self.root_launch_context(value),patch.object(service,'SourceBundle') as bundle,patch.object(service,'show_unit',side_effect=[{'LoadState':'not-found'},properties,properties,properties]),patch.object(service,'open_cgroup',return_value=fd),patch.object(value,'_same_invocation'),patch.object(service.subprocess,'Popen',return_value=wrapper),patch.object(service,'stop_unit') as stop:
+                with self.root_launch_context(value),patch.object(service,'SourceBundle') as bundle,patch.object(service,'show_unit',side_effect=[{'LoadState':'not-found'},properties,properties,properties,{'LoadState':'not-found'}]),patch.object(service,'open_cgroup',return_value=fd),patch.object(value,'_same_invocation'),patch.object(service.subprocess,'Popen',return_value=wrapper),patch.object(service,'stop_unit') as stop:
                     bundle.return_value.close.side_effect=OSError('source fd close uncertain')
                     with self.assertRaises(OSError):value.launch()
                     stop.assert_called_once();wrapper.kill.assert_called_once();wrapper.wait.assert_called_once()
@@ -111,6 +112,48 @@ class ServiceTests(unittest.TestCase):
                      'TemporaryFileSystem=/etc:ro /var/lib:ro /run:ro','TasksMax=2'):
             self.assertIn(prop,argv)
         with self.assertRaises(TypeError):service.observation_argv('caller option')
+
+    def test_launch_uses_private_manager_without_system_bus_wait_or_stdio(self):
+        args=service.observation_argv() if hasattr(service,'observation_argv') else service.refresh_argv('a'*32)
+        for forbidden in ('--wait','--pipe','--collect'):self.assertNotIn(forbidden,args)
+        self.assertIn('RemainAfterExit=no',args);self.assertIn('SuccessExitStatus=',args)
+
+    def test_launcher_exit_zero_is_not_unit_completion_and_failed_sentinel_is_raw(self):
+        value=self.owned();value._wrapper.poll.return_value=0
+        running=self.properties(value)
+        terminal=self.properties(value,ActiveState='failed',SubState='failed',MainPID='0',ExecMainCode='1',ExecMainStatus='90',Result='exit-code')
+        with patch.object(service,'show_unit',return_value=running),patch.object(service,'cgroup_identity',return_value=(1,2)):
+            self.assertIsNone(value.poll())
+        with patch.object(service,'show_unit',return_value=terminal),patch.object(service,'cgroup_identity',return_value=(1,2)):
+            self.assertEqual(value.poll(),90)
+        foreign=dict(terminal,InvocationID='c'*32)
+        with patch.object(service,'show_unit',side_effect=[terminal,foreign]),patch.object(service,'cgroup_identity',return_value=(1,2)):
+            with self.assertRaises(ValueError):value.poll()
+
+    def test_trimmed_group_is_only_owned_failed_data_and_running_replacement_is_rejected(self):
+        value=self.owned();value._wrapper.poll.return_value=0
+        terminal=self.properties(value,ActiveState='failed',SubState='failed',MainPID='0',ExecMainCode='1',ExecMainStatus='90',Result='exit-code',ControlGroup='')
+        with tempfile.TemporaryDirectory() as directory:
+            value._cgroup_fd=os.open(directory,os.O_RDONLY|os.O_DIRECTORY)
+            info=os.fstat(value._cgroup_fd);value._cgroup=(info.st_dev,info.st_ino)
+            try:
+                with patch.object(service,'show_unit',return_value=terminal),patch.object(service,'cgroup_identity',side_effect=FileNotFoundError):
+                    self.assertEqual(value.poll(),90)
+                active=dict(terminal,ActiveState='active',SubState='running',MainPID='100')
+                with patch.object(service,'show_unit',return_value=active),patch.object(service,'cgroup_identity',side_effect=FileNotFoundError):
+                    with self.assertRaises(ValueError):value.poll()
+            finally:os.close(value._cgroup_fd);value._cgroup_fd=None
+
+    def test_owned_retained_failed_unit_is_acknowledged_without_stopping_replacement(self):
+        value=self.owned();value._wrapper.poll.return_value=0
+        terminal=self.properties(value,ActiveState='failed',SubState='failed',MainPID='0',ExecMainCode='1',ExecMainStatus='76',Result='exit-code')
+        with patch.object(service,'show_unit',side_effect=[terminal,terminal,terminal,{'LoadState':'not-found'}]),patch.object(service,'cgroup_identity',return_value=(1,2)),patch.object(service,'stop_unit') as stop,patch.object(service,'reset_unit',create=True) as reset:
+            value.close();reset.assert_called_once_with();stop.assert_not_called()
+        value=self.owned();value._wrapper.poll.return_value=0
+        foreign=dict(terminal,InvocationID='c'*32)
+        with patch.object(service,'show_unit',side_effect=[terminal,terminal,foreign]),patch.object(service,'cgroup_identity',return_value=(1,2)),patch.object(service,'stop_unit') as stop,patch.object(service,'reset_unit',create=True) as reset:
+            with self.assertRaises(ValueError):value.close()
+            reset.assert_not_called();stop.assert_not_called()
 
     def test_same_name_replacement_is_never_stopped_but_owned_wrapper_reaped(self):
         value=self.owned()

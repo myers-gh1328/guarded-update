@@ -10,6 +10,7 @@ import os
 import secrets
 
 from inventory_refresh_protocol import correlator,safe_integer
+from inventory_refresh_guardian import COMPLETED_EXIT
 from inventory_refresh_state import boot
 from inventory_refresh_coordinator import publish_current_status
 from inventory_refresh_materializer import RefreshMaterializer
@@ -122,7 +123,7 @@ class RefreshTransaction:
             stage='service_cleanup';service.close();service=None
             stage='publication_admission';self._writers.check();self._resources.sample();self._policy.recheck()
             finished=self._time(boot_id)[1]
-            if result!=0 or finished>=job['deadline_boottime_ms']:
+            if result!=COMPLETED_EXIT or finished>=job['deadline_boottime_ms']:
                 reason='timeout' if result==76 or finished>=job['deadline_boottime_ms'] else (
                     'repository_failed' if result==75 else 'policy_unsupported' if result==74 else 'internal_error')
                 self._journal.finish('refresh',nonce,boot_id,finished,'failed',reason)

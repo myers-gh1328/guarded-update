@@ -51,6 +51,11 @@ class ObserverTests(unittest.TestCase):
         argv=observer.native_argv()
         self.assertEqual(argv,('/usr/bin/setpriv','--inh-caps=-all','--ambient-caps=-all','--bounding-set=-all','--no-new-privs','/usr/bin/python3','-I','-B',observer.LIB_ROOT+'/observation-native.py'))
 
+    def test_guardian_entry_retains_completion_without_changing_native_success(self):
+        with patch.object(observer,'identity'),patch.object(observer,'kernel_clock',return_value=(BOOT,105)),patch.object(observer.ObservationChannel,'fixed') as channel,patch.object(observer,'supervise',return_value=0):
+            channel.return_value.read_job.return_value=JOB
+            self.assertEqual(observer.run_guardian(),90)
+
     def test_guardian_rejects_stale_boot_before_spawn(self):
         with patch.object(observer,'identity'),patch.object(observer,'kernel_clock',return_value=('22222222-2222-4222-8222-222222222222',105)),patch.object(observer.ObservationChannel,'fixed') as channel,patch.object(observer.subprocess,'Popen') as spawn:
             channel.return_value.read_job.return_value=JOB

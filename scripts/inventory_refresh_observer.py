@@ -10,7 +10,7 @@ import time
 
 from inventory_refresh_cached_observation import CachedObservation, ObservationResult
 from inventory_refresh_channel import ObservationChannel
-from inventory_refresh_guardian import supervise, LIB_ROOT, ENV
+from inventory_refresh_guardian import supervise, retained_exit, LIB_ROOT, ENV
 from inventory_refresh_observation import _Ancestry, ObservationError
 from inventory_refresh_protocol import safe_integer
 from inventory_refresh_state import boot
@@ -98,7 +98,7 @@ def run_guardian():
         def spawn():
             return subprocess.Popen(native_argv(),stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,env=ENV,close_fds=True,cwd='/')
-        return supervise(job.started_boottime_ms,job.deadline_boottime_ms,spawn,clock=clock)
+        return retained_exit(supervise(job.started_boottime_ms,job.deadline_boottime_ms,spawn,clock=clock))
     except Exception:return 74
     finally:
         if channel is not None:channel.close()
