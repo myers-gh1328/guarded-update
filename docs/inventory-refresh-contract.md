@@ -514,3 +514,30 @@ Public helper status remains schema1. Retained metadata alone never proves that
 the cache survived reboot, still exists or matches current admitted policy;
 coordinator projection must obtain a fresh snapshot under its held lock and
 verify all those bindings before advertising usable cache evidence.
+
+### Journal, cache and public status coordination
+
+`publish_current_status` obtains a fresh reconciled journal snapshot under the
+held root lock and publishes through the same journal's typed status writer.
+The fixed OS runtime must supply actual boot identity, current admitted policy
+and metadata from an actual held cache lease; this function grants no OS or
+process authority. Available cache metadata must match retained success in
+boot, cache generation, policy and checked timestamp, including current policy.
+A manifest alone is insufficient. Later failed/deferred attempts retain that
+matching prior cache time; execution wall times remain null when not captured.
+No-work completion uses only its durable decision time.
+
+Operational uncertainty, missing policy, policy mismatch in any refresh phase,
+and cache loss/reboot after success produce an uncorrelated health status:
+`operation_nonce` and `attempt` are null. The private refresh record remains
+unchanged. Clients must not merge that health into an existing correlated helper
+proof. Active observation cannot be granted through uncertain or unavailable
+state. Observation receipts remain independent typed historical evidence.
+Top-level prior-cache metadata is not evidence that a failed/deferred attempt
+produced a generation; the client adapter must not fill that attempt's helper
+cache/policy proof from retained cache fields.
+
+This slice connects actual journal durability and atomic public-file I/O.
+Fixed OS admission, native child-result validation, policy/cache pinning across
+the physical lifecycle and the executable reporter adapter remain required
+before activation. The projection tests do not claim those integration gates.
