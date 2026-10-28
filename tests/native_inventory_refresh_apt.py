@@ -186,7 +186,10 @@ def run_worker(policy, number):
     status = result.returncode
     empty_worker()
     if status not in [0, 74, 75, 76]:
-        raise AssertionError('Fixed worker failed outside its safe exit contract')
+        # Publish only a fixed classification and numeric fixture identity; never native output.
+        collision = b'already exists' in result.stderr or b'already loaded' in result.stderr
+        reason = 'unit_name_in_use' if collision else 'unclassified_launcher_failure'
+        raise AssertionError(f'Fixed worker failed outside its safe exit contract (iteration={number}, exit={status}, reason={reason})')
     return status, token, job['policy_generation']
 
 
