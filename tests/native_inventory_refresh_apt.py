@@ -40,6 +40,7 @@ from inventory_refresh_cached_observation import ObservationJob, CachedObservati
 from inventory_refresh_channel import ObservationChannel
 from inventory_refresh_state import Journal
 from inventory_refresh_io import Inbox
+from inventory_refresh_policy_admission import PolicyGuard
 
 WORKER = 60001
 READER = 60002
@@ -533,7 +534,8 @@ def stopped_child_proof(args,job):
             launcher.wait(timeout=5)
 
 
-def run_worker(policy, number, *, stopped_child=False):
+def run_worker(policy, number, *, stopped_child=False, policy_guard=None):
+    if policy_guard is not None:policy_guard.recheck()
     empty_worker()
     token = f'{number:032x}'
     stage = Path(CACHE_ROOT)/('staging-'+token)
@@ -543,7 +545,7 @@ def run_worker(policy, number, *, stopped_child=False):
         directory = stage/relative
         directory.mkdir(mode=0o700)
         os.chown(directory, WORKER, WORKER)
-    rendered = render_policy(policy, token)
+    rendered = render_policy(policy, token) if policy_guard is None else policy_guard.render(token)
     for relative, data in rendered.items():
         target = Path(RUNTIME_ROOT)/'worker-apt.conf' if relative == 'apt.conf' else Path(POLICY_ROOT)/'apt'/relative
         write_root(target, data)
@@ -556,7 +558,7 @@ def run_worker(policy, number, *, stopped_child=False):
     nonce = f'{number:016x}'+secrets.token_hex(8)
     job = {'schema_version': 1, 'staging_token': token,
            'config_sha256': hashlib.sha256(rendered['apt.conf']).hexdigest(),
-           'policy_generation': policy_generation(b'k'*32, policy),
+           'policy_generation': policy_generation(b'k'*32, policy) if policy_guard is None else policy_guard.generation,
            'operation_nonce': nonce, 'helper_sequence': number,
            'boot_id': Path('/proc/sys/kernel/random/boot_id').read_text().strip(),
            'accepted_boottime_ms': now, 'started_boottime_ms': now, 'deadline_boottime_ms': now+(8000 if stopped_child else 600000)}
@@ -576,9 +578,11 @@ def run_worker(policy, number, *, stopped_child=False):
         '/usr/bin/python3', '-I', '-B', str(LIB_ROOT/'guardian.py')]
     if stopped_child:
         return stopped_child_proof(args,job),token,job['policy_generation']
+    if policy_guard is not None:policy_guard.recheck()
     result = subprocess.run(args, env=ENV, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=610)
     status = result.returncode
     empty_worker()
+    if policy_guard is not None:policy_guard.recheck()
     if status not in [0, 74, 75, 76]:
         # Publish only a fixed classification and numeric fixture identity; never native output.
         collision = b'already exists' in result.stderr or b'already loaded' in result.stderr
@@ -604,6 +608,7 @@ def main():
     accounts = []
     mounted = False
     server = None
+    private_policy_guard = None
     signers = []
     hook = Path('/etc/apt/apt.conf.d/99inventory-isolation-proof')
     assert not hook.exists()
@@ -687,7 +692,7 @@ def main():
         server.socket = context.wrap_socket(server.socket, server_side=True)
         threading.Thread(target=server.serve_forever, daemon=True).start()
         uri = 'https://127.0.0.1:'+str(server.server_port)+'/repo'
-        def policy(certificate_path=ca, signing_key=public, password=PASSWORD, missing=False):
+        def policy(certificate_path=ca, signing_key=public, password=PASSWORD, missing=False, raw=False):
             value = {'schema_version': 1, 'architectures': [architecture],
                 'sources': [{'id': 'fixture', 'type': 'deb', 'uri': uri, 'suites': ['proof'],
                              'components': ['main'], 'architectures': [architecture], 'signed_by': ['fixture']}],
@@ -699,13 +704,37 @@ def main():
             if missing:
                 extra = dict(value['sources'][0], id='missing', uri=uri+'/missing')
                 value['sources'].append(extra)
-            return parse_policy(json.dumps(value).encode())
+            data=json.dumps(value).encode()
+            return data if raw else parse_policy(data)
         # If host config leaked, this hook would be allowed to write the first active stage.
         marker = Path(CACHE_ROOT)/('staging-'+f'{1:032x}')/'host-hook-ran'
         hook.write_text('APT::Update::Pre-Invoke { "/usr/bin/touch '+str(marker)+'"; };\n')
         good = policy()
+        for name,data in [('policy.json',policy(raw=True)),('policy-commitment.key',b'k'*32)]:
+            target=Path(POLICY_ROOT)/name;target.write_bytes(data);os.chown(target,0,0);target.chmod(0o600)
+        private_policy_guard=PolicyGuard.fixed()
+        assert private_policy_guard.generation==policy_generation(b'k'*32,good)
+        # Real low-privilege UIDs must not read either private root input. The
+        # probe checks actual kernel IDs/capabilities before attempting access.
+        probe="""import os,sys
+identity=sys.argv[1]
+fields=dict(line.split(':',1) for line in open('/proc/self/status').read().splitlines())
+assert all(fields[key].split()==[identity]*4 for key in ('Uid','Gid'))
+assert not fields['Groups'].split() and fields['NoNewPrivs'].split()==['1']
+assert all(int(fields[key].strip(),16)==0 for key in ('CapInh','CapPrm','CapEff','CapBnd','CapAmb'))
+for path in sys.argv[2:]:
+ try:fd=os.open(path,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK)
+ except PermissionError:pass
+ else:
+  os.close(fd);sys.exit(91)
+"""
+        for identity in (WORKER,READER):
+            result=subprocess.run(list(worker_argv(identity,identity)[:-1])+['-c',probe,str(identity),
+                str(Path(POLICY_ROOT)/'policy.json'),str(Path(POLICY_ROOT)/'policy-commitment.key')],
+                env=ENV,stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=5)
+            assert result.returncode==0, 'Private root input UID/capability exclusion failed'
         prove_privilege_transition()
-        status, stage, generation = run_worker(good, 1)
+        status, stage, generation = run_worker(good, 1,policy_guard=private_policy_guard)
         assert status == 0, f'Valid signed TLS/authenticated repository refresh failed (exit={status})'
         assert Handler.requests > 0 and not marker.exists(), 'Host APT configuration leaked'
         lists = Path(CACHE_ROOT)/('staging-'+stage)/'lists'
@@ -713,10 +742,13 @@ def main():
         cache = os.open(CACHE_ROOT, os.O_RDONLY | os.O_DIRECTORY)
         store = Store(cache, 0, READER, WORKER)
         try:
+            private_policy_guard.recheck()
             store.publish(stage, 'a'*32, generation, datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'))
+            private_policy_guard.recheck()
             observation=prove_cache_pinned_observation(store,base)
             observation.update(prove_observation_process(store,base))
             observation.update(prove_observation_process(store,base,stopped_child=True))
+            private_policy_guard.recheck()
             previous = (Path(CACHE_ROOT)/'current.json').read_bytes()
             for number, candidate in [(2, policy(certificate_path=wrong_ca)),
                                       (3, policy(signing_key=wrong_public)),
@@ -740,6 +772,8 @@ def main():
             'synthetic_repository_only': True, 'target_repository_fit_proven': False,
             'coordinator_exercised': False, 'apt_refresh_exercised': True,
             'root_guardian_fixed_privilege_drop_exercised': True,
+            'fixed_root_policy_guard_and_current_commitment_verified':True,
+            'worker_and_reporter_private_policy_key_read_denied':True,
             'exact_guardian_capability_masks_verified': True,
             'unadmitted_package_sibling_and_matching_bytecode_ignored': True,
             'independent_deadline_fault_proof': True,
@@ -753,31 +787,34 @@ def main():
             'previous_current_retained_after_failure': True,
             'worker_memory_peak': int((cgroup(PARENT_SLICE)/'memory.peak').read_text()),**observation}
     finally:
-        if server is not None:
-            server.shutdown()
-            server.server_close()
-        if mounted:
-            empty_worker()
-            command(['/bin/umount', CACHE_ROOT])
-        for name in [WORKER_SLICE, PARENT_SLICE]:
-            subprocess.run(['/bin/systemctl', 'stop', name], env=ENV,
-                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
-        for path in unit_files:
-            if path.exists():
-                path.unlink()
-        command(['/bin/systemctl', 'daemon-reload'])
-        if hook.exists():
-            hook.unlink()
-        for path in [Path(POLICY_ROOT), Path(CACHE_ROOT), Path(RUNTIME_ROOT), LIB_ROOT]:
-            if path.exists():
-                shutil.rmtree(path)
-        for home in signers:
-            command(['/usr/bin/gpgconf', '--homedir', str(home), '--kill', 'gpg-agent'])
-        for account in reversed(accounts):
-            command(['/usr/sbin/userdel', account])
-            subprocess.run(['/usr/sbin/groupdel', account], env=ENV,
-                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
-        shutil.rmtree(base)
+        try:
+            if private_policy_guard is not None:private_policy_guard.close()
+        finally:
+            if server is not None:
+                server.shutdown()
+                server.server_close()
+            if mounted:
+                empty_worker()
+                command(['/bin/umount', CACHE_ROOT])
+            for name in [WORKER_SLICE, PARENT_SLICE]:
+                subprocess.run(['/bin/systemctl', 'stop', name], env=ENV,
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
+            for path in unit_files:
+                if path.exists():
+                    path.unlink()
+            command(['/bin/systemctl', 'daemon-reload'])
+            if hook.exists():
+                hook.unlink()
+            for path in [Path(POLICY_ROOT), Path(CACHE_ROOT), Path(RUNTIME_ROOT), LIB_ROOT]:
+                if path.exists():
+                    shutil.rmtree(path)
+            for home in signers:
+                command(['/usr/bin/gpgconf', '--homedir', str(home), '--kill', 'gpg-agent'])
+            for account in reversed(accounts):
+                command(['/usr/sbin/userdel', account])
+                subprocess.run(['/usr/sbin/groupdel', account], env=ENV,
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
+            shutil.rmtree(base)
     assert fingerprint(['/var/lib/dpkg/status', '/var/lib/apt/lists', '/etc/apt']) == before
     proof['host_apt_state_unchanged'] = True
     proof['owned_worker_cgroup_empty_before_publish'] = True
