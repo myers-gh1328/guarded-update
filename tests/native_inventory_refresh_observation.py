@@ -1,0 +1,72 @@
+#!/usr/bin/python3
+"""Disposable hosted-Linux proof of native observation primitives only.
+
+No refresh, installation, update execution or cache-coherence claim is made.
+The receipt's cache/policy identities are synthetic; the native locks, installed
+state fingerprint, monotonic clock and release evidence are actual runner data.
+"""
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import time
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]/'scripts'))
+from inventory_refresh_observation import NativeReadLocks, Observation
+
+TRY_LOCK = '''import fcntl, os, sys
+fd=os.open(sys.argv[1],os.O_RDWR|os.O_NOFOLLOW)
+try:
+ if sys.argv[2]=='native': fcntl.lockf(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)
+ else: fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)
+except BlockingIOError:
+ sys.exit(75)
+sys.exit(0)
+'''
+LOCKS = (('/var/lib/dpkg/lock-frontend', 'native'),
+         ('/var/lib/dpkg/lock', 'native'),
+         ('/run/guarded-update-executor.lock', 'executor'))
+
+
+def attempt(path, namespace):
+    return subprocess.run([sys.executable, '-I', '-c', TRY_LOCK, path, namespace],
+                          stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                          stderr=subprocess.DEVNULL, timeout=5, check=False).returncode
+
+
+def main():
+    if sys.platform != 'linux' or os.geteuid() != 0 or os.environ.get('GITHUB_ACTIONS') != 'true':
+        raise RuntimeError('Disposable hosted Linux root runner required')
+    with open('/proc/sys/kernel/random/boot_id', 'r', encoding='ascii') as source:
+        boot = source.read(64).strip()
+    def clock():
+        return boot, time.clock_gettime_ns(time.CLOCK_BOOTTIME)//1_000_000
+    accepted = clock()[1]
+    guard = NativeReadLocks.fixed()
+    observation = None
+    try:
+        observation = Observation.begin(guard, '0000000000000001'+'a'*16, boot,
+                                        'b'*32, 'c'*64, accepted, clock)
+        for path, namespace in LOCKS:
+            assert attempt(path, namespace) == 75, 'Native writer exclusion failed'
+        receipt = observation.finish('0000000000000001'+'a'*16)
+        assert receipt['outcome'] == 'released'
+        assert receipt['installed_before_sha256'] == receipt['installed_after_sha256']
+        for path, namespace in LOCKS:
+            assert attempt(path, namespace) == 0, 'Owned lock release failed'
+        return {'schema_version': 1, 'scope': 'native_observation_primitives',
+                'cache_policy_identities': 'synthetic', 'native_package_writer_exclusion': True,
+                'actual_executor_guard_exclusion': True, 'fixed_ancestry_verified': True,
+                'installed_state_unchanged_during_observation': True, 'receipt': receipt,
+                'independent_deadline_enforcement_verified': False,
+                'durable_coordinator_verified': False, 'cache_pin_verified': False}
+    finally:
+        if observation is not None:
+            observation.abort()
+        else:
+            guard.close()
+
+
+if __name__ == '__main__':
+    print(json.dumps(main(), sort_keys=True))

@@ -294,3 +294,35 @@ Verified artifact SHA-256 values:
 The proof does not exercise the root coordinator, observation lifecycle, reporter
 adapter or a real device's repositories. Those implementation and rollout gates
 remain open. No device capability was enabled by this evidence.
+
+## Native observation primitives
+
+The staged `inventory_refresh_observation.py` library holds actual POSIX shared
+locks on both native dpkg lock files, together with a shared flock on the existing
+executor guard. These are distinct lock namespaces; package exclusion uses the
+same fcntl record-lock mechanism as [APT's native GetLock implementation](https://github.com/Debian/apt/blob/main/apt-pkg/contrib/fileutl.cc).
+A process-wide owner prevents a second handle from opening/closing a native lock
+inode and inadvertently releasing its process-owned POSIX lock.
+
+The fixed Linux root adapter admits and retains full directory ancestry by FD,
+and checks that the named directories and lock files still identify those objects.
+Installed-state fingerprints cover only fixed status, optional architecture and
+bounded numeric update entries. Framed names/types distinguish missing and empty
+state. Reads stream within 64 MiB and 4,096 update entries, checking native deadline
+throughout enumeration and reads. Unsafe ownership, writable state, links,
+replacement, changed bytes or expired time cannot produce successful evidence.
+
+Observation identity is frozen before collection. An unrelated release nonce
+preserves the active observation. An exact release consumes it once, fingerprints
+under the held locks, verifies continuity, samples held-until before unlock and
+released after unlock. Success requires equal fingerprints and monotonic ordering
+within the fixed 120-second deadline. A failed matching release cleans up only its
+owned descriptors and produces no successful receipt. Unknown descriptor cleanup
+retains the process guard rather than permitting replacement work.
+
+Local regressions exercise real child-process package/executor contention and
+partial-acquisition cleanup against synthetic files. The hosted native proof
+exercises actual runner package locks, native clock and installed-state reads.
+Its cache/policy identifiers are explicitly synthetic: it does not establish
+cache pinning, durable coordinator/status publication or independent deadline
+containment. Those integration gates remain required before activation.
