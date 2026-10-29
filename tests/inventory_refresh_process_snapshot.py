@@ -11,12 +11,35 @@ class ProfileError(ValueError):
 CGROUP=b'0::/command.slice/command-center.slice/command-center-inventory.slice/command-center-inventory.service\n'
 
 
+def identity_failure_category(raw):
+    # Diagnostics only: never include kernel values or alter the admission check.
+    needed={b'Uid',b'Gid',b'Groups',b'NoNewPrivs',b'CapInh',b'CapPrm',b'CapEff',b'CapBnd',b'CapAmb'};fields={}
+    try:
+        for line in raw.splitlines():
+            name,separator,value=line.partition(b':')
+            if name in needed:
+                if not separator or name in fields:return 'profile_identity_fields'
+                fields[name]=value.split()
+        if set(fields)!=needed:return 'profile_identity_fields'
+        if fields[b'Uid']!=[b'60002']*4:return 'profile_uid'
+        if fields[b'Gid']!=[b'60002']*4:return 'profile_gid'
+        if fields[b'Groups']!=[]:return 'profile_groups'
+        if fields[b'NoNewPrivs']!=[b'1']:return 'profile_nnp'
+        if any(fields[key]!=[b'0000000000000000'] for key in needed if key.startswith(b'Cap')):return 'profile_caps'
+    except BaseException:pass
+    return 'profile_identity_fields'
+
+
 def validate_snapshot(pid,stat,status,cgroup,mountinfo,device):
     stage='profile_device'
     try:
         assert type(device) is tuple and len(device)==2 and all(type(v) is int and v>=0 for v in device)
         stage='profile_stat';start=process_start_ticks(stat,pid)
-        stage='profile_status';validate_process_view(status,pid,None);validate_kernel_identity(status,60002,60002)
+        stage='profile_view';validate_process_view(status,pid,None)
+        stage='profile_identity_fields'
+        try:validate_kernel_identity(status,60002,60002)
+        except BaseException:
+            stage=identity_failure_category(status);raise
         stage='profile_cgroup';assert type(cgroup) is bytes and cgroup==CGROUP
         stage='profile_mount';rows=mount_rows(mountinfo).values()
         groups=[row for row in rows if row['fs']==b'cgroup2']
@@ -129,7 +152,8 @@ class ProcessProbe:
         except BaseException as exc:
             self._failed=True
             labels={'check','stat','status','cgroup','mountinfo','profile','stat_recheck','final',
-                'profile_device','profile_stat','profile_status','profile_cgroup','profile_mount'}
+                'profile_device','profile_stat','profile_view','profile_identity_fields','profile_uid','profile_gid',
+                'profile_groups','profile_nnp','profile_caps','profile_cgroup','profile_mount'}
             if isinstance(exc,ProfileError) and str(exc) in labels:stage=str(exc)
             if os.geteuid()==0 and os.environ.get('GITHUB_ACTIONS')=='true' and stage in labels:
                 print('Native fixture process probe stage='+stage,file=sys.stderr)
