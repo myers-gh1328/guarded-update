@@ -54,6 +54,16 @@ def validate_snapshot(pid,stat,status,cgroup,mountinfo,device):
         stage='profile_mount_writable_other'
         for label,match in categories:
             if any(match(row['path']) for row in writable):stage='profile_mount_writable_'+label;break
+        if stage=='profile_mount_writable_nested_descendant':
+            descendants=[row for row in writable if row['path'].startswith(unit+'/')]
+            if len(descendants)!=1:stage+='_multiple'
+            else:
+                row=descendants[0];parts=row['path'][len(unit)+1:].split('/')
+                depth='one' if len(parts)==1 else 'many'
+                leaf='control' if parts[-1]=='.control' else 'init' if parts[-1]=='init.scope' else 'other'
+                root='root' if row['root']=='/' else 'subtree'
+                stack='stacked' if sum(item['path']==row['path'] for item in rows)>1 else 'single'
+                stage+='_'+depth+'_'+leaf+'_'+root+'_'+stack
         assert not writable
         stage='profile_mount_device';assert all(row['device']==device for row in groups)
         stage='profile_mount_root';root=[row for row in groups if row['path']=='/sys/fs/cgroup' and row['root']=='/']
@@ -170,8 +180,16 @@ class ProcessProbe:
                 'profile_mount_writable_nested_descendant','profile_mount_writable_nested_other','profile_mount_writable_sys',
                 'profile_mount_writable_run','profile_mount_writable_var','profile_mount_writable_proc',
                 'profile_mount_writable_other','profile_mount_device','profile_mount_root','profile_mount_nested'}
-            if isinstance(exc,ProfileError) and str(exc) in labels:stage=str(exc)
-            if os.geteuid()==0 and os.environ.get('GITHUB_ACTIONS')=='true' and stage in labels:
+            def permitted(label):
+                if label in labels:return True
+                if label.startswith('profile_mount_writable_nested_descendant_'):
+                    parts=label.removeprefix('profile_mount_writable_nested_descendant_').split('_')
+                    return parts==['multiple'] or (len(parts)==4 and parts[0] in ('one','many') and
+                        parts[1] in ('control','init','other') and parts[2] in ('root','subtree') and parts[3] in ('stacked','single'))
+                return False
+            if isinstance(exc,ProfileError) and permitted(str(exc)):stage=str(exc)
+            safe=permitted(stage)
+            if os.geteuid()==0 and os.environ.get('GITHUB_ACTIONS')=='true' and safe:
                 print('Native fixture process probe stage='+stage,file=sys.stderr)
             raise ValueError('Process profile unavailable') from None
 

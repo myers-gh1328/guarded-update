@@ -62,6 +62,21 @@ class ProcessSnapshotTests(unittest.TestCase):
                 owner.close()
             finally:os.close(fd)
 
+    def test_hosted_descendant_mount_diagnostic_uses_only_fixed_categories(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp);proc=root/'123';proc.mkdir()
+            unit=b'/sys/fs/cgroup/command.slice/command-center.slice/command-center-inventory.slice/command-center-inventory.service'
+            mounts=self.mounts+b'43 1 0:27 / '+unit+b'/secret-name rw - cgroup2 cgroup rw\n'
+            for name,raw in (('stat',self.stat),('status',self.status),('cgroup',self.cgroup),('mountinfo',mounts)):(proc/name).write_bytes(raw)
+            fd=os.open(root,os.O_RDONLY|os.O_DIRECTORY);output=io.StringIO()
+            try:
+                owner=ProcessProbe._from_directory(fd,123,(0,27),time.monotonic()+2,owner=os.getuid())
+                with patch('inventory_refresh_process_snapshot.os.geteuid',return_value=0),patch.dict(os.environ,{'GITHUB_ACTIONS':'true'}),contextlib.redirect_stderr(output):
+                    with self.assertRaises(ValueError):owner.sample()
+                self.assertEqual(output.getvalue(),'Native fixture process probe stage=profile_mount_writable_nested_descendant_one_other_root_single\n')
+                owner.close()
+            finally:os.close(fd)
+
     def test_hosted_failure_reports_only_fixed_probe_stage(self):
         with tempfile.TemporaryDirectory() as temp:
             root=Path(temp);proc=root/'123';proc.mkdir()
@@ -120,7 +135,7 @@ class ProcessSnapshotTests(unittest.TestCase):
 
     def test_writable_nested_mount_relation_to_unit_is_fixed_category(self):
         unit=b'/sys/fs/cgroup/command.slice/command-center.slice/command-center-inventory.slice/command-center-inventory.service'
-        for path,label in ((unit,'unit'),(b'/sys/fs/cgroup/command.slice','ancestor'),(unit+b'/child','descendant')):
+        for path,label in ((unit,'unit'),(b'/sys/fs/cgroup/command.slice','ancestor'),(unit+b'/child','descendant_one_other_root_single')):
             mount=self.mounts+b'43 1 0:27 / '+path+b' rw - cgroup2 cgroup rw\n'
             with self.assertRaisesRegex(ValueError,'profile_mount_writable_nested_'+label):
                 validate_snapshot(self.pid,self.stat,self.status,self.cgroup,mount,(0,27))
