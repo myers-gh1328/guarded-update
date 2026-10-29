@@ -254,7 +254,51 @@ fn oldest_index() -> Option<String> {
         .filter(|v| *v <= i64::MAX as u64)
         .map(|v| crate::timefmt::rfc3339(v as i64))
 }
+#[derive(Clone, Copy)]
+enum MetadataSource {
+    HostCached,
+    #[cfg(test)]
+    SelectedGeneration,
+}
+
 pub fn collect(tools: &impl Tools, report_id: &str, now: &str) -> Result<Value, String> {
+    collect_in_context(
+        tools,
+        report_id,
+        now,
+        MetadataSource::HostCached,
+        oldest_index,
+        || desktop_evidence(std::path::Path::new("/usr/share/applications")),
+    )
+}
+
+// Staged normalizer context only: this neither authenticates a pin nor grants
+// coherent/publication authority. The managed native adapter remains required.
+#[cfg(test)]
+fn collect_selected_generation(
+    tools: &impl Tools,
+    report_id: &str,
+    now: &str,
+) -> Result<Value, String> {
+    collect_in_context(
+        tools,
+        report_id,
+        now,
+        MetadataSource::SelectedGeneration,
+        oldest_index,
+        || desktop_evidence(std::path::Path::new("/usr/share/applications")),
+    )
+}
+
+fn collect_in_context(
+    tools: &impl Tools,
+    report_id: &str,
+    now: &str,
+    source: MetadataSource,
+    read_index_age: impl FnOnce() -> Option<String>,
+    read_desktops: impl FnOnce() -> (std::collections::BTreeSet<String>, bool),
+) -> Result<Value, String> {
+    let host_cached = matches!(source, MetadataSource::HostCached);
     let hostname = tools.text("/bin/hostname", &[], 4096)?.trim().to_owned();
     let architecture = tools
         .text("/usr/bin/uname", &["-m"], 4096)?
@@ -263,10 +307,16 @@ pub fn collect(tools: &impl Tools, report_id: &str, now: &str) -> Result<Value, 
     let (platform, version) = os_release(
         &system_text(std::path::Path::new("/etc/os-release"), 16384).unwrap_or_default(),
     );
+    let index_age = if host_cached { read_index_age() } else { None };
+    let policy_coverage = if host_cached {
+        "APT indexes are never refreshed; cached candidates and holds are observations, not verified repository refresh evidence. Update status remains Unknown."
+    } else {
+        "APT candidates are observations from selected metadata; this scan does not establish a verified metadata refresh. Update status remains Unknown."
+    };
     let mut scan = json!({"schemaVersion":1,"scanId":report_id,"startedAt":now,"completedAt":now,"status":"partial","reachable":true,"inventoryComplete":false,
-      "machine":{"hostname":hostname,"platform":platform,"osVersion":version,"architecture":architecture},"packages":[],"errors":[],"aptIndexOldestAt":oldest_index(),"applicationIdentification":"partial","coverage":[
+      "machine":{"hostname":hostname,"platform":platform,"osVersion":version,"architecture":architecture},"packages":[],"errors":[],"aptIndexOldestAt":index_age,"applicationIdentification":"partial","coverage":[
         "Read-only dpkg/APT package inventory in the dedicated reporting account context.",
-        "APT indexes are never refreshed; cached candidates and holds are observations, not verified repository refresh evidence. Update status remains Unknown.",
+        policy_coverage,
         "Other package managers, manual/portable installations and inaccessible per-user software are not collected.",
         "OS/security update assessment, CVEs, application health, service state and logs are not collected."]});
     let records=tools.text("/usr/bin/dpkg-query",&["--show","--showformat=${db:Status-Status}\\t${binary:Package}\\t${Version}\\t${Architecture}\\n"],8*1024*1024).and_then(|text|installed(&text));
@@ -278,21 +328,29 @@ pub fn collect(tools: &impl Tools, report_id: &str, now: &str) -> Result<Value, 
         return Ok(scan);
     };
     scan["inventoryComplete"] = json!(true);
-    let (visible, desktops_complete) =
-        desktop_evidence(std::path::Path::new("/usr/share/applications"));
-    let owners = tools.text(
-        "/usr/bin/dpkg-query",
-        &["--search", "/usr/share/applications/*.desktop"],
-        1024 * 1024,
-    );
-    let launchers = owners
-        .as_ref()
-        .map(|text| desktop_owners(text, &visible))
-        .unwrap_or_default();
-    if owners.is_ok() && desktops_complete {
-        scan["applicationIdentification"] = json!("available");
+    let (launchers, desktop_complete) = if host_cached {
+        let (visible, desktops_complete) = read_desktops();
+        let owners = tools.text(
+            "/usr/bin/dpkg-query",
+            &["--search", "/usr/share/applications/*.desktop"],
+            1024 * 1024,
+        );
+        (
+            owners
+                .as_ref()
+                .map(|text| desktop_owners(text, &visible))
+                .unwrap_or_default(),
+            owners.is_ok() && desktops_complete,
+        )
     } else {
+        (std::collections::BTreeSet::new(), false)
+    };
+    if desktop_complete {
+        scan["applicationIdentification"] = json!("available");
+    } else if host_cached {
         scan["coverage"].as_array_mut().unwrap().push(json!("Graphical application identification is partial: launcher files or ownership evidence were unavailable, unreadable or exceeded collection limits."));
+    } else {
+        scan["coverage"].as_array_mut().unwrap().push(json!("Graphical application identification is partial: optional launcher and ownership enrichment was not collected for this scan."));
     }
     let held = tools
         .text(
@@ -338,9 +396,14 @@ pub fn collect(tools: &impl Tools, report_id: &str, now: &str) -> Result<Value, 
         }
     }
     if policy_failed {
-        scan["errors"].as_array_mut().unwrap().push(json!(
-            "Cached APT policy unavailable or bounded collection deadline reached."
-        ));
+        scan["errors"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!(if host_cached {
+                "Cached APT policy unavailable or bounded collection deadline reached."
+            } else {
+                "Selected APT policy unavailable or bounded collection deadline reached."
+            }));
     }
     let native = tools
         .text("/usr/bin/dpkg", &["--print-architecture"], 128)
@@ -375,7 +438,11 @@ pub fn collect(tools: &impl Tools, report_id: &str, now: &str) -> Result<Value, 
         } else {
             None
         });
-        row["note"] = json!(if is_held == Some(true) {
+        row["note"] = json!(if !host_cached && is_held == Some(true) {
+            "APT hold observed. Candidate is unverified; update status remains Unknown."
+        } else if !host_cached {
+            "Candidate is unverified; this scan does not establish a verified metadata refresh and update status remains Unknown."
+        } else if is_held == Some(true) {
             "APT hold observed. Cached candidate is unverified; update status remains Unknown."
         } else {
             "Cached candidate is unverified; no metadata refresh performed and update status remains Unknown."
@@ -417,6 +484,110 @@ mod tests {
             Ok("a".repeat(64))
         }
     }
+    #[test]
+    fn selected_generation_keeps_inventory_unknown_without_optional_owner_query() {
+        struct SelectedTools;
+        impl Tools for SelectedTools {
+            fn text(&self, program: &str, args: &[&str], limit: usize) -> Result<String, String> {
+                assert_ne!(
+                    args.first(),
+                    Some(&"--search"),
+                    "Optional desktop lookup consumed native session"
+                );
+                Fake {
+                    installed_available: true,
+                }
+                .text(program, args, limit)
+            }
+            fn sha256(&self, _: &[u8]) -> Result<String, String> {
+                unreachable!()
+            }
+        }
+        let scan =
+            collect_selected_generation(&SelectedTools, "synthetic-report", "2026-01-01T00:00:00Z")
+                .unwrap();
+        assert_eq!(scan["inventoryComplete"], true);
+        assert_eq!(scan["aptIndexOldestAt"], Value::Null);
+        assert_eq!(scan["applicationIdentification"], "partial");
+        assert_eq!(scan["packages"].as_array().unwrap().len(), 2);
+        let cups = scan["packages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["packageId"] == "cups")
+            .unwrap();
+        assert_eq!(cups["latestVersion"], "2");
+        assert_eq!(cups["held"], true);
+        assert_eq!(cups["reliableMatch"], false);
+        assert_eq!(cups["upgradeAvailable"], false);
+        assert!(cups["applicationEvidence"].is_string());
+        assert!(
+            scan["coverage"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|line| line.as_str().unwrap().contains("not collected"))
+        );
+        assert!(!scan.to_string().contains("no metadata refresh performed"));
+    }
+
+    #[test]
+    fn selected_generation_never_reads_host_index_age_or_desktop_files() {
+        let scan = collect_in_context(
+            &Fake {
+                installed_available: true,
+            },
+            "synthetic-report",
+            "2026-01-01T00:00:00Z",
+            MetadataSource::SelectedGeneration,
+            || panic!("Host APT lists read in selected-generation scan"),
+            || panic!("Optional desktop files read in selected-generation scan"),
+        )
+        .unwrap();
+        assert_eq!(scan["aptIndexOldestAt"], Value::Null);
+        assert_eq!(scan["inventoryComplete"], true);
+    }
+
+    #[test]
+    fn default_collector_still_queries_desktop_owners_and_reads_host_metadata() {
+        struct CountOwners(std::sync::atomic::AtomicUsize);
+        impl Tools for CountOwners {
+            fn text(&self, program: &str, args: &[&str], limit: usize) -> Result<String, String> {
+                if args.first() == Some(&"--search") {
+                    self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    return Ok("cups: /synthetic/cups.desktop\n".into());
+                }
+                Fake {
+                    installed_available: true,
+                }
+                .text(program, args, limit)
+            }
+            fn sha256(&self, _: &[u8]) -> Result<String, String> {
+                unreachable!()
+            }
+        }
+        let tools = CountOwners(std::sync::atomic::AtomicUsize::new(0));
+        collect(&tools, "synthetic-report", "2026-01-01T00:00:00Z").unwrap();
+        assert_eq!(tools.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let scan = collect_in_context(
+            &tools,
+            "synthetic-report",
+            "2026-01-01T00:00:00Z",
+            MetadataSource::HostCached,
+            || Some("2025-12-30T00:00:00Z".into()),
+            || {
+                (
+                    std::collections::BTreeSet::from(["/synthetic/cups.desktop".into()]),
+                    true,
+                )
+            },
+        )
+        .unwrap();
+        assert_eq!(scan["aptIndexOldestAt"], "2025-12-30T00:00:00Z");
+        assert_eq!(scan["applicationIdentification"], "available");
+        assert_eq!(tools.0.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
     #[test]
     fn application_coverage_is_partial_for_missing_or_oversized_desktop_evidence() {
         let root = std::env::temp_dir().join(format!("inventory-desktop-{}", std::process::id()));

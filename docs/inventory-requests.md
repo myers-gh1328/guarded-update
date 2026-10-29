@@ -176,3 +176,12 @@ unfinished. Native verification exercises installed, architecture and hold reads
 inside the same fingerprint window as policy. It compares real hold selections
 without changing them; a positive nonempty hold or desktop lookup on every target
 is not established by an empty runner hold set.
+
+The Rust collector has a test-only selected-generation context that reuses its
+existing package normalization. It skips host APT index-age reads and both
+optional desktop traversal and ownership lookup. Index age stays null, graphical
+coverage stays partial, and server application recognition remains available.
+Candidates and holds retain Unknown update status; this context does not verify
+a metadata refresh or authenticate native evidence. The default executable still
+uses host-cached collection. A managed bridge must place every retained OS read
+inside the verified observation interval before this context can be enabled.
