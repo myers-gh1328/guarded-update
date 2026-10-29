@@ -1147,6 +1147,160 @@ mod tests {
         (exchange, record)
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    struct RealExchange {
+        child: std::process::Child,
+        pipes: Option<super::super::reporter_pipe::PipePair>,
+        deadline: std::time::Instant,
+        path: std::path::PathBuf,
+    }
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    impl RealExchange {
+        fn spawn(fixture: &Fixture) -> Result<Self> {
+            Self::spawn_mode(fixture, "")
+        }
+        fn spawn_mode(fixture: &Fixture, suffix: &'static str) -> Result<Self> {
+            use std::process::{Command, Stdio};
+            use std::time::{Duration, Instant};
+            const PROGRAM: &str = r#"
+import sys,json
+def emit(v):
+    sys.stdout.buffer.write((json.dumps(v,separators=(',',':'))+'\n').encode());sys.stdout.buffer.flush()
+def command(i,op,fields=()):
+    raw=sys.stdin.buffer.readline(262145)
+    assert raw.endswith(b'\n') and len(raw)<=262144
+    v=json.loads(raw);assert set(v)=={'schema_version','id','operation'}|set(fields)
+    assert type(v['id']) is int and v['id']==i and v['schema_version']==1 and v['operation']==op
+    return v
+def response(i,op,phase,**fields):emit(dict(schema_version=1,id=i,operation=op,phase=phase,**fields))
+boot='00000000-0000-4000-8000-000000000001';nonce='0000000000000008'+'b'*16
+offer=dict(nonce=nonce,boot_id=boot,cache_generation='a'*32,policy_generation='b'*64,lock_open_boottime_ms=1005,expires_boottime_ms=10000)
+receipt=dict(offer,lock_held_until_boottime_ms=1012,released_boottime_ms=1012,outcome='released',installed_before_sha256='c'*64,installed_after_sha256='c'*64)
+response(0,'initialize','pinned',context=dict(cache_generation='a'*32,policy_generation='b'*64,successful_checked_at='2026-01-01T00:00:00.123456Z',boot_id=boot,pinned_boottime_ms=1001))
+assert command(1,'publish_observation',('nonce',))['nonce']==nonce;response(1,'publish_observation','published')
+command(2,'await_open');response(2,'await_open','scan_proposed',offer=offer,scan_started_boottime_ms=1010)
+assert command(3,'scan_admitted',('scan_started_boottime_ms',))['scan_started_boottime_ms']==1010;response(3,'scan_admitted','scanning',scan_started_boottime_ms=1010)
+data={4:('installed','installed\tinventory-proof:arm64\t0.9\tarm64\n'),5:('holds',''),6:('policy','inventory-proof:arm64:\n  Installed: 0.9\n  Candidate: 1.0\n  Version table:\n     1.0 123\n        123 https://repo.invalid stable/main arm64 Packages\n'),7:('architecture','arm64\n')}
+for i,(op,text) in data.items():
+    v=command(i,op,('packages',) if op=='policy' else ())
+    if op=='policy':assert v['packages']==['inventory-proof:arm64']
+    if text:response(i,op,'data',chunk_index=0,text=text)
+    response(i,op,'data_complete',chunks=int(bool(text)),utf8_bytes=len(text.encode()))
+command(8,'freeze_scan');response(8,'freeze_scan','scan_frozen',scan=dict(scan_started_boottime_ms=1010,scan_finished_boottime_ms=1012,installed_before_sha256='c'*64,installed_after_sha256='c'*64))
+assert command(9,'publish_release',('nonce',))['nonce']==nonce;response(9,'publish_release','published')
+command(10,'await_receipt');response(10,'await_receipt','prepared',evidence=dict(schema_version=1,scan_started_boottime_ms=1010,scan_finished_boottime_ms=1012,successful_checked_at='2026-01-01T00:00:00.123456Z',observation_receipt=receipt))
+"#;
+            require(matches!(
+                suffix,
+                "" | "\nsys.exit(3)\n"
+                    | "\nsys.stdout.buffer.write(b'noise');sys.stdout.buffer.flush()\n"
+            ))?;
+            let program = format!("{PROGRAM}{suffix}");
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut child = Command::new("/usr/bin/python3")
+                .args(["-I", "-B", "-S", "-c", &program])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .map_err(|_| ERROR.to_owned())?;
+            let pipes = super::super::reporter_pipe::PipePair::new(
+                child.stdin.take().ok_or(ERROR)?,
+                child.stdout.take().ok_or(ERROR)?,
+                deadline,
+            )
+            .map_err(|_| ERROR.to_owned())?;
+            Ok(Self {
+                child,
+                pipes: Some(pipes),
+                deadline,
+                path: fixture.dir.join("requests.json"),
+            })
+        }
+        fn finish(mut self) -> Result<()> {
+            let mut pipes = self.pipes.take().ok_or(ERROR)?;
+            let eof = pipes.require_eof().is_ok();
+            let closed = pipes.close().is_ok();
+            let after_close_in_time = std::time::Instant::now() < self.deadline;
+            let exit = loop {
+                match self.child.try_wait() {
+                    Ok(Some(status)) => {
+                        break status.success() && std::time::Instant::now() < self.deadline;
+                    }
+                    Err(_) => break false,
+                    Ok(None) => {}
+                }
+                if std::time::Instant::now() >= self.deadline {
+                    break false;
+                }
+                let remaining = self
+                    .deadline
+                    .saturating_duration_since(std::time::Instant::now());
+                std::thread::sleep(remaining.min(std::time::Duration::from_millis(2)));
+            };
+            require(eof && closed && after_close_in_time && exit)
+        }
+    }
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    impl Exchange for RealExchange {
+        fn sample(&mut self) -> Result<Clock> {
+            Ok(clock(1012))
+        }
+        fn read(&mut self) -> Result<Vec<u8>> {
+            self.pipes
+                .as_mut()
+                .ok_or(ERROR)?
+                .read_frame()
+                .map_err(|_| ERROR.into())
+        }
+        fn write(&mut self, raw: &[u8]) -> Result<()> {
+            let command: Value = serde_json::from_slice(raw).map_err(|_| ERROR.to_owned())?;
+            let saved: Value =
+                serde_json::from_slice(&std::fs::read(&self.path).map_err(|_| ERROR.to_owned())?)
+                    .map_err(|_| ERROR.to_owned())?;
+            let active = &saved["collection"]["active"];
+            if command["operation"] == "publish_observation" {
+                require(
+                    active["submitted"] == true
+                        && active["native_attempt"]["observation_nonce"] == command["nonce"]
+                        && active["proof"]["evidence"]["scan"].is_null(),
+                )?;
+            } else if command["operation"] == "scan_admitted" {
+                require(
+                    active["proof"]["evidence"]["scan"]["started_boottime_ms"]
+                        == command["scan_started_boottime_ms"],
+                )?;
+            } else if command["operation"] == "publish_release" {
+                require(
+                    active["native_attempt"]["observation_nonce"] == command["nonce"]
+                        && active["native_attempt"]["release_requested_boottime_ms"].is_u64()
+                        && active["proof"]["evidence"]["scan"]["finished_boottime_ms"].is_null(),
+                )?;
+            }
+            self.pipes
+                .as_mut()
+                .ok_or(ERROR)?
+                .write_frame(raw)
+                .map_err(|_| ERROR.into())
+        }
+        fn close(&mut self) -> Result<()> {
+            match self.pipes.take() {
+                Some(pipes) => pipes.close().map_err(|_| ERROR.into()),
+                None => Ok(()),
+            }
+        }
+        fn host_metadata(&mut self, kind: HostMetadata) -> Result<String> {
+            Ok(match kind {
+                HostMetadata::Hostname => "synthetic-host\n",
+                HostMetadata::MachineArchitecture => "aarch64\n",
+            }
+            .into())
+        }
+        fn root_receipt(&mut self) -> Result<Value> {
+            Ok(scripted_receipt())
+        }
+    }
+
     #[test]
     fn prepared_receipt_keeps_journal_scan_unfinished() {
         let fixture = Fixture::new();
@@ -1193,6 +1347,121 @@ mod tests {
             ["freeze_scan", "publish_release", "await_receipt"]
         );
         unfinished_at(&fixture, &before, Some(1010));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn real_pipe_dialogue_keeps_journal_unfinished_after_prepared() {
+        let fixture = Fixture::new();
+        let negotiated = negotiated();
+        let mut journal = fixture.ready(&negotiated);
+        let intent = journal
+            .admit_native_collection(REPORT, 1, 1, &clock(1001), "bbbbbbbbbbbbbbbb", &negotiated)
+            .unwrap();
+        let exchange = RealExchange::spawn(&fixture).unwrap();
+        let mut prepared = PinnedSession::admit(exchange, expected())
+            .unwrap()
+            .publish(&mut journal, intent, &negotiated)
+            .unwrap()
+            .admit_scan(&mut journal, &negotiated)
+            .unwrap()
+            .collect_selected("2026-01-01T00:00:00Z")
+            .unwrap()
+            .prepare(&mut journal)
+            .unwrap();
+        assert_eq!(prepared.scan["inventoryComplete"], true);
+        assert!(
+            prepared
+                .scanning
+                .proof
+                .scan
+                .as_ref()
+                .unwrap()
+                .finished_boottime_ms
+                .is_none()
+        );
+        assert_eq!(prepared.scanning.request_id, REQUEST);
+        let before = saved(&fixture);
+        prepared
+            .scanning
+            .session
+            .exchange
+            .take()
+            .unwrap()
+            .finish()
+            .unwrap();
+        unfinished_at(&fixture, &before, Some(1010));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn real_pipe_completion_rejects_nonzero_exit_and_surplus() {
+        for suffix in [
+            "\nsys.exit(3)\n",
+            "\nsys.stdout.buffer.write(b'noise');sys.stdout.buffer.flush()\n",
+        ] {
+            let fixture = Fixture::new();
+            let negotiated = negotiated();
+            let mut journal = fixture.ready(&negotiated);
+            let intent = journal
+                .admit_native_collection(
+                    REPORT,
+                    1,
+                    1,
+                    &clock(1001),
+                    "bbbbbbbbbbbbbbbb",
+                    &negotiated,
+                )
+                .unwrap();
+            let exchange = RealExchange::spawn_mode(&fixture, suffix).unwrap();
+            let mut prepared = PinnedSession::admit(exchange, expected())
+                .unwrap()
+                .publish(&mut journal, intent, &negotiated)
+                .unwrap()
+                .admit_scan(&mut journal, &negotiated)
+                .unwrap()
+                .collect_selected("2026-01-01T00:00:00Z")
+                .unwrap()
+                .prepare(&mut journal)
+                .unwrap();
+            let before = saved(&fixture);
+            assert!(
+                prepared
+                    .scanning
+                    .session
+                    .exchange
+                    .take()
+                    .unwrap()
+                    .finish()
+                    .is_err()
+            );
+            unfinished_at(&fixture, &before, Some(1010));
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn real_pipe_completion_cannot_succeed_after_teardown_deadline() {
+        let fixture = Fixture::new();
+        let negotiated = negotiated();
+        let mut journal = fixture.ready(&negotiated);
+        let intent = journal
+            .admit_native_collection(REPORT, 1, 1, &clock(1001), "bbbbbbbbbbbbbbbb", &negotiated)
+            .unwrap();
+        let exchange = RealExchange::spawn(&fixture).unwrap();
+        let mut prepared = PinnedSession::admit(exchange, expected())
+            .unwrap()
+            .publish(&mut journal, intent, &negotiated)
+            .unwrap()
+            .admit_scan(&mut journal, &negotiated)
+            .unwrap()
+            .collect_selected("2026-01-01T00:00:00Z")
+            .unwrap()
+            .prepare(&mut journal)
+            .unwrap();
+        let mut exchange = prepared.scanning.session.exchange.take().unwrap();
+        exchange.deadline = std::time::Instant::now();
+        assert!(exchange.finish().is_err());
     }
 
     #[test]

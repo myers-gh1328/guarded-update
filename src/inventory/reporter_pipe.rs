@@ -49,7 +49,7 @@ fn nonblock(fd: RawFd) -> Result<()> {
     }
 }
 
-struct PipePair {
+pub(super) struct PipePair {
     input: Option<ChildStdin>,
     output: Option<ChildStdout>,
     input_id: (u64, u64),
@@ -59,7 +59,7 @@ struct PipePair {
     failed: bool,
 }
 impl PipePair {
-    fn new(input: ChildStdin, output: ChildStdout, deadline: Instant) -> Result<Self> {
+    pub(super) fn new(input: ChildStdin, output: ChildStdout, deadline: Instant) -> Result<Self> {
         let input_id = identity(&input, 1, false)?;
         let output_id = identity(&output, 0, false)?;
         if input_id == output_id || Instant::now() >= deadline {
@@ -102,7 +102,7 @@ impl PipePair {
         std::thread::sleep(remaining.min(Duration::from_millis(2)));
         self.verify()
     }
-    fn write_frame(&mut self, raw: &[u8]) -> Result<()> {
+    pub(super) fn write_frame(&mut self, raw: &[u8]) -> Result<()> {
         let result = self.write_inner(raw);
         if result.is_err() {
             self.failed = true;
@@ -137,7 +137,7 @@ impl PipePair {
         }
         Ok(())
     }
-    fn read_frame(&mut self) -> Result<Vec<u8>> {
+    pub(super) fn read_frame(&mut self) -> Result<Vec<u8>> {
         let result = self.read_inner();
         if result.is_err() {
             self.failed = true;
@@ -177,7 +177,39 @@ impl PipePair {
             self.verify()?;
         }
     }
-    fn close(self) -> Result<()> {
+    pub(super) fn require_eof(&mut self) -> Result<()> {
+        let result = (|| {
+            self.verify()?;
+            if !self.pending.is_empty() {
+                return Err(ERROR);
+            }
+            loop {
+                self.verify()?;
+                let mut byte = [0u8; 1];
+                match self.output.as_mut().ok_or(ERROR)?.read(&mut byte) {
+                    Ok(0) => {
+                        self.verify()?;
+                        return Ok(());
+                    }
+                    Ok(_) => return Err(ERROR),
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock
+                        ) =>
+                    {
+                        self.pause()?
+                    }
+                    Err(_) => return Err(ERROR),
+                }
+            }
+        })();
+        if result.is_err() {
+            self.failed = true;
+        }
+        result
+    }
+    pub(super) fn close(self) -> Result<()> {
         self.close_with(|fd| {
             // SAFETY: ownership was transferred exactly once; failed close is never retried.
             unsafe { close(fd) == 0 }
@@ -395,6 +427,48 @@ mod tests {
         assert_eq!(pair.read_frame().unwrap(), b"[]\n");
         assert!(pair.write_frame(b"{}\n{}\n").is_err());
         assert!(pair.read_frame().is_err());
+        pair.close().unwrap();
+        assert!(child.wait().unwrap().success());
+    }
+
+    #[test]
+    fn completion_requires_eof_without_surplus() {
+        for (source, expected) in [
+            ("import sys; sys.stdout.buffer.write(b'{}\\n')", true),
+            ("import sys; sys.stdout.buffer.write(b'{}\\nextra')", false),
+        ] {
+            let mut child = Command::new("/usr/bin/python3")
+                .args(["-I", "-c", source])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+            let mut pair = PipePair::new(
+                child.stdin.take().unwrap(),
+                child.stdout.take().unwrap(),
+                Instant::now() + Duration::from_secs(3),
+            )
+            .unwrap();
+            assert_eq!(pair.read_frame().unwrap(), b"{}\n");
+            assert_eq!(pair.require_eof().is_ok(), expected);
+            pair.close().unwrap();
+            assert!(child.wait().unwrap().success());
+        }
+    }
+
+    #[test]
+    fn completion_rejects_held_open_output_at_deadline() {
+        let mut child=Command::new("/usr/bin/python3").args(["-I","-c","import sys,time; sys.stdout.buffer.write(b'{}\\n'); sys.stdout.buffer.flush(); time.sleep(0.2)"])
+            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
+        let mut pair = PipePair::new(
+            child.stdin.take().unwrap(),
+            child.stdout.take().unwrap(),
+            Instant::now() + Duration::from_millis(80),
+        )
+        .unwrap();
+        assert_eq!(pair.read_frame().unwrap(), b"{}\n");
+        assert!(pair.require_eof().is_err());
         pair.close().unwrap();
         assert!(child.wait().unwrap().success());
     }
