@@ -45,7 +45,10 @@ def validate_snapshot(pid,stat,status,cgroup,mountinfo,device):
         groups=[row for row in rows if row['fs']==b'cgroup2']
         stage='profile_mount_missing';assert groups
         writable=[row for row in groups if b'ro' not in row['options']]
-        categories=(('root',lambda path:path=='/sys/fs/cgroup'),('nested',lambda path:path.startswith('/sys/fs/cgroup/')),
+        unit='/sys/fs/cgroup/command.slice/command-center.slice/command-center-inventory.slice/command-center-inventory.service'
+        categories=(('root',lambda path:path=='/sys/fs/cgroup'),('nested_unit',lambda path:path==unit),
+            ('nested_ancestor',lambda path:path.startswith('/sys/fs/cgroup/') and unit.startswith(path+'/')),
+            ('nested_descendant',lambda path:path.startswith(unit+'/')),('nested_other',lambda path:path.startswith('/sys/fs/cgroup/')),
             ('sys',lambda path:path.startswith('/sys/')),('run',lambda path:path.startswith('/run/')),
             ('var',lambda path:path.startswith('/var/')),('proc',lambda path:path.startswith('/proc/')))
         stage='profile_mount_writable_other'
@@ -163,7 +166,8 @@ class ProcessProbe:
             labels={'check','stat','status','cgroup','mountinfo','profile','stat_recheck','final',
                 'profile_device','profile_stat','profile_view','profile_identity_fields','profile_uid','profile_gid',
                 'profile_groups','profile_nnp','profile_caps','profile_cgroup','profile_mount_parse','profile_mount_missing',
-                'profile_mount_writable_root','profile_mount_writable_nested','profile_mount_writable_sys',
+                'profile_mount_writable_root','profile_mount_writable_nested_unit','profile_mount_writable_nested_ancestor',
+                'profile_mount_writable_nested_descendant','profile_mount_writable_nested_other','profile_mount_writable_sys',
                 'profile_mount_writable_run','profile_mount_writable_var','profile_mount_writable_proc',
                 'profile_mount_writable_other','profile_mount_device','profile_mount_root','profile_mount_nested'}
             if isinstance(exc,ProfileError) and str(exc) in labels:stage=str(exc)

@@ -118,8 +118,15 @@ class ProcessSnapshotTests(unittest.TestCase):
         with self.assertRaises(ValueError):validate_snapshot(self.pid,self.stat,self.status,self.cgroup,self.mounts,(0,28))
         with self.assertRaises(ValueError):validate_snapshot(True,self.stat,self.status,self.cgroup,self.mounts,(0,27))
 
+    def test_writable_nested_mount_relation_to_unit_is_fixed_category(self):
+        unit=b'/sys/fs/cgroup/command.slice/command-center.slice/command-center-inventory.slice/command-center-inventory.service'
+        for path,label in ((unit,'unit'),(b'/sys/fs/cgroup/command.slice','ancestor'),(unit+b'/child','descendant')):
+            mount=self.mounts+b'43 1 0:27 / '+path+b' rw - cgroup2 cgroup rw\n'
+            with self.assertRaisesRegex(ValueError,'profile_mount_writable_nested_'+label):
+                validate_snapshot(self.pid,self.stat,self.status,self.cgroup,mount,(0,27))
+
     def test_writable_mount_fixed_path_categories(self):
-        for path,label in ((b'/sys/fs/cgroup/leaf','profile_mount_writable_nested'),
+        for path,label in ((b'/sys/fs/cgroup/leaf','profile_mount_writable_nested_other'),
             (b'/sys/other','profile_mount_writable_sys'),(b'/run/other','profile_mount_writable_run'),
             (b'/var/other','profile_mount_writable_var'),(b'/proc/other','profile_mount_writable_proc')):
             mount=self.mounts+b'43 1 0:27 / '+path+b' rw - cgroup2 cgroup rw\n'
