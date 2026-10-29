@@ -80,7 +80,7 @@ const DATA_ERROR: &str = "Invalid private reporter data";
 const SAFE: u64 = 9_007_199_254_740_991;
 const SESSION_LIMIT: usize = 64 * 1024 * 1024;
 
-struct DataSession {
+pub(super) struct DataSession {
     poisoned: bool,
     active: bool,
     last: u64,
@@ -89,7 +89,7 @@ struct DataSession {
     policies: usize,
 }
 impl DataSession {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self {
             poisoned: false,
             active: false,
@@ -99,7 +99,11 @@ impl DataSession {
             policies: 0,
         }
     }
-    fn start(&mut self, id: u64, operation: &str) -> Result<DataAssembly<'_>, &'static str> {
+    pub(super) fn start(
+        &mut self,
+        id: u64,
+        operation: &str,
+    ) -> Result<DataAssembly<'_>, &'static str> {
         let limit = match operation {
             "installed" => 8 * 1024 * 1024,
             "architecture" => 128,
@@ -139,7 +143,7 @@ impl DataSession {
     }
 }
 
-struct DataAssembly<'a> {
+pub(super) struct DataAssembly<'a> {
     owner: &'a mut DataSession,
     id: u64,
     operation: String,
@@ -150,7 +154,7 @@ struct DataAssembly<'a> {
     taken: bool,
 }
 impl DataAssembly<'_> {
-    fn feed(&mut self, raw: &[u8]) -> Result<(), &'static str> {
+    pub(super) fn feed(&mut self, raw: &[u8]) -> Result<(), &'static str> {
         let result = self.feed_inner(raw);
         if result.is_err() {
             self.owner.poisoned = true;
@@ -213,7 +217,10 @@ impl DataAssembly<'_> {
             _ => Err(DATA_ERROR),
         }
     }
-    fn take(mut self) -> Result<String, &'static str> {
+    pub(super) fn complete(&self) -> bool {
+        self.done && !self.owner.poisoned
+    }
+    pub(super) fn take(mut self) -> Result<String, &'static str> {
         if self.owner.poisoned || !self.owner.active || !self.done {
             self.owner.poisoned = true;
             return Err(DATA_ERROR);

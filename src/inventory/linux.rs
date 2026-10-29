@@ -2,7 +2,7 @@
 use super::process::Tools;
 use serde_json::{Value, json};
 
-fn package_id(value: &str) -> bool {
+pub(super) fn package_id(value: &str) -> bool {
     let mut parts = value.split(':');
     let Some(base) = parts.next() else {
         return false;
@@ -275,7 +275,7 @@ pub fn collect(tools: &impl Tools, report_id: &str, now: &str) -> Result<Value, 
 // Staged normalizer context only: this neither authenticates a pin nor grants
 // coherent/publication authority. The managed native adapter remains required.
 #[cfg(test)]
-fn collect_selected_generation(
+pub(super) fn collect_selected_generation(
     tools: &impl Tools,
     report_id: &str,
     now: &str,

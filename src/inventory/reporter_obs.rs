@@ -1,14 +1,17 @@
-//! Scripted OBS/scan admission only; no process, live Root or completion witness.
+//! Scripted reporter bridge only; no process, live Root or completion witness.
 //! Deadline comparisons here do not bound arbitrary blocking I/O. A real
 //! admitted nonblocking exchange and source/lifetime proofs remain separate.
 
-use super::reporter_frame::parse_frame;
+use super::process::Tools;
+use super::reporter_frame::{DataSession, parse_frame};
 use super::requests::{
     Capability, ClientStatus, Clock, CollectionProof, NativeCollectionIntent, Negotiated,
     PublishedNativeCollection, RequestJournal,
 };
 use serde::Deserialize;
 use serde_json::json;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 const ERROR: &str = "Reporter OBS publication unavailable";
 const SAFE: u64 = 9_007_199_254_740_991;
@@ -26,6 +29,12 @@ trait Exchange {
     fn read(&mut self) -> Result<Vec<u8>>;
     fn write(&mut self, raw: &[u8]) -> Result<()>;
     fn close(&mut self) -> Result<()>;
+    fn host_metadata(&mut self, kind: HostMetadata) -> Result<String>;
+}
+#[derive(Clone, Copy)]
+enum HostMetadata {
+    Hostname,
+    MachineArchitecture,
 }
 
 struct ExpectedPin {
@@ -106,6 +115,7 @@ enum Phase {
     AwaitingOffer,
     Acknowledging,
     Scanning,
+    Querying,
     Closed,
 }
 struct PinnedSession<E: Exchange> {
@@ -135,6 +145,184 @@ struct ScanningSession<E: Exchange> {
     session: PinnedSession<E>,
     proof: CollectionProof,
     offer: RootOffer,
+    data: DataSession,
+    next_id: u64,
+}
+struct NormalizedSession<E: Exchange> {
+    scanning: ScanningSession<E>,
+    scan: serde_json::Value,
+}
+
+// Sync is required by the existing normalizer. Contention/reentry must fail
+// immediately and poison BOTH callers, never wait beyond the native deadline.
+struct FixedTools<E: Exchange + Send> {
+    scanning: Mutex<ScanningSession<E>>,
+    failed: Arc<AtomicBool>,
+}
+impl<E: Exchange + Send> FixedTools<E> {
+    fn new(scanning: ScanningSession<E>) -> Self {
+        Self {
+            scanning: Mutex::new(scanning),
+            failed: Arc::new(AtomicBool::new(false)),
+        }
+    }
+    fn into_scanning(self) -> Result<ScanningSession<E>> {
+        let mut scanning = self.scanning.into_inner().map_err(|_| ERROR.to_owned())?;
+        require(!self.failed.load(Ordering::SeqCst) && scanning.session.phase == Phase::Scanning)?;
+        guarded(&mut scanning.session, &self.failed)?;
+        Ok(scanning)
+    }
+}
+impl<E: Exchange + Send> Tools for FixedTools<E> {
+    fn text(&self, program: &str, args: &[&str], limit: usize) -> Result<String> {
+        if self.failed.load(Ordering::SeqCst) {
+            return Err(ERROR.into());
+        }
+        let mut scanning = match self.scanning.try_lock() {
+            Ok(value) => value,
+            Err(_) => {
+                self.failed.store(true, Ordering::SeqCst);
+                return Err(ERROR.into());
+            }
+        };
+        let result = scanning.fixed_text(program, args, limit, &self.failed);
+        if result.is_err() {
+            self.failed.store(true, Ordering::SeqCst);
+        }
+        require(!self.failed.load(Ordering::SeqCst))?;
+        result
+    }
+    fn sha256(&self, _bytes: &[u8]) -> Result<String> {
+        self.failed.store(true, Ordering::SeqCst);
+        Err(ERROR.into())
+    }
+}
+fn guarded<E: Exchange>(session: &mut PinnedSession<E>, failed: &AtomicBool) -> Result<Clock> {
+    require(!failed.load(Ordering::SeqCst))?;
+    let clock = session.check()?;
+    require(!failed.load(Ordering::SeqCst))?;
+    Ok(clock)
+}
+
+impl<E: Exchange> ScanningSession<E> {
+    fn fixed_text(
+        &mut self,
+        program: &str,
+        args: &[&str],
+        limit: usize,
+        failed: &AtomicBool,
+    ) -> Result<String> {
+        require(self.session.phase == Phase::Scanning)?;
+        self.session.phase = Phase::Querying;
+        guarded(&mut self.session, failed)?;
+        let host = match (program, args, limit) {
+            ("/bin/hostname", [], 4096) => Some(HostMetadata::Hostname),
+            ("/usr/bin/uname", ["-m"], 4096) => Some(HostMetadata::MachineArchitecture),
+            _ => None,
+        };
+        if let Some(kind) = host {
+            guarded(&mut self.session, failed)?;
+            let text = self
+                .session
+                .port()?
+                .host_metadata(kind)
+                .map_err(|_| ERROR.to_owned())?;
+            guarded(&mut self.session, failed)?;
+            require(text.len() <= 4096)?;
+            self.session.phase = Phase::Scanning;
+            return Ok(text);
+        }
+        const FORMAT: &str = "--showformat=${db:Status-Status}\\t${binary:Package}\\t${Version}\\t${Architecture}\\n";
+        const HOLDS: [&str; 5] = [
+            "-o",
+            "Dir::Cache::pkgcache=",
+            "-o",
+            "Dir::Cache::srcpkgcache=",
+            "showhold",
+        ];
+        const POLICY: [&str; 5] = [
+            "-o",
+            "Dir::Cache::pkgcache=",
+            "-o",
+            "Dir::Cache::srcpkgcache=",
+            "policy",
+        ];
+        let operation = if program == "/usr/bin/dpkg-query"
+            && args == ["--show", FORMAT]
+            && limit == 8 * 1024 * 1024
+        {
+            "installed"
+        } else if program == "/usr/bin/dpkg" && args == ["--print-architecture"] && limit == 128 {
+            "architecture"
+        } else if program == "/usr/bin/apt-mark" && args == HOLDS && limit == 1024 * 1024 {
+            "holds"
+        } else if program == "/usr/bin/apt-cache"
+            && args.len() >= 6
+            && args.len() <= 305
+            && args[..5] == POLICY
+            && limit == 16 * 1024 * 1024
+        {
+            let packages = &args[5..];
+            require(
+                packages.iter().all(|value| super::linux::package_id(value))
+                    && packages
+                        .iter()
+                        .copied()
+                        .collect::<std::collections::BTreeSet<_>>()
+                        .len()
+                        == packages.len(),
+            )?;
+            "policy"
+        } else {
+            return Err(ERROR.into());
+        };
+        let id = self.next_id;
+        self.next_id = id.checked_add(1).ok_or(ERROR)?;
+        let mut command = json!({"schema_version":1,"id":id,"operation":operation});
+        if operation == "policy" {
+            command["packages"] = json!(&args[5..]);
+        }
+        let mut raw = serde_json::to_vec(&command).map_err(|_| ERROR.to_owned())?;
+        raw.push(b'\n');
+        require(raw.len() <= 256 * 1024)?;
+        let Self { session, data, .. } = self;
+        let mut assembly = data.start(id, operation).map_err(|_| ERROR.to_owned())?;
+        guarded(session, failed)?;
+        session.port()?.write(&raw).map_err(|_| ERROR.to_owned())?;
+        guarded(session, failed)?;
+        loop {
+            guarded(session, failed)?;
+            let raw = session.port()?.read().map_err(|_| ERROR.to_owned())?;
+            guarded(session, failed)?;
+            assembly.feed(&raw).map_err(|_| ERROR.to_owned())?;
+            guarded(session, failed)?;
+            if assembly.complete() {
+                break;
+            }
+        }
+        let text = assembly.take().map_err(|_| ERROR.to_owned())?;
+        guarded(session, failed)?;
+        session.phase = Phase::Scanning;
+        Ok(text)
+    }
+}
+impl<E: Exchange + Send> ScanningSession<E> {
+    fn collect_selected(self, now: &str) -> Result<NormalizedSession<E>> {
+        require(checked_at(now))?;
+        let report = self.proof.scan.as_ref().ok_or(ERROR)?.report_id.clone();
+        let tools = FixedTools::new(self);
+        let result = super::linux::collect_selected_generation(&tools, &report, now);
+        // linux.rs intentionally converts several Tools failures to partial
+        // coverage. A failed managed exchange must never escape that way.
+        let mut scanning = tools.into_scanning()?;
+        let scan = result.map_err(|_| ERROR.to_owned())?;
+        require(
+            scan["inventoryComplete"] == true
+                && matches!(scan["status"].as_str(), Some("complete" | "partial")),
+        )?;
+        scanning.session.check()?;
+        Ok(NormalizedSession { scanning, scan })
+    }
 }
 
 impl<E: Exchange> PublishedSession<E> {
@@ -244,6 +432,8 @@ impl<E: Exchange> PublishedSession<E> {
             session,
             proof,
             offer,
+            data: DataSession::new(),
+            next_id: 4,
         })
     }
 }
@@ -478,6 +668,7 @@ mod tests {
         reads: usize,
         samples: usize,
         scan_seen: bool,
+        host_calls: usize,
     }
     struct Scripted {
         frames: VecDeque<Vec<u8>>,
@@ -489,6 +680,10 @@ mod tests {
         fail_scan_ack: bool,
         fail_attach: bool,
         change_after_scanning: bool,
+        data_reply: bool,
+        data_fault: Option<&'static str>,
+        poison_on_data_write: Option<Arc<AtomicBool>>,
+        poison_on_data_final: Option<Arc<AtomicBool>>,
     }
     impl Exchange for Scripted {
         fn sample(&mut self) -> Result<Clock> {
@@ -513,7 +708,14 @@ mod tests {
                 bytes.push(b'\n');
                 std::fs::write(&self.path, bytes).unwrap();
             }
-            self.frames.pop_front().ok_or("Synthetic EOF".into())
+            let frame = self.frames.pop_front().ok_or("Synthetic EOF")?;
+            if let Some(flag) = &self.poison_on_data_final
+                && serde_json::from_slice::<Value>(&frame)
+                    .is_ok_and(|value| value["phase"] == "data_complete")
+            {
+                flag.store(true, Ordering::SeqCst);
+            }
+            Ok(frame)
         }
         fn write(&mut self, raw: &[u8]) -> Result<()> {
             let saved: Value = serde_json::from_slice(&std::fs::read(&self.path).unwrap()).unwrap();
@@ -547,6 +749,49 @@ mod tests {
                     assert!(scan["finished_boottime_ms"].is_null());
                     record.scan_seen = true;
                 }
+                "installed" | "architecture" | "holds" | "policy" => {
+                    assert!(self.data_reply);
+                    assert_eq!(scan["started_boottime_ms"], 1010);
+                    let operation = command["operation"].as_str().unwrap();
+                    let id = command["id"].as_u64().unwrap();
+                    let text = match operation {
+                        "installed" => {
+                            "installed\tinventory-proof:arm64\t0.9\tarm64\ninstalled\tnginx:arm64\t1.0\tarm64\n"
+                        }
+                        "architecture" => "arm64\n",
+                        "holds" => "nginx:arm64\n",
+                        _ => {
+                            "inventory-proof:arm64:\n  Installed: 0.9\n  Candidate: 1.0\n  Version table:\n     1.0 123\n        123 https://repo.invalid stable/main arm64 Packages\nnginx:arm64:\n  Installed: 1.0\n  Candidate: 1.1\n  Version table:\n     1.1 123\n        123 https://repo.invalid stable/main arm64 Packages\n"
+                        }
+                    };
+                    let text = if self.data_fault == Some("installed_malformed")
+                        && operation == "installed"
+                    {
+                        "synthetic malformed installed data\n".to_owned()
+                    } else if self.data_fault == Some("architecture_overflow")
+                        && operation == "architecture"
+                    {
+                        "x".repeat(129)
+                    } else {
+                        text.to_owned()
+                    };
+                    let eof = self.data_fault == Some(operation);
+                    if !eof {
+                        let index = usize::from(
+                            self.data_fault == Some("bad_chunk") && operation == "installed",
+                        );
+                        self.frames.push_back(format!("{}\n",json!({"schema_version":1,"id":id,"operation":operation,"phase":"data","chunk_index":index,"text":text})).into_bytes());
+                        let bytes = text.len()
+                            + usize::from(
+                                self.data_fault == Some("bad_policy_final")
+                                    && operation == "policy",
+                            );
+                        self.frames.push_back(format!("{}\n",json!({"schema_version":1,"id":id,"operation":operation,"phase":"data_complete","chunks":1,"utf8_bytes":bytes})).into_bytes());
+                    }
+                    if let Some(flag) = &self.poison_on_data_write {
+                        flag.store(true, Ordering::SeqCst);
+                    }
+                }
                 _ => panic!("Unexpected scripted operation"),
             }
             record.writes.push(raw.to_vec());
@@ -559,6 +804,20 @@ mod tests {
         fn close(&mut self) -> Result<()> {
             self.record.lock().unwrap().closes += 1;
             Ok(())
+        }
+        fn host_metadata(&mut self, kind: HostMetadata) -> Result<String> {
+            self.record.lock().unwrap().host_calls += 1;
+            if self.data_fault == Some("host_error") {
+                return Err("Synthetic confidential backend error".into());
+            }
+            if self.data_fault == Some("host_overflow") {
+                return Ok("x".repeat(4097));
+            }
+            Ok(match kind {
+                HostMetadata::Hostname => "synthetic-host\n",
+                HostMetadata::MachineArchitecture => "aarch64\n",
+            }
+            .into())
         }
     }
     fn scripted(fixture: &Fixture) -> (Scripted, Arc<Mutex<Recorded>>) {
@@ -574,6 +833,10 @@ mod tests {
                 fail_scan_ack: false,
                 fail_attach: false,
                 change_after_scanning: false,
+                data_reply: false,
+                data_fault: None,
+                poison_on_data_write: None,
+                poison_on_data_final: None,
             },
             record,
         )
@@ -593,6 +856,28 @@ mod tests {
         exchange.times = (0..40)
             .map(|index| clock(if index < 9 { 1002 } else { 1012 }))
             .collect();
+        (exchange, record)
+    }
+    fn data_scanning(
+        _fixture: &Fixture,
+        journal: &mut RequestJournal<'_>,
+        session: &Negotiated,
+        exchange: Scripted,
+    ) -> ScanningSession<Scripted> {
+        let intent = journal
+            .admit_native_collection(REPORT, 1, 1, &clock(1001), "bbbbbbbbbbbbbbbb", session)
+            .unwrap();
+        PinnedSession::admit(exchange, expected())
+            .unwrap()
+            .publish(journal, intent, session)
+            .unwrap()
+            .admit_scan(journal, session)
+            .unwrap()
+    }
+    fn data_scripted(fixture: &Fixture) -> (Scripted, Arc<Mutex<Recorded>>) {
+        let (mut exchange, record) = scan_scripted(fixture);
+        exchange.data_reply = true;
+        exchange.times.extend((0..400).map(|_| clock(1012)));
         (exchange, record)
     }
 
@@ -711,6 +996,303 @@ mod tests {
             command,
             json!({"schema_version":1,"id":3,"operation":"scan_admitted","scan_started_boottime_ms":1010})
         );
+    }
+
+    #[test]
+    fn fixed_reporter_tools_feed_the_existing_selected_normalizer_without_currency_claims() {
+        let fixture = Fixture::new();
+        let session = negotiated();
+        let mut journal = fixture.ready(&session);
+        let intent = journal
+            .admit_native_collection(REPORT, 1, 1, &clock(1001), "bbbbbbbbbbbbbbbb", &session)
+            .unwrap();
+        let (mut exchange, record) = scan_scripted(&fixture);
+        exchange.data_reply = true;
+        exchange.times.extend((0..200).map(|_| clock(1012)));
+        let scanning = PinnedSession::admit(exchange, expected())
+            .unwrap()
+            .publish(&mut journal, intent, &session)
+            .unwrap()
+            .admit_scan(&mut journal, &session)
+            .unwrap();
+        let normalized = scanning.collect_selected("2026-01-01T00:00:00Z").unwrap();
+        assert_eq!(normalized.scan["scanId"], REPORT);
+        assert_eq!(normalized.scan["inventoryComplete"], true);
+        assert!(normalized.scan["aptIndexOldestAt"].is_null());
+        assert_eq!(normalized.scan["applicationIdentification"], "partial");
+        let packages = normalized.scan["packages"].as_array().unwrap();
+        assert_eq!(packages.len(), 2);
+        assert_eq!(packages[0]["packageId"], "inventory-proof:arm64");
+        assert_eq!(packages[0]["latestVersion"], "1.0");
+        assert_eq!(packages[1]["held"], true);
+        assert_eq!(packages[1]["provider"], "APT");
+        for package in packages {
+            assert_eq!(package["reliableMatch"], false);
+            assert_eq!(package["upgradeAvailable"], false);
+        }
+        assert!(
+            normalized
+                .scanning
+                .proof
+                .scan
+                .as_ref()
+                .unwrap()
+                .finished_boottime_ms
+                .is_none()
+        );
+        let writes = &record.lock().unwrap().writes;
+        let data: Vec<Value> = writes[3..]
+            .iter()
+            .map(|raw| serde_json::from_slice(raw).unwrap())
+            .collect();
+        assert_eq!(
+            data.iter()
+                .map(|frame| frame["operation"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["installed", "holds", "policy", "architecture"]
+        );
+        assert_eq!(
+            data[2]["packages"],
+            json!(["inventory-proof:arm64", "nginx:arm64"])
+        );
+    }
+
+    #[test]
+    fn swallowed_tool_failures_and_malformed_inventory_never_escape_as_normalized_drafts() {
+        for fault in [
+            "holds",
+            "policy",
+            "architecture",
+            "bad_policy_final",
+            "bad_chunk",
+            "architecture_overflow",
+            "installed_malformed",
+            "host_error",
+            "host_overflow",
+        ] {
+            let fixture = Fixture::new();
+            let session = negotiated();
+            let mut journal = fixture.ready(&session);
+            let (mut exchange, record) = data_scripted(&fixture);
+            exchange.data_fault = Some(fault);
+            let scanning = data_scanning(&fixture, &mut journal, &session, exchange);
+            let before = saved(&fixture);
+            let error = match scanning.collect_selected("2026-01-01T00:00:00Z") {
+                Ok(_) => panic!("Invalid draft for {fault}"),
+                Err(error) => error,
+            };
+            assert_eq!(error, ERROR);
+            let recorded = record.lock().unwrap();
+            assert_eq!(recorded.closes, 1);
+            let operations: Vec<String> = recorded.writes[3..]
+                .iter()
+                .map(|raw| {
+                    serde_json::from_slice::<Value>(raw).unwrap()["operation"]
+                        .as_str()
+                        .unwrap()
+                        .to_owned()
+                })
+                .collect();
+            match fault {
+                "holds" => assert_eq!(operations, ["installed", "holds"]),
+                "policy" | "bad_policy_final" => {
+                    assert_eq!(operations, ["installed", "holds", "policy"])
+                }
+                "host_error" | "host_overflow" => assert!(operations.is_empty()),
+                _ => {}
+            }
+            drop(recorded);
+            drop(journal);
+            unfinished_at(&fixture, &before, Some(1010));
+        }
+    }
+
+    #[test]
+    fn fixed_tool_whitelist_rejects_options_programs_limits_and_policy_aliases_without_io() {
+        let cases = vec![
+            ("/bin/sh", vec!["-c", "true"], 4096),
+            ("/bin/hostname", vec![], 4095),
+            ("/usr/bin/uname", vec!["-a"], 4096),
+            (
+                "/usr/bin/dpkg-query",
+                vec!["--search", "/usr/share/applications/*.desktop"],
+                1024 * 1024,
+            ),
+            (
+                "/usr/bin/dpkg",
+                vec!["--admindir=/tmp", "--print-architecture"],
+                128,
+            ),
+            ("/usr/bin/apt-mark", vec!["showhold"], 1024 * 1024),
+            (
+                "/usr/bin/apt-cache",
+                vec![
+                    "-o",
+                    "Dir::Cache::pkgcache=",
+                    "-o",
+                    "Dir::Cache::srcpkgcache=",
+                    "policy",
+                    "-oBad=1",
+                ],
+                16 * 1024 * 1024,
+            ),
+            (
+                "/usr/bin/apt-cache",
+                vec![
+                    "-o",
+                    "Dir::Cache::pkgcache=",
+                    "-o",
+                    "Dir::Cache::srcpkgcache=",
+                    "policy",
+                    "pkg",
+                    "pkg",
+                ],
+                16 * 1024 * 1024,
+            ),
+        ];
+        for (program, args, limit) in cases {
+            let fixture = Fixture::new();
+            let session = negotiated();
+            let mut journal = fixture.ready(&session);
+            let (exchange, record) = data_scripted(&fixture);
+            let tools = FixedTools::new(data_scanning(&fixture, &mut journal, &session, exchange));
+            assert_eq!(tools.text(program, &args, limit).unwrap_err(), ERROR);
+            assert!(tools.text("/bin/hostname", &[], 4096).is_err());
+            assert!(tools.into_scanning().is_err());
+            let record = record.lock().unwrap();
+            assert_eq!(record.writes.len(), 3);
+            assert_eq!(record.host_calls, 0);
+            assert_eq!(record.closes, 1);
+        }
+    }
+
+    #[test]
+    fn digest_is_never_a_system_tools_fallback_or_partial_success() {
+        let fixture = Fixture::new();
+        let session = negotiated();
+        let mut journal = fixture.ready(&session);
+        let (exchange, record) = data_scripted(&fixture);
+        let tools = FixedTools::new(data_scanning(&fixture, &mut journal, &session, exchange));
+        assert_eq!(tools.sha256(b"synthetic private body").unwrap_err(), ERROR);
+        assert!(tools.text("/bin/hostname", &[], 4096).is_err());
+        assert!(tools.into_scanning().is_err());
+        let record = record.lock().unwrap();
+        assert_eq!(record.writes.len(), 3);
+        assert_eq!(record.host_calls, 0);
+    }
+
+    #[test]
+    fn repeated_fixed_read_poison_cannot_reset_shared_data_session() {
+        let fixture = Fixture::new();
+        let session = negotiated();
+        let mut journal = fixture.ready(&session);
+        let (exchange, record) = data_scripted(&fixture);
+        let tools = FixedTools::new(data_scanning(&fixture, &mut journal, &session, exchange));
+        assert_eq!(
+            tools
+                .text("/usr/bin/dpkg", &["--print-architecture"], 128)
+                .unwrap(),
+            "arm64\n"
+        );
+        assert!(
+            tools
+                .text("/usr/bin/dpkg", &["--print-architecture"], 128)
+                .is_err()
+        );
+        assert!(tools.text("/bin/hostname", &[], 4096).is_err());
+        assert!(tools.into_scanning().is_err());
+        let record = record.lock().unwrap();
+        assert_eq!(record.writes.len(), 4);
+        assert_eq!(record.reads, 6);
+    }
+
+    #[test]
+    fn in_flight_poison_stops_next_port_effect_and_withholds_completed_text() {
+        for on_final in [false, true] {
+            let fixture = Fixture::new();
+            let session = negotiated();
+            let mut journal = fixture.ready(&session);
+            let (exchange, record) = data_scripted(&fixture);
+            let tools = FixedTools::new(data_scanning(&fixture, &mut journal, &session, exchange));
+            {
+                let mut scanning = tools.scanning.lock().unwrap();
+                let exchange = scanning.session.exchange.as_mut().unwrap();
+                if on_final {
+                    exchange.poison_on_data_final = Some(tools.failed.clone());
+                } else {
+                    exchange.poison_on_data_write = Some(tools.failed.clone());
+                }
+            }
+            assert!(
+                tools
+                    .text("/usr/bin/dpkg", &["--print-architecture"], 128)
+                    .is_err()
+            );
+            assert!(tools.text("/bin/hostname", &[], 4096).is_err());
+            assert!(tools.into_scanning().is_err());
+            let record = record.lock().unwrap();
+            assert_eq!(record.writes.len(), 4);
+            assert_eq!(record.reads, if on_final { 6 } else { 4 });
+            assert_eq!(record.host_calls, 0);
+        }
+    }
+
+    #[test]
+    fn concurrent_tool_entry_fails_without_waiting_for_the_locked_session() {
+        let fixture = Fixture::new();
+        let session = negotiated();
+        let mut journal = fixture.ready(&session);
+        let (exchange, record) = data_scripted(&fixture);
+        let tools = Arc::new(FixedTools::new(data_scanning(
+            &fixture,
+            &mut journal,
+            &session,
+            exchange,
+        )));
+        let locked = tools.scanning.lock().unwrap();
+        let other = tools.clone();
+        let (sent, received) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            sent.send(other.text("/bin/hostname", &[], 4096)).unwrap();
+        });
+        let result = received.recv_timeout(std::time::Duration::from_secs(1));
+        drop(locked);
+        thread.join().unwrap();
+        assert!(result.unwrap().is_err());
+        assert!(tools.text("/bin/hostname", &[], 4096).is_err());
+        drop(tools);
+        let record = record.lock().unwrap();
+        assert_eq!(record.host_calls, 0);
+        assert_eq!(record.writes.len(), 3);
+        assert_eq!(record.closes, 1);
+    }
+
+    #[test]
+    fn data_calls_keep_the_earlier_original_or_root_deadline() {
+        for original in [false, true] {
+            let fixture = Fixture::new();
+            let session = negotiated();
+            let mut journal = fixture.ready(&session);
+            let (mut exchange, record) = data_scripted(&fixture);
+            if original {
+                let mut frame: Value = serde_json::from_slice(&proposal()).unwrap();
+                frame["offer"]["expires_boottime_ms"] = json!(121005);
+                exchange.frames[2] = format!("{frame}\n").into_bytes();
+                exchange.times[30] = clock(121002);
+            } else {
+                exchange.times[30] = clock(10000);
+            }
+            let scanning = data_scanning(&fixture, &mut journal, &session, exchange);
+            let before = saved(&fixture);
+            assert!(scanning.collect_selected("2026-01-01T00:00:00Z").is_err());
+            let record = record.lock().unwrap();
+            assert_eq!(record.writes.len(), 4);
+            assert_eq!(record.reads, 5);
+            assert_eq!(record.closes, 1);
+            drop(record);
+            drop(journal);
+            unfinished_at(&fixture, &before, Some(1010));
+        }
     }
 
     #[test]
