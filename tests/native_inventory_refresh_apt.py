@@ -9,6 +9,7 @@ from datetime import datetime, timedelta, timezone
 import email.utils
 import errno
 import functools
+import fcntl
 import gzip
 import hashlib
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
@@ -31,6 +32,9 @@ import sys
 import threading
 import time
 import tempfile
+
+from inventory_refresh_artifact_fixture import verify_archive
+from inventory_refresh_reporter_fixture_files import FixtureSources
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT/'scripts'))
@@ -1337,6 +1341,40 @@ def install_parent_fixture(program,*,reporter=False):
         raise
 
 
+def stage_reporter_artifact_fixture(archive):
+    # Verification is read-only and precedes all protected publication. This
+    # helper never starts a unit, so partial staging can retire with empty=True.
+    verified=verify_archive(ROOT,archive)
+    fixture={'verified':verified,'sources':None,'parent':None,'retirement_attempted':False}
+    try:
+        fixture['sources']=FixtureSources.fixed(verified)
+        fixture['sources'].publish()
+        entry=verified['files']['libexec/command-center-inventory-refresh/reporter.py'].decode('utf-8')
+        fixture['parent']=install_parent_fixture(entry,reporter=True)
+        return fixture
+    except BaseException:
+        retire_reporter_artifact_fixture(fixture,True)
+        raise
+
+
+def retire_reporter_artifact_fixture(fixture,confirmed_empty):
+    assert not fixture.get('retirement_attempted',False),'Reporter artifact fixture already retired or uncertain'
+    fixture['retirement_attempted']=True
+    valid_confirmation=type(confirmed_empty) is bool
+    confirmed_empty=confirmed_empty if valid_confirmation else False
+    parent,fixture['parent']=fixture['parent'],None
+    sources,fixture['sources']=fixture['sources'],None
+    failed=not valid_confirmation
+    try:
+        if parent is not None:retire_parent_fixture(parent,confirmed_empty)
+    except BaseException:failed=True
+    finally:
+        if sources is not None:
+            try:sources.retire(confirmed_empty)
+            except BaseException:failed=True
+    assert not failed,'Reporter artifact fixture retirement unconfirmed'
+
+
 def run_reporter_parent_fixture(program):
     from inventory_refresh_unit_status import PROPERTIES
     for name in ('inventory_refresh_reporter_parent',):
@@ -1480,7 +1518,89 @@ def prove_reporter_library_roundtrip(actor,public):
             close_reporter_parent(process.stdout,closing)
 
 
-def prove_actual_coordinator_entry_loop():
+def prove_packaged_reporter_roundtrip(archive,public):
+    """Synthetic-parent mechanics only; no durable Rust or completion claim."""
+    from inventory_refresh_unit_status import PROPERTIES
+    from inventory_refresh_reporter_controller import run_reporter_controller
+    unit='command-center-inventory.service';description='Packaged reporter proof '+secrets.token_hex(16)
+    expected='/command.slice/command-center.slice/command-center-inventory.slice/'+unit
+    def properties():
+        result=subprocess.run(['/bin/systemctl','show','--property='+','.join(PROPERTIES),unit],env=ENV,
+            stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,timeout=2)
+        assert result.returncode in (0,4) and len(result.stdout)<=4096
+        values={}
+        for line in result.stdout.decode('ascii').splitlines():
+            key,separator,value=line.partition('=');assert separator and key in PROPERTIES and key not in values;values[key]=value
+        assert set(values)==set(PROPERTIES);return values
+    assert properties()['LoadState']=='not-found'
+    fixture=stage_reporter_artifact_fixture(archive);process=None;group=None;identity=None;invocation=None;confirmed=False
+    try:
+        args=['/usr/bin/systemd-run','--quiet','--wait','--collect','--pipe','--unit='+unit,'--slice='+PARENT_SLICE,'--description='+description]
+        for item in ('User=60002','Group=60002','Type=exec','Restart=no','RemainAfterExit=no','KillMode=control-group',
+            'KillSignal=SIGKILL','TimeoutStopSec=1','RuntimeMaxSec=20','OOMPolicy=kill','TasksMax=8','MemoryAccounting=yes','NoNewPrivileges=yes','CapabilityBoundingSet=',
+            'AmbientCapabilities=','ProtectSystem=strict','ProtectHome=yes','ProtectControlGroups=yes',
+            'ProtectKernelTunables=yes','PrivateDevices=yes','PrivateTmp=yes','PrivateNetwork=yes',
+            'ReadWritePaths=/run/command-center-inventory-refresh/observation /run/command-center-inventory-refresh/release'):
+            args+=['-p',item]
+        args+=['/usr/local/libexec/command-center-inventory']
+        deadline=time.monotonic()+25
+        process=subprocess.Popen(args,env=ENV,stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL)
+        while True:
+            value=properties()
+            if value['LoadState']=='loaded' and value['InvocationID'] and value['ControlGroup']==expected:
+                assert value['Description']==description and re.fullmatch('[0-9a-f]{32}',value['InvocationID'])
+                invocation=value['InvocationID'];group=os.open('/sys/fs/cgroup'+expected,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+                info=os.fstat(group);identity=(info.st_dev,info.st_ino);break
+            assert value['LoadState'] in ('loaded','not-found') and process.poll() is None and time.monotonic()<deadline
+            time.sleep(.02)
+        fds=(process.stdout.fileno(),process.stdin.fileno());identities=[]
+        for fd,direction in zip(fds,(os.O_RDONLY,os.O_WRONLY)):
+            info=os.fstat(fd);flags=fcntl.fcntl(fd,fcntl.F_GETFL)
+            assert stat.S_ISFIFO(info.st_mode) and flags&os.O_ACCMODE==direction
+            identities.append((info.st_dev,info.st_ino))
+        assert identities[0]!=identities[1]
+        for fd in fds:os.set_blocking(fd,False)
+        before=public();nonce='0000000000000008'+'d'*16
+        context={key:before[key] for key in ('cache_generation','policy_generation','successful_checked_at')}
+        context['boot_id']=Path('/proc/sys/kernel/random/boot_id').read_text().strip()
+        result=run_reporter_controller(process,expected_context=context,read_root_status=public,nonce=nonce,deadline=deadline)
+        result['artifact']={key:fixture['verified'][key] for key in ('source_commit','archive_sha256','entry_sha256')}
+        return result
+    finally:
+        failed=False
+        if process is not None:
+            try:process.wait(timeout=max(0,deadline-time.monotonic()))
+            except BaseException:failed=True
+            for stream in (process.stdin,process.stdout):
+                if stream is not None:
+                    try:stream.close()
+                    except BaseException:failed=True
+        try:
+            value=properties()
+            if invocation is not None:
+                if value['LoadState']!='not-found':
+                    assert value['Description']==description and value['InvocationID']==invocation and value['ActiveState'] in ('inactive','failed')
+                assert group is not None and (os.fstat(group).st_dev,os.fstat(group).st_ino)==identity
+                try:named=os.stat('/sys/fs/cgroup'+expected,follow_symlinks=False)
+                except FileNotFoundError:pass
+                else:
+                    assert (named.st_dev,named.st_ino)==identity
+                    fd=os.open('cgroup.events',os.O_RDONLY|os.O_NOFOLLOW,dir_fd=group)
+                    try:assert b'populated 0' in os.read(fd,4096).splitlines()
+                    finally:os.close(fd)
+                confirmed=not failed
+            elif process is None:confirmed=value['LoadState']=='not-found'
+        except BaseException:failed=True
+        finally:
+            if group is not None:
+                try:os.close(group)
+                except BaseException:failed=True;confirmed=False
+            try:retire_reporter_artifact_fixture(fixture,confirmed)
+            except BaseException:failed=True
+        if failed:raise ValueError('Packaged reporter fixture cleanup unconfirmed')
+
+
+def prove_actual_coordinator_entry_loop(archive):
     """GHA-only actual entry, restricted inbox actor and controlled policy refusal."""
     from inventory_refresh_publisher_profile import publisher_properties
     from inventory_refresh_resources import UNIT,SELF_CGROUP
@@ -1620,6 +1740,9 @@ def prove_actual_coordinator_entry_loop():
         receipt=prove_reporter_library_roundtrip(actor,public)
         prove_reporter_parent_mechanics()
         prove_reporter_environment_mechanics(public)
+        packaged=prove_packaged_reporter_roundtrip(archive,public)
+        receipt=packaged['evidence']['observation_receipt']
+        assert receipt['nonce']=='0000000000000008'+'d'*16 and packaged['mechanics_only'] is True
         invalidate_policy()
         assert launcher.wait(timeout=35)==74
         final=confirm_inert();assert final['ExecMainCode']=='1' and final['ExecMainStatus']=='74' and final['Result']=='exit-code'
@@ -1646,6 +1769,8 @@ def prove_actual_coordinator_entry_loop():
         'restricted_reporter_current_readonly_resource_admission_verified':True,
         'restricted_reporter_parent_origin_clock_mechanics_verified':True,
         'restricted_reporter_protected_environment_pin_mechanics_verified':True,
+        'restricted_reporter_artifact_dialogue_roundtrip_mechanics_verified':True,
+        'restricted_reporter_artifact':packaged['artifact'],
         'restricted_reporter_request_writer_roundtrip_verified':True}
 
 def is_live_worker(raw,*,parent=None):
@@ -1888,6 +2013,8 @@ def _run_worker(policy, number, *, stopped_child=False, policy_guard=None,journa
 
 def main():
     assert sys.platform == 'linux' and os.geteuid() == 0 and os.environ.get('GITHUB_ACTIONS') == 'true'
+    assert len(sys.argv)==2
+    archive=Path(sys.argv[1])
     for path in [Path(POLICY_ROOT), Path(CACHE_ROOT), Path(RUNTIME_ROOT), Path(STATE_ROOT), LIB_ROOT]:
         assert not path.exists(), 'Refuse to adopt an existing helper installation'
     unit_files = [Path('/run/systemd/system')/name for name in [PARENT_SLICE, WORKER_SLICE]]
@@ -2072,7 +2199,7 @@ for path in sys.argv[2:]:
         recovered,_,_=run_worker(good,8,policy_guard=private_policy_guard)
         assert recovered==0, 'Owned failed refresh unit was not acknowledged for the next job'
         assert (Path(CACHE_ROOT)/'current.json').read_bytes()==previous
-        resource_proof.update(prove_actual_coordinator_entry_loop())
+        resource_proof.update(prove_actual_coordinator_entry_loop(archive))
         proof = {'schema_version': 1, 'scope': 'fixed_worker_trusted_policy',
             'synthetic_repository_only': True, 'target_repository_fit_proven': False,
             'coordinator_exercised': False, 'apt_refresh_exercised': True,

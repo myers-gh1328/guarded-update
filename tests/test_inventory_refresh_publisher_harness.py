@@ -17,6 +17,67 @@ from unittest.mock import Mock,patch
 
 
 class PublisherHarnessTests(unittest.TestCase):
+    def test_packaged_reporter_launch_has_fixed_unprivileged_scope_and_no_root_signal(self):
+        tree=ast.parse((Path(__file__).parent/'native_inventory_refresh_apt.py').read_bytes())
+        launch=next(node for node in tree.body if isinstance(node,ast.FunctionDef) and node.name=='prove_packaged_reporter_roundtrip')
+        code=ast.unparse(launch)
+        for value in ('User=60002','Group=60002','NoNewPrivileges=yes','PrivateNetwork=yes','RuntimeMaxSec=20'):
+            self.assertIn(value,code)
+        self.assertIn('run_reporter_controller',code)
+        self.assertIn('retire_reporter_artifact_fixture',code)
+        self.assertNotIn('.kill(',code);self.assertNotIn('os.kill(',code)
+
+    def test_artifact_staging_verifies_then_publishes_before_literal_parent_install(self):
+        tree=ast.parse((Path(__file__).parent/'native_inventory_refresh_apt.py').read_bytes())
+        names=('stage_reporter_artifact_fixture','retire_reporter_artifact_fixture')
+        nodes=[next(node for node in tree.body if isinstance(node,ast.FunctionDef) and node.name==name) for name in names]
+        events=[]
+        def retire_sources(empty):
+            events.append(('sources',empty))
+            if not empty:raise ValueError('Unknown fixture cleanup')
+        sources=SimpleNamespace(publish=lambda:events.append('publish'),retire=retire_sources)
+        verified={'files':{'libexec/command-center-inventory-refresh/reporter.py':b'fixed entry'}}
+        parent={'owned':True}
+        def verify(repo,path):events.append(('verify',repo,path));return verified
+        def fixed(value):self.assertIs(value,verified);events.append('fixed');return sources
+        def install(program,**options):
+            self.assertEqual((program,options),('fixed entry',{'reporter':True}));events.append('parent');return parent
+        scope={'ROOT':'checkout','verify_archive':verify,'FixtureSources':SimpleNamespace(fixed=fixed),
+            'install_parent_fixture':install,'retire_parent_fixture':lambda value,empty:events.append(('parent-retire',empty))}
+        exec(compile(ast.Module(body=nodes,type_ignores=[]),'<artifact-staging>','exec'),scope)
+        fixture=scope[names[0]]('archive')
+        self.assertEqual(events,[('verify','checkout','archive'),'fixed','publish','parent'])
+        with self.assertRaises(AssertionError):scope[names[1]](fixture,False)
+        self.assertEqual(events[-2:],[('parent-retire',False),('sources',False)])
+        self.assertIsNone(fixture['sources']);self.assertIsNone(fixture['parent'])
+        retired_events=list(events)
+        with self.assertRaises(AssertionError):scope[names[1]](fixture,True)
+        self.assertEqual(events,retired_events)
+        events.clear();sources.retire=lambda empty:events.append(('sources',empty))
+        def failed_parent(value,empty):events.append(('parent-retire',empty));raise OSError('private')
+        scope['retire_parent_fixture']=failed_parent
+        with self.assertRaises(AssertionError):scope[names[1]]({'parent':parent,'sources':sources},True)
+        self.assertEqual(events,[('parent-retire',True),('sources',True)])
+        events.clear()
+        scope['retire_parent_fixture']=lambda value,empty:events.append(('parent-retire',empty))
+        with self.assertRaises(AssertionError):scope[names[1]]({'parent':parent,'sources':sources},1)
+        self.assertEqual(events,[('parent-retire',False),('sources',False)])
+        events.clear()
+        def failed_install(*args,**kwargs):raise OSError('private')
+        scope['install_parent_fixture']=failed_install
+        with self.assertRaises(OSError):scope[names[0]]('archive')
+        self.assertEqual(events[-1],('sources',True))
+        events.clear()
+        def failed_verify(*args):raise ValueError('private')
+        scope['verify_archive']=failed_verify
+        with self.assertRaises(ValueError):scope[names[0]]('archive')
+        self.assertEqual(events,[])
+        scope['verify_archive']=verify
+        def failed_publish():events.append('partial-publish');raise OSError('private')
+        sources.publish=failed_publish
+        with self.assertRaises(OSError):scope[names[0]]('archive')
+        self.assertEqual(events[-2:],['partial-publish',('sources',True)])
+
     def test_fixed_c_parent_has_two_literal_entry_cases_and_no_forwarded_program(self):
         tree=ast.parse((Path(__file__).parent/'native_inventory_refresh_apt.py').read_bytes())
         factory=next(node for node in tree.body if isinstance(node,ast.FunctionDef) and node.name=='parent_fixture_c_source')
