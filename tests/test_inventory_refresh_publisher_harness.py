@@ -35,9 +35,15 @@ class PublisherHarnessTests(unittest.TestCase):
         body=ast.parse(code)
         assignments=[node.value for node in body.body if isinstance(node,ast.Assign) and any(isinstance(t,ast.Name) and t.id=='SOURCES' for t in node.targets)]
         sources=ast.literal_eval(assignments[-1])
-        self.assertEqual(len(sources),8)
+        self.assertEqual(len(sources),9)
+        self.assertIn(('inventory_refresh_reader_tools','inventory_refresh_reader_tools.py'),sources)
         self.assertEqual(sources[-2:],(('inventory_refresh_reader_session','inventory_refresh_reader_session.py'),('inventory_refresh_reporter_io','inventory_refresh_reporter_io.py')))
         self.assertIn('Synthetic seam only',code)
+        self.assertIn("session.policy(['inventory-proof'])",code)
+        self.assertNotIn('subprocess.run(',code)
+        setup=next(node for node in tree.body if isinstance(node,ast.FunctionDef) and node.name=='prove_reporter_library_roundtrip')
+        copy_loop=next(node for node in setup.body if isinstance(node,ast.For))
+        self.assertIn('inventory_refresh_reader_tools',ast.literal_eval(copy_loop.iter))
         prints=[node for node in ast.walk(body) if isinstance(node,ast.Call) and isinstance(node.func,ast.Name) and node.func.id=='print']
         self.assertEqual(len(prints),3)
         self.assertTrue(all(any(keyword.arg=='flush' and isinstance(keyword.value,ast.Constant) and keyword.value.value is True for keyword in node.keywords) for node in prints))

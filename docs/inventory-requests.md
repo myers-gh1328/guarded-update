@@ -147,3 +147,19 @@ the physical-work fence. Even successful release publication leaves the attempt
 unfinished until verified Root cleanup and all reporter-owned resources closing
 can be bound to that exact scope. There is no cleanup-completion transition in
 this slice, and no executable, capability advertisement or device activation.
+
+The staged reporter session now exposes one fixed APT policy query during its
+admitted scan. It accepts at most 300 distinct canonical binary package IDs and
+selects the immutable generation's `APT_CONFIG` internally. It accepts no caller
+command, option, environment or path. Root-owned ancestry and the held generation
+identity are checked around the query, alongside the reader projection and boot
+clock. This does not read host APT lists or refresh metadata.
+
+Output is streamed with a 16MiB per-query bound and cumulative 64MiB/67-query
+session bounds. Each query has at most ten seconds and stays within the original
+Root lease, reserving one second for later finishing/release. EOF and successful
+direct-child exit are both required; failure consumes the session. Cleanup closes
+owned resources and uses a bounded wait for the directly owned child. It cannot
+prove descendant teardown or Root cleanup; the managed reporter's cgroup and
+receipt gates remain required. Other fixed tools, Rust normalization integration,
+and production source/bootstrap wiring remain unfinished.

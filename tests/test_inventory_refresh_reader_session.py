@@ -4,6 +4,7 @@ import json
 from contextlib import contextmanager
 from types import SimpleNamespace
 from pathlib import Path
+from unittest.mock import patch
 import sys
 import tempfile
 import unittest
@@ -68,6 +69,56 @@ class ReaderSessionTests(unittest.TestCase):
         self.assertEqual(evidence['observation_receipt'],receipt)
         with self.assertRaises(ValueError):session.finish(self.status(receipt=receipt))
         os.fstat(self.dpkg_fd)
+
+    def test_fixed_policy_query_is_available_only_inside_the_admitted_scan(self):
+        session=self.pin()
+        with self.assertRaises(ValueError):session.policy(['synthetic'])
+        self.now=100;session=self.pin();self.start(session)
+        with patch('inventory_refresh_reader_tools._policy',return_value='synthetic:\n Candidate: 2\n') as query:
+            self.assertEqual(session.policy(['synthetic']),'synthetic:\n Candidate: 2\n')
+            self.assertEqual(query.call_args.args[2],['synthetic'])
+        self.now=130;session.finish_scan()
+        with self.assertRaises(ValueError):session.policy(['synthetic'])
+        session.close()
+
+    def test_policy_query_budget_is_cumulative_and_failure_consumes_session(self):
+        session=self.pin();self.start(session)
+        with patch('inventory_refresh_reader_tools._policy',return_value='synthetic') as query:
+            for _ in range(67):session.policy(['synthetic'])
+            with self.assertRaises(ValueError):session.policy(['synthetic'])
+            self.assertEqual(query.call_count,67)
+        with self.assertRaises(ValueError):session.finish_scan()
+        self.now=100;session=self.pin();self.start(session)
+        with patch('inventory_refresh_reader_tools._policy',side_effect=ValueError('synthetic child failure')) as query:
+            with self.assertRaises(ValueError):session.policy(['synthetic'])
+            with self.assertRaises(ValueError):session.policy(['synthetic'])
+            query.assert_called_once()
+        self.publish('d'*32,'e'*32);self.assertTrue(self.store.retire(GEN))
+
+    def test_policy_total_output_budget_cannot_reset_between_batches(self):
+        session=self.pin();self.start(session)
+        with patch('inventory_refresh_reader_tools._policy',return_value='a'*(16*1024*1024)) as query:
+            for _ in range(4):session.policy(['synthetic'])
+            with self.assertRaises(ValueError):session.policy(['synthetic'])
+            self.assertEqual(query.call_count,4)
+        session.close()
+
+    def test_policy_post_query_projection_change_and_clock_rewind_withhold_output(self):
+        for mutation in ('projection','clock','closed'):
+            self.now=100;session=self.pin();self.start(session)
+            def changed(*_):
+                if mutation=='projection':
+                    path=self.cache/('generation-'+GEN)/'_inventory-reader'/'apt.conf'
+                    path.chmod(0o640);path.write_bytes(b'changed');path.chmod(0o440)
+                elif mutation=='clock':self.now=119
+                else:session.close()
+                return 'never publish'
+            with self.subTest(mutation=mutation),patch('inventory_refresh_reader_tools._policy',side_effect=changed):
+                with self.assertRaises(ValueError):session.policy(['synthetic'])
+                with self.assertRaises(ValueError):session.finish_scan()
+            if mutation=='projection':
+                path=self.cache/('generation-'+GEN)/'_inventory-reader'/'apt.conf'
+                path.chmod(0o640);path.write_bytes(b'synthetic apt.conf');path.chmod(0o440)
 
     def test_projection_requires_empty_readonly_parts_directory(self):
         directory=self.cache/('generation-'+GEN)/'_inventory-reader'/'empty.d'

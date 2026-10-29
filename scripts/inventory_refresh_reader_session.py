@@ -35,6 +35,7 @@ class ReaderSession:
         value._generation=cache_generation;value._policy=policy_generation
         value._checked=successful_checked_at
         value._phase='pinned';value._offer=None
+        value._policy_calls=0;value._policy_bytes=0
         try:
             value._time()
             context=cache.lease_current()
@@ -125,6 +126,25 @@ class ReaderSession:
             _require(self._before==self._after)
             self._phase='awaiting_receipt'
             return {'installed_before_sha256':self._before,'installed_after_sha256':self._after}
+        except BaseException:
+            self.close()
+            raise
+
+    def policy(self,packages):
+        """Fixed read-only query of this pinned generation, never a command API."""
+        try:
+            _require(not self._closed and self._phase=='scanning' and self._policy_calls<67 and self._policy_bytes<64*1024*1024)
+            from inventory_refresh_reader_tools import _policy
+            self._phase='querying';self._policy_calls+=1
+            self._verify_projection();self._scan_time()
+            text=_policy(self._cache,self._generation,packages,self._scan_time,
+                self._offer['expires_boottime_ms'],min(16*1024*1024,64*1024*1024-self._policy_bytes))
+            self._policy_bytes+=len(text.encode('utf-8'))
+            _require(not self._closed and self._phase=='querying')
+            self._verify_projection();self._scan_time()
+            _require(not self._closed and self._phase=='querying')
+            self._phase='scanning'
+            return text
         except BaseException:
             self.close()
             raise

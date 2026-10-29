@@ -1073,7 +1073,7 @@ def reporter_library_program():
     # implementation with a fixed reader-only closure, not a production entry.
     prefix=(ROOT/'scripts/inventory_refresh_root_entry.py').read_text().split('\ndef main():',1)[0]
     modules=('inventory_refresh_protocol','inventory_refresh_receipt','inventory_refresh_state','inventory_refresh_storage',
-        'inventory_refresh_status','inventory_refresh_observation','inventory_refresh_reader_session','inventory_refresh_reporter_io')
+        'inventory_refresh_status','inventory_refresh_observation','inventory_refresh_reader_tools','inventory_refresh_reader_session','inventory_refresh_reporter_io')
     body=r'''
 import json,subprocess
 assert len(sys.argv)==2 and re.fullmatch('[0-9a-f]{32}',sys.argv[1])
@@ -1123,11 +1123,9 @@ try:
  for chain in chains:chain.verify()
  # Synthetic seam only: this is NOT a durable reporting RequestJournal proof.
  session.begin_scan(value,observation_nonce=nonce,dpkg_fd=chains[2].fds[-1],owner=0,admit_scan=lambda _:True)
- config='/var/cache/command-center-inventory-refresh/generation-'+initial['cache_generation']+'/_inventory-reader/apt.conf'
- result=subprocess.run(['/usr/bin/apt-cache','policy','inventory-proof'],env={'PATH':'/usr/sbin:/usr/bin:/sbin:/bin','LC_ALL':'C','LANG':'C','APT_CONFIG':config},cwd='/',stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,timeout=5)
- assert result.returncode==0 and len(result.stdout)<=65536
- assert re.search(rb'(?m)^\s*Candidate: 1\.0\s*$',result.stdout)
- assert re.search(rb'(?m)^\s*(?:\*\*\*\s+)?1\.0\s+123\s*$',result.stdout)
+ result=session.policy(['inventory-proof'])
+ assert re.search(r'(?m)^\s*Candidate: 1\.0\s*$',result)
+ assert re.search(r'(?m)^\s*(?:\*\*\*\s+)?1\.0\s+123\s*$',result)
  for chain in chains:chain.verify()
  session.finish_scan()
  print(json.dumps({'phase':'scan_finished'}),flush=True)
@@ -1183,7 +1181,7 @@ def close_reporter_parent(stream,group):
 def prove_reporter_library_roundtrip(actor,public):
     """Native library seam; synthetic admission, not executable-client readiness."""
     from inventory_refresh_unit_status import PROPERTIES
-    for name in ('inventory_refresh_reader_session','inventory_refresh_reporter_io'):
+    for name in ('inventory_refresh_reader_tools','inventory_refresh_reader_session','inventory_refresh_reporter_io'):
         target=LIB_ROOT/(name+'.py');shutil.copyfile(ROOT/'scripts'/(name+'.py'),target);target.chmod(0o444)
     unit='command-center-inventory-session-proof.service';description='Disposable reporter session '+secrets.token_hex(16)
     nonce='0000000000000007'+'e'*16
