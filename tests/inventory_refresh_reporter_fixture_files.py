@@ -24,12 +24,12 @@ def _metadata(info):
 
 class FixtureSources:
     @classmethod
-    def fixed(cls,verified):
+    def fixed(cls,verified,*,include_entry=False):
         require(os.geteuid()==0 and os.environ.get('GITHUB_ACTIONS')=='true')
         from inventory_refresh_resources import _Chain
         chain=_Chain(('usr','local','libexec','command-center-inventory-refresh'));value=None
         try:
-            value=cls._from_directory(chain.fds[-1],verified['files']);value._ancestry=chain;chain=None
+            value=cls._from_directory(chain.fds[-1],verified['files'],include_entry=include_entry);value._ancestry=chain;chain=None
             value.verify();return value
         except BaseException:
             if value is not None:value.close()
@@ -38,22 +38,23 @@ class FixtureSources:
             if chain is not None:chain.close()
 
     @classmethod
-    def _from_directory(cls,directory,contents,*,owner=(0,0)):
+    def _from_directory(cls,directory,contents,*,owner=(0,0),include_entry=False):
         """Private transferred-data/borrowed-directory fixture, not origin proof."""
         require(cls is FixtureSources)
         value=cls();value._directory=None;value._ancestry=None;value._created=[]
         value._closed=False;value._poisoned=False;value._attempted=False;value._published=False;value._owner=owner
-        value._retired=False;value._cleanup_uncertain=False
+        value._retired=False;value._cleanup_uncertain=False;value._close_failed=False
         try:
             require(type(contents) is dict and set(contents)==FILE_NAMES and type(owner) is tuple and len(owner)==2 and
-                all(type(item) is int and item>=0 for item in owner))
-            value._expected={name:contents[LIB+name] for name in LIBRARY_NAMES-{'reporter.py'}}
+                all(type(item) is int and item>=0 for item in owner) and type(include_entry) is bool)
+            value._expected={name:contents[LIB+name] for name in (LIBRARY_NAMES if include_entry else LIBRARY_NAMES-{'reporter.py'})}
             require(all(type(raw) is bytes and 0<len(raw)<=65536 for raw in value._expected.values()))
             value._directory=os.dup(directory);value._identity=value._directory_info()
             value._missing=set()
             for name in sorted(value._expected):
                 if not value._existing(name):
                     require(name not in CORE_NAMES);value._missing.add(name)
+            require(not include_entry or 'reporter.py' in value._missing)
             value.verify();return value
         except BaseException:
             value.close();raise ValueError('Protected reporter fixture staging unavailable') from None
@@ -150,7 +151,9 @@ class FixtureSources:
         if failed:raise ValueError('Protected reporter fixture retirement unconfirmed')
 
     def close(self):
-        if self._closed:return
+        if self._closed:
+            if self._close_failed:raise ValueError('Protected reporter fixture descriptor cleanup unconfirmed')
+            return
         self._closed=True;directory,self._directory=self._directory,None;chain,self._ancestry=self._ancestry,None;failed=False
         if directory is not None:
             try:os.close(directory)
@@ -159,5 +162,5 @@ class FixtureSources:
             try:chain.close()
             except BaseException:failed=True
         if failed:
-            self._cleanup_uncertain=True
+            self._cleanup_uncertain=True;self._close_failed=True
             raise ValueError('Protected reporter fixture descriptor cleanup unconfirmed')

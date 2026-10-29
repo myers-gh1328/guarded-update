@@ -30,10 +30,32 @@ def _directory(info,owner):
 
 class FixtureBinary:
     @classmethod
+    def fixed(cls,artifact):
+        """Root-only literal destination, borrowing an admitted runner chain."""
+        from inventory_refresh_rust_native_admission import RunnerArtifact
+        from inventory_refresh_resources import _Chain
+        require(os.geteuid()==0 and os.environ.get('GITHUB_ACTIONS')=='true' and type(artifact) is RunnerArtifact)
+        chain=None;value=None
+        try:
+            artifact.verify();chain=_Chain(('usr','local','libexec'));chain.verify()
+            value=cls.from_directory(artifact.source_dir,artifact.name,chain.fds[-1],artifact.digest,artifact.size,artifact.owner,(0,0))
+            value._source_chain=artifact;value._destination_chain=chain;chain=None
+            value._verify_source();return value
+        except BaseException:
+            if value is not None:
+                try:value.close()
+                except BaseException:pass
+            if chain is not None:
+                try:chain.close()
+                except BaseException:pass
+            raise ValueError(ERROR) from None
+
+    @classmethod
     def from_directory(cls,source_dir,name,destination_dir,digest,size,source_owner,destination_owner):
         """Private fixture seam; borrowed directories do not prove ancestry."""
         value=cls();value._source_dir=None;value._destination_dir=None;value._source=None
-        value._closed=False;value._uncertain=False;value._published=False;value._attempted=False;value._retired=False
+        value._closed=False;value._uncertain=False;value._close_failed=False;value._published=False;value._attempted=False;value._retired=False
+        value._source_chain=None;value._destination_chain=None
         try:
             require(cls is FixtureBinary and type(name) is str and re.fullmatch('command_center_inventory-[0-9a-f]{16}',name) and
                 type(digest) is str and re.fullmatch('[0-9a-f]{64}',digest) and type(size) is int and 0<size<=LIMIT and
@@ -65,6 +87,8 @@ class FixtureBinary:
         src=os.fstat(self._source_dir);require(stat.S_ISDIR(src.st_mode) and src.st_uid==self._source_owner and not src.st_mode&0o022 and
             (src.st_dev,src.st_ino,src.st_mode,src.st_uid,src.st_gid)==self._source_identity)
         require(_directory(os.fstat(self._destination_dir),self._destination_owner)==self._destination_identity)
+        if self._source_chain is not None:self._source_chain.verify()
+        if self._destination_chain is not None:self._destination_chain.verify()
 
     def _hash(self,fd):
         os.lseek(fd,0,os.SEEK_SET);digest=hashlib.sha256();size=0
@@ -117,6 +141,19 @@ class FixtureBinary:
         if failed:self._uncertain=True;raise ValueError(ERROR) from None
         self._published=True
 
+    def verify_published(self):
+        fd=None;failed=False
+        try:
+            require(self._published and not self._closed and not self._uncertain);self._verify_source()
+            fd=os.open(DESTINATION,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK,dir_fd=self._destination_dir)
+            require(self._verify_target(fd,0o555)==self._target_metadata);self._verify_source()
+        except BaseException:failed=True
+        finally:
+            if fd is not None:
+                try:os.close(fd)
+                except BaseException:failed=True
+        if failed:self._uncertain=True;raise ValueError(ERROR) from None
+
     def retire(self,confirmed_empty):
         require(not self._retired and not self._closed);self._retired=True;failed=False;fd=None
         try:
@@ -136,11 +173,17 @@ class FixtureBinary:
         if failed:raise ValueError(ERROR) from None
 
     def close(self):
-        if self._closed:return
+        if self._closed:
+            if self._close_failed:raise ValueError(ERROR)
+            return
         self._closed=True;failed=False
         for name in ('_source','_source_dir','_destination_dir'):
             fd=getattr(self,name);setattr(self,name,None)
             if fd is not None:
                 try:os.close(fd)
                 except BaseException:failed=True
-        if failed:self._uncertain=True;raise ValueError(ERROR) from None
+        chain,self._destination_chain=self._destination_chain,None
+        if chain is not None:
+            try:chain.close()
+            except BaseException:failed=True
+        if failed:self._uncertain=True;self._close_failed=True;raise ValueError(ERROR) from None

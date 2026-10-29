@@ -33,6 +33,18 @@ class FixtureFilesTests(unittest.TestCase):
         for name in self.missing:self.assertEqual((self.root/name).read_bytes(),self.files[artifact.LIB+name])
         owner.retire(True)
         for name in self.missing:self.assertFalse((self.root/name).exists())
+
+    def test_reporter_entry_can_be_owned_and_retired_with_the_verified_closure(self):
+        self.owner=staging.FixtureSources._from_directory(self.fd,self.files,owner=(os.getuid(),os.getgid()),include_entry=True)
+        self.owner.publish();entry=self.root/'reporter.py'
+        self.assertEqual(entry.read_bytes(),self.files[artifact.LIB+'reporter.py'])
+        self.owner.retire(True);self.assertFalse(entry.exists())
+
+    def test_requested_entry_must_be_absent_even_when_existing_bytes_match(self):
+        target=self.root/'reporter.py';raw=self.files[artifact.LIB+'reporter.py'];target.write_bytes(raw);target.chmod(0o444)
+        with self.assertRaises(ValueError):staging.FixtureSources._from_directory(self.fd,self.files,owner=(os.getuid(),os.getgid()),include_entry=True)
+        self.assertEqual(target.read_bytes(),raw)
+        with self.assertRaises(ValueError):staging.FixtureSources._from_directory(self.fd,self.files,owner=(os.getuid(),os.getgid()),include_entry=1)
         self.assertTrue((self.root/'coordinator.py').is_file());os.fstat(self.fd)
 
     def test_unknown_retirement_is_absorbing_and_cannot_be_relabelled_success(self):
@@ -49,6 +61,16 @@ class FixtureFilesTests(unittest.TestCase):
         with patch.object(staging.os,'close',side_effect=uncertain):
             with self.assertRaises(ValueError):owner.publish()
         with self.assertRaises(ValueError):owner.retire(True)
+
+    def test_failed_descriptor_close_remains_uncertain_on_repeat(self):
+        owner=self.admit();actual=os.close;attempts=[]
+        def uncertain(fd):
+            attempts.append(fd);actual(fd);raise OSError('synthetic close uncertainty')
+        with patch.object(staging.os,'close',side_effect=uncertain):
+            with self.assertRaises(ValueError):owner.close()
+        with self.assertRaises(ValueError):owner.close()
+        self.assertEqual(len(attempts),1)
+        self.owner=None
 
     def test_existing_root_source_mismatch_is_never_overwritten(self):
         target=self.root/'coordinator.py';target.chmod(0o600);target.write_bytes(b'foreign existing coordinator');target.chmod(0o444)

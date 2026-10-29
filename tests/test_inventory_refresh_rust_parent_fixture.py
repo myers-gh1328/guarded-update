@@ -30,7 +30,7 @@ class FixtureBinaryTests(unittest.TestCase):
             sf=os.open(src,os.O_RDONLY|os.O_DIRECTORY);df=os.open(dst,os.O_RDONLY|os.O_DIRECTORY)
             try:
                 value=FixtureBinary.from_directory(sf,name,df,hashlib.sha256(raw).hexdigest(),len(raw),os.getuid(),(os.getuid(),os.getgid()))
-                value.publish();target=dst/'command-center-inventory'
+                value.publish();value.verify_published();target=dst/'command-center-inventory'
                 self.assertEqual(target.read_bytes(),raw);self.assertEqual(target.stat().st_mode&0o777,0o555)
                 value.retire(True);self.assertFalse(target.exists())
             finally:os.close(sf);os.close(df)
@@ -101,6 +101,14 @@ class FixtureBinaryTests(unittest.TestCase):
             with self.assertRaises(ValueError):value.retire(True)
         self.assertEqual(len(calls),3);self.assertTrue(target.exists())
         with self.assertRaises(ValueError):value.retire(True)
+        with self.assertRaises(ValueError):value.close()
+        self.value=None
+
+    def test_prelaunch_verification_detects_replacement_and_preserves_target(self):
+        value=self.admit();value.publish();target=self.dst/'command-center-inventory';target.unlink();target.write_bytes(self.raw);target.chmod(0o555)
+        with self.assertRaises(ValueError):value.verify_published()
+        with self.assertRaises(ValueError):value.retire(True)
+        self.assertEqual(target.read_bytes(),self.raw)
 
     def test_non_boolean_cleanup_confirmation_never_retires(self):
         value=self.admit();value.publish();target=self.dst/'command-center-inventory'

@@ -17,6 +17,122 @@ from unittest.mock import Mock,patch
 
 
 class PublisherHarnessTests(unittest.TestCase):
+    def test_rust_reporter_staging_retires_only_after_preflight_and_confirmed_empty(self):
+        names=('stage_rust_reporter_artifact_fixture','retire_rust_reporter_artifact_fixture')
+        tree=ast.parse((Path(__file__).parent/'native_inventory_refresh_apt.py').read_bytes())
+        nodes=[node for node in tree.body if isinstance(node,ast.FunctionDef) and node.name in names]
+        self.assertEqual({node.name for node in nodes},set(names))
+        events=[]
+        class Owner:
+            def __init__(self,name):self.name=name
+            def publish(self):events.append((self.name,'publish'))
+            def verify(self):events.append((self.name,'verify'))
+            def verify_published(self):events.append((self.name,'verify'))
+            def retire(self,empty):events.append((self.name,'retire',empty))
+            def close(self):events.append((self.name,'close'))
+        artifact,sources,binary=(Owner(name) for name in ('artifact','sources','binary'))
+        scope={'ROOT':'checkout','verify_archive':lambda root,path:{'source_commit':'commit'},
+            'RunnerArtifact':SimpleNamespace(fixed=lambda commit,deadline:artifact),
+            'FixtureSources':SimpleNamespace(fixed=lambda verified,include_entry:sources),
+            'FixtureBinary':SimpleNamespace(fixed=lambda supplied:binary)}
+        exec(compile(ast.Module(body=nodes,type_ignores=[]),'<rust-stage>','exec'),scope)
+        fixture=scope[names[0]]('archive',100)
+        events.clear();scope[names[1]](fixture,True)
+        self.assertEqual(events,[('artifact','verify'),('sources','verify'),('binary','verify'),
+            ('binary','retire',True),('sources','retire',True),('artifact','close')])
+        with self.assertRaises(AssertionError):scope[names[1]](fixture,True)
+        fixture=scope[names[0]]('archive',100);events.clear()
+        with self.assertRaises(AssertionError):scope[names[1]](fixture,False)
+        self.assertEqual(events,[('binary','retire',False),('sources','retire',False),('artifact','close')])
+        fixture=scope[names[0]]('archive',100);events.clear()
+        def fail():events.append(('binary','verify'));raise ValueError('changed')
+        binary.verify_published=fail
+        with self.assertRaises(AssertionError):scope[names[1]](fixture,True)
+        self.assertEqual(events,[('artifact','verify'),('sources','verify'),('binary','verify'),
+            ('binary','retire',False),('sources','retire',False),('artifact','close')])
+    def test_rust_staging_failure_closes_owners_without_retiring(self):
+        tree=ast.parse((Path(__file__).parent/'native_inventory_refresh_apt.py').read_bytes())
+        nodes=[node for node in tree.body if isinstance(node,ast.FunctionDef) and node.name in
+            ('stage_rust_reporter_artifact_fixture','retire_rust_reporter_artifact_fixture')]
+        for failure in ('sources.publish','binary.publish','binary.verify_published'):
+            events=[]
+            class Owner:
+                def __init__(self,name):self.name=name
+                def effect(self,op):
+                    events.append((self.name,op))
+                    if self.name+'.'+op==failure:raise OSError('uncertain')
+                def publish(self):self.effect('publish')
+                def verify(self):self.effect('verify')
+                def verify_published(self):self.effect('verify_published')
+                def close(self):self.effect('close')
+                def retire(self,empty):events.append((self.name,'retire',empty))
+            artifact,sources,binary=(Owner(name) for name in ('artifact','sources','binary'))
+            scope={'ROOT':'checkout','verify_archive':lambda root,path:{'source_commit':'commit'},
+                'RunnerArtifact':SimpleNamespace(fixed=lambda commit,deadline:artifact),
+                'FixtureSources':SimpleNamespace(fixed=lambda verified,include_entry:sources),
+                'FixtureBinary':SimpleNamespace(fixed=lambda supplied:binary)}
+            exec(compile(ast.Module(body=nodes,type_ignores=[]),'<rust-stage>','exec'),scope)
+            with self.assertRaises(ValueError):scope['stage_rust_reporter_artifact_fixture']('archive',100)
+            self.assertFalse(any('retire' in event for event in events))
+            expected=['artifact','sources'] if failure=='sources.publish' else ['artifact','sources','binary']
+            self.assertCountEqual([event[0] for event in events if event[1]=='close'],expected)
+
+    def test_rust_retirement_failure_propagates_unknown_and_closes_artifact(self):
+        tree=ast.parse((Path(__file__).parent/'native_inventory_refresh_apt.py').read_bytes())
+        node=next(node for node in tree.body if isinstance(node,ast.FunctionDef) and node.name=='retire_rust_reporter_artifact_fixture')
+        scope={};exec(compile(ast.Module(body=[node],type_ignores=[]),'<rust-retire>','exec'),scope)
+        events=[]
+        def fail(empty):events.append(('binary',empty));raise OSError('uncertain')
+        fixture={'artifact':SimpleNamespace(verify=lambda:None,close=lambda:events.append(('artifact','close'))),
+            'sources':SimpleNamespace(verify=lambda:None,retire=lambda empty:events.append(('sources',empty))),
+            'binary':SimpleNamespace(verify_published=lambda:None,retire=fail)}
+        with self.assertRaises(AssertionError):scope['retire_rust_reporter_artifact_fixture'](fixture,True)
+        self.assertEqual(events,[('binary',True),('sources',False),('artifact','close')])
+
+    def test_rust_test_output_requires_exact_single_executed_test(self):
+        tree=ast.parse((Path(__file__).parent/'native_inventory_refresh_apt.py').read_bytes())
+        node=next(node for node in tree.body if isinstance(node,ast.FunctionDef) and node.name=='validate_rust_proof_output')
+        scope={'re':re};exec(compile(ast.Module(body=[node],type_ignores=[]),'<rust-output>','exec'),scope)
+        check=scope['validate_rust_proof_output']
+        valid=(b'\nrunning 1 test\ntest inventory::reporter_obs::tests::hosted_real_reporter_rust_journal_roundtrip ... ok\n'
+            b'\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 169 filtered out; finished in 1.23s\n')
+        check(valid)
+        for bad in (valid.replace(b'running 1 test',b'running 0 tests'),valid.replace(b'0 ignored',b'1 ignored'),
+            valid.replace(b' ... ok',b' ... ignored'),valid+b'extra\n',valid.replace(b'1 passed',b'0 passed')):
+            with self.assertRaises((AssertionError,ValueError)):check(bad)
+
+    def test_rust_properties_timeout_never_signals_owned_process(self):
+        tree=ast.parse((Path(__file__).parent/'native_inventory_refresh_apt.py').read_bytes())
+        node=next(node for node in tree.body if isinstance(node,ast.FunctionDef) and node.name=='rust_unit_properties')
+        read_fd,write_fd=os.pipe();stream=os.fdopen(read_fd,'rb',buffering=0)
+        child=SimpleNamespace(stdout=stream,wait=Mock(),kill=Mock(),terminate=Mock())
+        process=SimpleNamespace(Popen=Mock(return_value=child),DEVNULL=subprocess.DEVNULL,PIPE=subprocess.PIPE)
+        scope={'subprocess':process,'os':os,'time':time,'select':__import__('select'),'ENV':{},'PROPERTIES':('LoadState',)}
+        exec(compile(ast.Module(body=[node],type_ignores=[]),'<properties>','exec'),scope)
+        try:
+            with self.assertRaises(ValueError):scope['rust_unit_properties'](time.monotonic()+.03,('LoadState',))
+            child.kill.assert_not_called();child.terminate.assert_not_called()
+            self.assertTrue(stream.closed)
+            self.assertEqual(process.Popen.call_args.args[0][0],'/bin/systemctl')
+        finally:os.close(write_fd)
+
+    def test_real_coordinator_runs_rust_reporter_after_packaged_reporter(self):
+        tree=ast.parse((Path(__file__).parent/'native_inventory_refresh_apt.py').read_bytes())
+        node=next(node for node in tree.body if isinstance(node,ast.FunctionDef) and node.name=='prove_actual_coordinator_entry_loop')
+        code=ast.unparse(node)
+        self.assertLess(code.index('prove_packaged_reporter_roundtrip'),code.index('prove_rust_reporter_roundtrip'))
+        self.assertIn('restricted_rust_parent_real_reporter_journal_mechanics_verified',code)
+
+    def test_rust_reporter_unit_has_fixed_identity_scope_and_cleanup_gate(self):
+        tree=ast.parse((Path(__file__).parent/'native_inventory_refresh_apt.py').read_bytes())
+        node=next(node for node in tree.body if isinstance(node,ast.FunctionDef) and node.name=='prove_rust_reporter_roundtrip')
+        code=ast.unparse(node)
+        for item in ('User=60002','Group=60002','NoNewPrivileges=yes','PrivateNetwork=yes','RuntimeMaxSec=20',
+            '--exact','--ignored','--test-threads=1','hosted_real_reporter_rust_journal_roundtrip',
+            'InvocationID','cgroup.events','populated 0','validate_rust_proof_output','retire_rust_reporter_artifact_fixture'):
+            self.assertIn(item,code)
+        self.assertNotIn('.kill(',code);self.assertNotIn('os.kill(',code)
+
     def test_packaged_reporter_launch_has_fixed_unprivileged_scope_and_no_root_signal(self):
         tree=ast.parse((Path(__file__).parent/'native_inventory_refresh_apt.py').read_bytes())
         launch=next(node for node in tree.body if isinstance(node,ast.FunctionDef) and node.name=='prove_packaged_reporter_roundtrip')

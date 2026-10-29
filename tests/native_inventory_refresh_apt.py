@@ -35,6 +35,8 @@ import tempfile
 
 from inventory_refresh_artifact_fixture import verify_archive
 from inventory_refresh_reporter_fixture_files import FixtureSources
+from inventory_refresh_rust_native_admission import RunnerArtifact
+from inventory_refresh_rust_parent_fixture import FixtureBinary
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT/'scripts'))
@@ -1375,6 +1377,58 @@ def retire_reporter_artifact_fixture(fixture,confirmed_empty):
     assert not failed,'Reporter artifact fixture retirement unconfirmed'
 
 
+def validate_rust_proof_output(raw):
+    assert type(raw) is bytes and len(raw)<=8192
+    lines=raw.decode('ascii').splitlines()
+    lines=[line for line in lines if line]
+    assert len(lines)==3 and lines[0]=='running 1 test'
+    assert lines[1]=='test inventory::reporter_obs::tests::hosted_real_reporter_rust_journal_roundtrip ... ok'
+    assert re.fullmatch(r'test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out; finished in [0-9]+\.[0-9]+s',lines[2])
+
+
+def stage_rust_reporter_artifact_fixture(archive,deadline):
+    # All uncertain partial publications are retained, including before launch.
+    verified=verify_archive(ROOT,archive)
+    fixture={'verified':verified,'artifact':None,'sources':None,'binary':None,'retirement_attempted':False}
+    try:
+        fixture['artifact']=RunnerArtifact.fixed(verified['source_commit'],deadline)
+        fixture['sources']=FixtureSources.fixed(verified,include_entry=True)
+        fixture['sources'].publish()
+        fixture['binary']=FixtureBinary.fixed(fixture['artifact'])
+        fixture['binary'].publish();fixture['binary'].verify_published()
+        return fixture
+    except BaseException:
+        for owner in (fixture['binary'],fixture['sources'],fixture['artifact']):
+            if owner is not None:
+                try:owner.close()
+                except BaseException:pass
+        raise ValueError('Rust reporter fixture staging unconfirmed') from None
+
+
+def retire_rust_reporter_artifact_fixture(fixture,confirmed_empty):
+    assert not fixture.get('retirement_attempted',False),'Rust reporter fixture retirement already attempted'
+    fixture['retirement_attempted']=True
+    valid=type(confirmed_empty) is bool and confirmed_empty
+    if valid:
+        try:
+            fixture['artifact'].verify();fixture['sources'].verify();fixture['binary'].verify_published()
+        except BaseException:valid=False
+    failed=not valid
+    binary,fixture['binary']=fixture['binary'],None
+    sources,fixture['sources']=fixture['sources'],None
+    artifact,fixture['artifact']=fixture['artifact'],None
+    if binary is not None:
+        try:binary.retire(valid)
+        except BaseException:failed=True;valid=False
+    if sources is not None:
+        try:sources.retire(valid)
+        except BaseException:failed=True
+    if artifact is not None:
+        try:artifact.close()
+        except BaseException:failed=True
+    assert not failed,'Rust reporter fixture retirement unconfirmed'
+
+
 def run_reporter_parent_fixture(program):
     from inventory_refresh_unit_status import PROPERTIES
     for name in ('inventory_refresh_reporter_parent',):
@@ -1600,6 +1654,119 @@ def prove_packaged_reporter_roundtrip(archive,public):
         if failed:raise ValueError('Packaged reporter fixture cleanup unconfirmed')
 
 
+def rust_unit_properties(deadline,properties):
+    # Never signal a Root-owned systemctl child on timeout; preserve uncertainty.
+    import select
+    child=None;failed=False;raw=bytearray()
+    try:
+        child=subprocess.Popen(['/bin/systemctl','show','--property='+','.join(properties),'command-center-inventory.service'],
+            env=ENV,stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL)
+        fd=child.stdout.fileno();os.set_blocking(fd,False);poller=select.poll();poller.register(fd,select.POLLIN|select.POLLHUP|select.POLLERR)
+        while True:
+            remaining=deadline-time.monotonic();assert remaining>0 and poller.poll(max(1,int(remaining*1000)))
+            try:chunk=os.read(fd,4097-len(raw))
+            except BlockingIOError:continue
+            assert time.monotonic()<deadline
+            if not chunk:break
+            raw.extend(chunk);assert len(raw)<=4096
+        remaining=deadline-time.monotonic();assert remaining>0 and child.wait(timeout=remaining) in (0,4) and time.monotonic()<deadline
+    except BaseException:failed=True
+    finally:
+        if child is not None:
+            try:child.stdout.close()
+            except BaseException:failed=True
+    if failed:raise ValueError('Rust unit status unconfirmed')
+    try:
+        values={}
+        for line in bytes(raw).decode('ascii').splitlines():
+            key,separator,value=line.partition('=');assert separator and key in properties and key not in values;values[key]=value
+        assert set(values)==set(properties) and time.monotonic()<deadline
+        return values
+    except BaseException:raise ValueError('Rust unit status unconfirmed') from None
+
+
+def prove_rust_reporter_roundtrip(archive,public):
+    """Hosted fixture mechanics; no production or process-set completion witness."""
+    import select
+    from inventory_refresh_unit_status import PROPERTIES
+    unit='command-center-inventory.service';description='Rust reporter proof '+secrets.token_hex(16)
+    expected='/command.slice/command-center.slice/command-center-inventory.slice/'+unit
+    deadline=time.monotonic()+60
+    def properties():return rust_unit_properties(min(deadline,time.monotonic()+2),PROPERTIES)
+    assert properties()['LoadState']=='not-found'
+    fixture=stage_rust_reporter_artifact_fixture(archive,deadline)
+    process=None;group=None;identity=None;invocation=None;confirmed=False;completed=False
+    try:
+        args=['/usr/bin/systemd-run','--quiet','--wait','--collect','--pipe','--unit='+unit,'--slice='+PARENT_SLICE,
+            '--description='+description,'--setenv=GITHUB_ACTIONS=true','--setenv=GUARDED_UPDATE_NATIVE_RUST_PROOF=1']
+        for item in ('User=60002','Group=60002','Type=exec','Restart=no','RemainAfterExit=no','KillMode=control-group',
+            'KillSignal=SIGKILL','TimeoutStopSec=1','RuntimeMaxSec=20','OOMPolicy=kill','TasksMax=8','MemoryAccounting=yes','NoNewPrivileges=yes','CapabilityBoundingSet=',
+            'AmbientCapabilities=','ProtectSystem=strict','ProtectHome=yes','ProtectControlGroups=yes',
+            'ProtectKernelTunables=yes','PrivateDevices=yes','PrivateTmp=yes','PrivateNetwork=yes',
+            'ReadWritePaths=/run/command-center-inventory-refresh/observation /run/command-center-inventory-refresh/release'):
+            args+=['-p',item]
+        args+=['/usr/local/libexec/command-center-inventory','--exact',
+            'inventory::reporter_obs::tests::hosted_real_reporter_rust_journal_roundtrip','--ignored','--test-threads=1','--nocapture']
+        fixture['binary'].verify_published();assert time.monotonic()<deadline
+        process=subprocess.Popen(args,env=ENV,stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL)
+        while True:
+            value=properties()
+            if value['LoadState']=='loaded' and value['InvocationID'] and value['ControlGroup']==expected:
+                assert value['Description']==description and re.fullmatch('[0-9a-f]{32}',value['InvocationID'])
+                invocation=value['InvocationID'];group=os.open('/sys/fs/cgroup'+expected,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+                info=os.fstat(group);identity=(info.st_dev,info.st_ino);break
+            assert value['LoadState'] in ('loaded','not-found') and process.poll() is None and time.monotonic()<deadline
+            time.sleep(.02)
+        fd=process.stdout.fileno();info=os.fstat(fd);flags=fcntl.fcntl(fd,fcntl.F_GETFL)
+        assert stat.S_ISFIFO(info.st_mode) and flags&os.O_ACCMODE==os.O_RDONLY
+        os.set_blocking(fd,False);output=bytearray();poller=select.poll();poller.register(fd,select.POLLIN|select.POLLHUP|select.POLLERR)
+        while True:
+            remaining=deadline-time.monotonic();assert remaining>0 and poller.poll(max(1,int(remaining*1000)))
+            try:chunk=os.read(fd,min(8193-len(output),8193))
+            except BlockingIOError:continue
+            assert time.monotonic()<deadline
+            if not chunk:break
+            output.extend(chunk);assert len(output)<=8192
+        assert process.wait(timeout=max(0,deadline-time.monotonic()))==0 and time.monotonic()<deadline
+        validate_rust_proof_output(bytes(output))
+        status=public();receipt=status['observation_receipt']
+        assert status['observation_lease'] is None and receipt['nonce']=='0000000000000009'+'d'*16 and receipt['outcome']=='released'
+        assert time.monotonic()<deadline
+        completed=True
+        return receipt
+    finally:
+        failed=False
+        if process is not None:
+            try:process.wait(timeout=max(0,deadline-time.monotonic()))
+            except BaseException:failed=True
+            if process.stdout is not None:
+                try:process.stdout.close()
+                except BaseException:failed=True
+        try:
+            value=properties()
+            if invocation is not None:
+                if value['LoadState']!='not-found':
+                    assert value['Description']==description and value['InvocationID']==invocation and value['ActiveState'] in ('inactive','failed')
+                assert group is not None and (os.fstat(group).st_dev,os.fstat(group).st_ino)==identity
+                try:named=os.stat('/sys/fs/cgroup'+expected,follow_symlinks=False)
+                except FileNotFoundError:pass
+                else:
+                    assert (named.st_dev,named.st_ino)==identity
+                    fd=os.open('cgroup.events',os.O_RDONLY|os.O_NOFOLLOW,dir_fd=group)
+                    try:assert b'populated 0' in os.read(fd,4096).splitlines()
+                    finally:os.close(fd)
+                confirmed=completed and not failed and time.monotonic()<deadline
+        except BaseException:failed=True
+        finally:
+            if group is not None:
+                try:os.close(group)
+                except BaseException:failed=True;confirmed=False
+            try:retire_rust_reporter_artifact_fixture(fixture,confirmed)
+            except BaseException:failed=True
+        if time.monotonic()>=deadline:failed=True
+        if failed:raise ValueError('Rust reporter fixture cleanup unconfirmed')
+
+
 def prove_actual_coordinator_entry_loop(archive):
     """GHA-only actual entry, restricted inbox actor and controlled policy refusal."""
     from inventory_refresh_publisher_profile import publisher_properties
@@ -1743,6 +1910,8 @@ def prove_actual_coordinator_entry_loop(archive):
         packaged=prove_packaged_reporter_roundtrip(archive,public)
         receipt=packaged['evidence']['observation_receipt']
         assert receipt['nonce']=='0000000000000008'+'d'*16 and packaged['mechanics_only'] is True
+        receipt=prove_rust_reporter_roundtrip(archive,public)
+        assert receipt['nonce']=='0000000000000009'+'d'*16
         invalidate_policy()
         assert launcher.wait(timeout=35)==74
         final=confirm_inert();assert final['ExecMainCode']=='1' and final['ExecMainStatus']=='74' and final['Result']=='exit-code'
@@ -1770,6 +1939,7 @@ def prove_actual_coordinator_entry_loop(archive):
         'restricted_reporter_parent_origin_clock_mechanics_verified':True,
         'restricted_reporter_protected_environment_pin_mechanics_verified':True,
         'restricted_reporter_artifact_dialogue_roundtrip_mechanics_verified':True,
+        'restricted_rust_parent_real_reporter_journal_mechanics_verified':True,
         'restricted_reporter_artifact':packaged['artifact'],
         'restricted_reporter_request_writer_roundtrip_verified':True}
 
