@@ -172,6 +172,45 @@ fn request_config(
     Ok(request)
 }
 pub fn post(config: &Config, path: &str, body: &str, now: u64) -> Result<Response, String> {
+    post_inner(
+        config,
+        path,
+        body,
+        now,
+        #[cfg(test)]
+        None,
+    )
+}
+
+#[cfg(test)]
+pub(super) fn post_fixture(
+    config: &Config,
+    path: &str,
+    body: &str,
+    now: u64,
+    ca: &Path,
+) -> Result<Response, String> {
+    let port = config
+        .server_url
+        .strip_prefix("https://127.0.0.1:")
+        .ok_or("Fixture endpoint must be loopback")?;
+    if port.is_empty()
+        || !port.bytes().all(|b| b.is_ascii_digit())
+        || port.parse::<u16>().ok().is_none_or(|p| p == 0)
+    {
+        return Err("Fixture endpoint must be loopback".into());
+    }
+    state::protected(ca, false)?;
+    post_inner(config, path, body, now, Some(ca))
+}
+
+fn post_inner(
+    config: &Config,
+    path: &str,
+    body: &str,
+    now: u64,
+    #[cfg(test)] ca: Option<&Path>,
+) -> Result<Response, String> {
     if !matches!(
         path,
         "/api/agent/v1/inventory/check-ins" | "/api/agent/v1/inventory/reports"
@@ -204,32 +243,36 @@ pub fn post(config: &Config, path: &str, body: &str, now: u64) -> Result<Respons
         .map(|b| format!("{b:02x}"))
         .collect::<String>();
     let request = request_config(config, path, body, now, &nonce, &digest, &signature)?;
-    let output = SystemTools.run(
-        "/usr/bin/curl",
-        &[
-            "--disable",
-            "--silent",
-            "--show-error",
-            "--proto",
-            "=https",
-            "--max-redirs",
-            "0",
-            "--connect-timeout",
-            "10",
-            "--max-time",
-            "90",
-            "--max-filesize",
-            "65536",
-            "--include",
-            "--suppress-connect-headers",
-            "--write-out",
-            "\n%{http_code}",
-            "--config",
-            "-",
-        ],
-        request.as_bytes(),
-        128 * 1024,
-    )?;
+    let args = vec![
+        "--disable",
+        "--silent",
+        "--show-error",
+        "--proto",
+        "=https",
+        "--max-redirs",
+        "0",
+        "--connect-timeout",
+        "10",
+        "--max-time",
+        "90",
+        "--max-filesize",
+        "65536",
+        "--include",
+        "--suppress-connect-headers",
+        "--write-out",
+        "\n%{http_code}",
+        "--config",
+        "-",
+    ];
+    #[cfg(test)]
+    let args = if let Some(ca) = ca {
+        let mut args = args;
+        args.extend(["--cacert", ca.to_str().ok_or("Invalid fixture CA path")?]);
+        args
+    } else {
+        args
+    };
+    let output = SystemTools.run("/usr/bin/curl", &args, request.as_bytes(), 128 * 1024)?;
     let text = String::from_utf8(output).map_err(|_| "Invalid reporting response")?;
     let (response, status) = text.rsplit_once('\n').ok_or("Invalid reporting response")?;
     let status = status
@@ -256,6 +299,214 @@ pub fn post(config: &Config, path: &str, body: &str, now: u64) -> Result<Respons
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn retire_tls(child: &mut std::process::Child, root: &Path, ready: bool) -> Result<(), String> {
+        if child
+            .try_wait()
+            .map_err(|_| "TLS fixture status unknown")?
+            .is_none()
+        {
+            child.kill().map_err(|_| "TLS fixture stop unknown")?;
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            if child
+                .try_wait()
+                .map_err(|_| "TLS fixture status unknown")?
+                .is_some()
+            {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err("TLS fixture stop unknown".into());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        if !ready {
+            return Err("TLS fixture startup unknown; scratch retained".into());
+        }
+        std::fs::remove_dir_all(root).map_err(|_| "TLS fixture cleanup unknown".into())
+    }
+    #[test]
+    fn unready_tls_child_is_stopped_but_its_directory_is_retained() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::{Command, Stdio};
+        let root = std::fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!(
+                "inventory-tls-uncertain-{}",
+                random_hex(16).unwrap()
+            ));
+        std::fs::create_dir(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut child = Command::new("/usr/bin/python3")
+            .args(["-I", "-c", "import time; time.sleep(30)"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        assert!(retire_tls(&mut child, &root, false).is_err());
+        assert!(child.try_wait().unwrap().is_some());
+        assert!(root.is_dir());
+        std::fs::remove_dir(&root).unwrap();
+    }
+    #[test]
+    fn fixture_ca_never_authorizes_non_loopback_destinations() {
+        let config = Config {
+            schema_version: 1,
+            server_url: "https://example.test:8443".into(),
+            device_id: "test".into(),
+            enrollment_id: "00000000-0000-4000-8000-000000000001".into(),
+            key_id: "test".into(),
+            reporting_private_key_file: "/unused".into(),
+            state_dir: "/unused".into(),
+        };
+        assert!(
+            post_fixture(
+                &config,
+                "/api/agent/v1/inventory/check-ins",
+                "{}",
+                1,
+                Path::new("/unused")
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn fixture_trust_rejects_missing_invalid_or_untrusted_ca_path() {
+        let config = Config {
+            schema_version: 1,
+            server_url: "https://127.0.0.1:4443".into(),
+            device_id: "test".into(),
+            enrollment_id: "00000000-0000-4000-8000-000000000001".into(),
+            key_id: "test".into(),
+            reporting_private_key_file: "/unused".into(),
+            state_dir: "/unused".into(),
+        };
+        assert!(
+            post_fixture(
+                &config,
+                "/api/agent/v1/inventory/check-ins",
+                "{}",
+                1,
+                Path::new("/missing-ca")
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn fixture_curl_requires_matching_private_ca_and_ip_san_without_redirects() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::{Child, Command, Stdio};
+        struct Fixture {
+            child: Child,
+            root: PathBuf,
+            ready: bool,
+            retirement_attempted: bool,
+        }
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                if !self.retirement_attempted {
+                    let _ = self.child.kill();
+                }
+            }
+        }
+        impl Fixture {
+            fn retire(&mut self) -> Result<(), String> {
+                if self.retirement_attempted {
+                    return Err("TLS fixture retirement already attempted".into());
+                }
+                self.retirement_attempted = true;
+                retire_tls(&mut self.child, &self.root, self.ready)
+            }
+        }
+        fn fixture(san: &str) -> (Fixture, Config) {
+            let root = std::fs::canonicalize(std::env::temp_dir())
+                .unwrap()
+                .join(format!("inventory-tls-{}", random_hex(16).unwrap()));
+            std::fs::create_dir(&root).unwrap();
+            std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let child = Command::new("/usr/bin/python3")
+                .args([
+                    "-I",
+                    "-B",
+                    concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/tests/inventory_tls_fixture.py"
+                    ),
+                    root.to_str().unwrap(),
+                    san,
+                ])
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+            let mut fixture = Fixture {
+                child,
+                root,
+                ready: false,
+                retirement_attempted: false,
+            };
+            let start = std::time::Instant::now();
+            while !fixture.root.join("port").exists() {
+                assert!(
+                    fixture.child.try_wait().unwrap().is_none(),
+                    "Fixture TLS server exited"
+                );
+                assert!(
+                    start.elapsed() < std::time::Duration::from_secs(15),
+                    "Fixture TLS server startup timed out"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            let port = std::fs::read_to_string(fixture.root.join("port"))
+                .unwrap()
+                .parse::<u16>()
+                .unwrap();
+            fixture.ready = true;
+            let config = Config {
+                schema_version: 1,
+                server_url: format!("https://127.0.0.1:{port}"),
+                device_id: "synthetic".into(),
+                enrollment_id: "00000000-0000-4000-8000-000000000001".into(),
+                key_id: "synthetic".into(),
+                reporting_private_key_file: fixture.root.join("device.key"),
+                state_dir: fixture.root.clone(),
+            };
+            (fixture, config)
+        }
+        let (mut good, config) = fixture("ip");
+        let path = "/api/agent/v1/inventory/check-ins";
+        assert_eq!(
+            post_fixture(&config, path, "{}", 1, &good.root.join("server.pem"))
+                .unwrap()
+                .status,
+            200
+        );
+        assert!(post_fixture(&config, path, "{}", 1, &good.root.join("other.pem")).is_err());
+        assert_eq!(
+            post_fixture(
+                &config,
+                "/api/agent/v1/inventory/reports",
+                "{}",
+                1,
+                &good.root.join("server.pem")
+            )
+            .unwrap()
+            .status,
+            302
+        );
+        good.retire().unwrap();
+        drop(good);
+        let (mut wrong, config) = fixture("wrong");
+        assert!(post_fixture(&config, path, "{}", 1, &wrong.root.join("server.pem")).is_err());
+        wrong.retire().unwrap();
+    }
     #[test]
     fn purpose_bound_canonical_request_has_no_trailing_newline() {
         assert_eq!(
