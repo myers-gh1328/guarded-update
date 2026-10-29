@@ -338,3 +338,31 @@ bytes; no further command is processed. Caller-owned original descriptors,
 child exit, process-set cleanup and durable journal/source gates remain
 separate. This is a private capability composition library with real-pipe
 fixtures, not an activated executable or native completion proof.
+
+A build-only generator now composes a fixed reporter entry from the existing
+Root source loader's exact helper/class segments and a reporter-specific
+template. It preserves the Root coordinator and its27-module closure. The
+reporter closure has18 fixed dependency-ordered modules, admitted and compiled
+as one batch before any project execution. Generation rejects unexpected AST
+shapes, helper/closure shadowing and duplicate markers, and records input,
+closure and generated-entry hashes. Artifact integration must still bind the
+generator and all inputs to the selected commit; these hashes alone are not
+trusted release provenance.
+
+The template requires isolated Python, exact entry arguments, nonRoot saved
+identity, zero capability sets, no-new-privileges and current intended unit
+membership before project admission. Source owners close before runtime
+construction. Both original pipe directions and identities are checked before
+nonblocking flags change. Python stream wrappers and inherited raw descriptors
+are tracked separately: borrowing wrappers close first, then their original
+raw FD closes once after identity revalidation; owning wrappers never trigger
+a raw-close retry. Replacement descriptors are preserved, distinct descriptors
+sharing an inode remain distinct, and every close is attempted.
+
+The outer entry exits only after explicit cleanup and bypasses later interpreter
+flush/finalizer retries. Any admission or cleanup uncertainty yields74, including
+after visible prepared evidence. Tests cover clean-process closure imports,
+real owned pipe wrappers and silent profile rejection. This generator/template
+is not yet packaged, installed or activated. Parent admission of the exact
+entry bytes before execution, actual restricted entry/native Root roundtrip,
+Rust durable ownership and complete process-set cleanup remain required.
