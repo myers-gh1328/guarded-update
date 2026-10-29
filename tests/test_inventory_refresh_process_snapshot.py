@@ -72,7 +72,7 @@ class ProcessSnapshotTests(unittest.TestCase):
                 owner=ProcessProbe._from_directory(fd,123,(0,27),time.monotonic()+2,owner=os.getuid())
                 with patch('inventory_refresh_process_snapshot.os.geteuid',return_value=0),patch.dict(os.environ,{'GITHUB_ACTIONS':'true'}),contextlib.redirect_stderr(output):
                     with self.assertRaises(ValueError):owner.sample()
-                self.assertEqual(output.getvalue(),'Native fixture process probe stage=profile_mount\n')
+                self.assertEqual(output.getvalue(),'Native fixture process probe stage=profile_mount_writable\n')
                 owner.close()
             finally:os.close(fd)
 
