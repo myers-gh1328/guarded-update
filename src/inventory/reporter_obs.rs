@@ -1,10 +1,11 @@
-//! Scripted OBS publication seam only; no process, Root grant or scan authority.
+//! Scripted OBS/scan admission only; no process, live Root or completion witness.
 //! Deadline comparisons here do not bound arbitrary blocking I/O. A real
 //! admitted nonblocking exchange and source/lifetime proofs remain separate.
 
 use super::reporter_frame::parse_frame;
 use super::requests::{
-    Clock, NativeCollectionIntent, Negotiated, PublishedNativeCollection, RequestJournal,
+    Capability, ClientStatus, Clock, CollectionProof, NativeCollectionIntent, Negotiated,
+    PublishedNativeCollection, RequestJournal,
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -102,6 +103,9 @@ enum Phase {
     Pinned,
     Publishing,
     Published,
+    AwaitingOffer,
+    Acknowledging,
+    Scanning,
     Closed,
 }
 struct PinnedSession<E: Exchange> {
@@ -114,6 +118,134 @@ struct PinnedSession<E: Exchange> {
 struct PublishedSession<E: Exchange> {
     session: PinnedSession<E>,
     published: PublishedNativeCollection,
+}
+
+// Structural scripted metadata, never proof of a live Root lock/source origin.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RootOffer {
+    nonce: String,
+    boot_id: String,
+    cache_generation: String,
+    policy_generation: String,
+    lock_open_boottime_ms: u64,
+    expires_boottime_ms: u64,
+}
+struct ScanningSession<E: Exchange> {
+    session: PinnedSession<E>,
+    proof: CollectionProof,
+    offer: RootOffer,
+}
+
+impl<E: Exchange> PublishedSession<E> {
+    fn admit_scan(
+        self,
+        journal: &mut RequestJournal<'_>,
+        negotiated: &Negotiated,
+    ) -> Result<ScanningSession<E>> {
+        let Self {
+            mut session,
+            published,
+        } = self;
+        require(session.phase == Phase::Published)?;
+        session.phase = Phase::AwaitingOffer;
+        session.check()?;
+        let mut command =
+            serde_json::to_vec(&json!({"schema_version":1,"id":2,"operation":"await_open"}))
+                .map_err(|_| ERROR.to_owned())?;
+        command.push(b'\n');
+        // Metadata-only wait outside JOURNAL_ACCESS. Current authority is checked
+        // by attach before ANY scan_admitted command can release native reads.
+        session
+            .port()?
+            .write(&command)
+            .map_err(|_| ERROR.to_owned())?;
+        session.check()?;
+        let raw = session.port()?.read().map_err(|_| ERROR.to_owned())?;
+        session.check()?;
+        let frame = parse_frame(&raw).map_err(|_| ERROR.to_owned())?;
+        let object = frame.as_object().ok_or(ERROR)?;
+        require(
+            object.len() == 6
+                && frame["schema_version"].as_u64() == Some(1)
+                && frame["id"].as_u64() == Some(2)
+                && frame["operation"] == "await_open"
+                && frame["phase"] == "scan_proposed",
+        )?;
+        let offer: RootOffer =
+            serde_json::from_value(frame["offer"].clone()).map_err(|_| ERROR.to_owned())?;
+        let proposed = frame["scan_started_boottime_ms"]
+            .as_u64()
+            .filter(|time| *time <= SAFE)
+            .ok_or(ERROR)?;
+        require(
+            offer.nonce == published.observation_nonce()
+                && offer.boot_id == session.context.boot_id
+                && offer.cache_generation == session.context.cache_generation
+                && offer.policy_generation == session.context.policy_generation
+                && offer.lock_open_boottime_ms <= SAFE
+                && offer.expires_boottime_ms <= SAFE
+                && offer
+                    .expires_boottime_ms
+                    .checked_sub(offer.lock_open_boottime_ms)
+                    .is_some_and(|span| span <= 120000)
+                && session.context.pinned_boottime_ms <= offer.lock_open_boottime_ms
+                && offer.lock_open_boottime_ms <= proposed,
+        )?;
+        let actual = session.check()?;
+        session.deadline = session.deadline.min(offer.expires_boottime_ms);
+        require(proposed <= actual.boottime_ms && actual.boottime_ms < session.deadline)?;
+        // Preserve the fresh owner last-clock. Only the separate proof Clock is
+        // historical, recording the exact child proposal before its first read.
+        let attachment_clock = Clock {
+            boottime_ms: proposed,
+            ..actual
+        };
+        let proof = journal
+            .attach_native_scan(published, &attachment_clock, negotiated)
+            .map_err(|_| ERROR.to_owned())?;
+        session.check()?; // Fsync may consume the last budget; no ACK on expiry.
+        session.phase = Phase::Acknowledging;
+        let mut command=serde_json::to_vec(&json!({"schema_version":1,"id":3,"operation":"scan_admitted","scan_started_boottime_ms":proposed})).map_err(|_|ERROR.to_owned())?;
+        command.push(b'\n');
+        session.check()?;
+        session
+            .port()?
+            .write(&command)
+            .map_err(|_| ERROR.to_owned())?;
+        session.check()?;
+        let raw = session.port()?.read().map_err(|_| ERROR.to_owned())?;
+        session.check()?;
+        let frame = parse_frame(&raw).map_err(|_| ERROR.to_owned())?;
+        let object = frame.as_object().ok_or(ERROR)?;
+        require(
+            object.len() == 5
+                && frame["schema_version"].as_u64() == Some(1)
+                && frame["id"].as_u64() == Some(3)
+                && frame["operation"] == "scan_admitted"
+                && frame["phase"] == "scanning"
+                && frame["scan_started_boottime_ms"].as_u64() == Some(proposed),
+        )?;
+        let pending = journal
+            .pending(Capability::Collection)
+            .map_err(|_| ERROR.to_owned())?
+            .ok_or(ERROR)?;
+        require(
+            pending.status == ClientStatus::Running
+                && pending.operation_nonce.as_deref() == Some(proof.operation_nonce.as_str())
+                && pending.report_id.is_none()
+                && pending.report_sha256.is_none()
+                && pending.attempt
+                    == Some(serde_json::to_value(&proof).map_err(|_| ERROR.to_owned())?),
+        )?;
+        session.check()?; // Includes time spent in the protected pending read.
+        session.phase = Phase::Scanning;
+        Ok(ScanningSession {
+            session,
+            proof,
+            offer,
+        })
+    }
 }
 
 impl<E: Exchange> PinnedSession<E> {
@@ -345,6 +477,7 @@ mod tests {
         durable_seen: bool,
         reads: usize,
         samples: usize,
+        scan_seen: bool,
     }
     struct Scripted {
         frames: VecDeque<Vec<u8>>,
@@ -353,6 +486,9 @@ mod tests {
         path: std::path::PathBuf,
         fail_write: bool,
         change_on_ack: bool,
+        fail_scan_ack: bool,
+        fail_attach: bool,
+        change_after_scanning: bool,
     }
     impl Exchange for Scripted {
         fn sample(&mut self) -> Result<Clock> {
@@ -369,21 +505,52 @@ mod tests {
                 bytes.push(b'\n');
                 std::fs::write(&self.path, bytes).unwrap();
             }
+            if record.reads == 3 && self.fail_attach {
+                std::fs::create_dir(self.path.with_extension("pending")).unwrap();
+            }
+            if record.reads == 4 && self.change_after_scanning {
+                let mut bytes = std::fs::read(&self.path).unwrap();
+                bytes.push(b'\n');
+                std::fs::write(&self.path, bytes).unwrap();
+            }
             self.frames.pop_front().ok_or("Synthetic EOF".into())
         }
         fn write(&mut self, raw: &[u8]) -> Result<()> {
             let saved: Value = serde_json::from_slice(&std::fs::read(&self.path).unwrap()).unwrap();
             let command: Value = serde_json::from_slice(raw).unwrap();
-            assert_eq!(saved["collection"]["active"]["submitted"], true);
-            assert!(saved["collection"]["active"]["proof"]["evidence"]["scan"].is_null());
-            assert_eq!(
-                saved["collection"]["active"]["native_attempt"]["observation_nonce"],
-                command["nonce"]
-            );
+            let retained = if saved["collection"]["active"].is_object() {
+                &saved["collection"]["active"]
+            } else {
+                &saved["collection"]["last_terminal"]
+            };
+            assert_eq!(retained["submitted"], true);
+            let scan = &retained["proof"]["evidence"]["scan"];
             let mut record = self.record.lock().unwrap();
-            record.durable_seen = true;
+            match command["operation"].as_str().unwrap() {
+                "publish_observation" => {
+                    assert!(scan.is_null());
+                    assert_eq!(
+                        retained["native_attempt"]["observation_nonce"],
+                        command["nonce"]
+                    );
+                    record.durable_seen = true;
+                }
+                "await_open" => assert!(scan.is_null()),
+                "scan_admitted" => {
+                    assert_eq!(
+                        scan["started_boottime_ms"],
+                        command["scan_started_boottime_ms"]
+                    );
+                    assert_eq!(scan["report_id"], REPORT);
+                    assert_eq!(scan["sequence"], 1);
+                    assert_eq!(scan["source_revision"], 1);
+                    assert!(scan["finished_boottime_ms"].is_null());
+                    record.scan_seen = true;
+                }
+                _ => panic!("Unexpected scripted operation"),
+            }
             record.writes.push(raw.to_vec());
-            if self.fail_write {
+            if self.fail_write || (self.fail_scan_ack && command["operation"] == "scan_admitted") {
                 Err("Synthetic possibly visible write failure".into())
             } else {
                 Ok(())
@@ -404,12 +571,35 @@ mod tests {
                 path: fixture.dir.join("requests.json"),
                 fail_write: false,
                 change_on_ack: false,
+                fail_scan_ack: false,
+                fail_attach: false,
+                change_after_scanning: false,
             },
             record,
         )
     }
 
+    fn proposal() -> Vec<u8> {
+        format!("{}\n",json!({"schema_version":1,"id":2,"operation":"await_open","phase":"scan_proposed","offer":{
+        "nonce":"0000000000000008bbbbbbbbbbbbbbbb","boot_id":BOOT,"cache_generation":"a".repeat(32),"policy_generation":"b".repeat(64),
+        "lock_open_boottime_ms":1005,"expires_boottime_ms":10000},"scan_started_boottime_ms":1010})).into_bytes()
+    }
+    fn scanning_ack() -> Vec<u8> {
+        b"{\"schema_version\":1,\"id\":3,\"operation\":\"scan_admitted\",\"phase\":\"scanning\",\"scan_started_boottime_ms\":1010}\n".to_vec()
+    }
+    fn scan_scripted(fixture: &Fixture) -> (Scripted, Arc<Mutex<Recorded>>) {
+        let (mut exchange, record) = scripted(fixture);
+        exchange.frames.extend([proposal(), scanning_ack()]);
+        exchange.times = (0..40)
+            .map(|index| clock(if index < 9 { 1002 } else { 1012 }))
+            .collect();
+        (exchange, record)
+    }
+
     fn unfinished(fixture: &Fixture, before: &Value) {
+        unfinished_at(fixture, before, None);
+    }
+    fn unfinished_at(fixture: &Fixture, before: &Value, start: Option<u64>) {
         let mut reopened = RequestJournal::open(&fixture.dir, BOOT, &fixture.lock).unwrap();
         assert_eq!(
             reopened.recover_collection(None).unwrap(),
@@ -424,7 +614,13 @@ mod tests {
             .or_else(|| after["collection"]["last_terminal"].as_object())
             .unwrap();
         assert_eq!(retained["submitted"], true);
-        assert!(retained["proof"]["evidence"]["scan"].is_null());
+        let scan = &retained["proof"]["evidence"]["scan"];
+        if let Some(start) = start {
+            assert_eq!(scan["started_boottime_ms"], start);
+            assert!(scan["finished_boottime_ms"].is_null());
+        } else {
+            assert!(scan.is_null());
+        }
         assert_eq!(
             retained["native_attempt"]["observation_nonce"],
             "0000000000000008bbbbbbbbbbbbbbbb"
@@ -484,6 +680,301 @@ mod tests {
         let record = record.lock().unwrap();
         assert!(record.writes.is_empty());
         assert_eq!(record.closes, 1);
+    }
+
+    #[test]
+    fn root_offer_attaches_exact_scan_durably_before_scan_admitted_ack() {
+        let fixture = Fixture::new();
+        let session = negotiated();
+        let mut journal = fixture.ready(&session);
+        let intent = journal
+            .admit_native_collection(REPORT, 1, 1, &clock(1001), "bbbbbbbbbbbbbbbb", &session)
+            .unwrap();
+        let (exchange, record) = scan_scripted(&fixture);
+        let published = PinnedSession::admit(exchange, expected())
+            .unwrap()
+            .publish(&mut journal, intent, &session)
+            .unwrap();
+        let scanning = published.admit_scan(&mut journal, &session).unwrap();
+        let scan = scanning.proof.scan.as_ref().unwrap();
+        assert_eq!(scan.started_boottime_ms, 1010);
+        assert!(scan.finished_boottime_ms.is_none());
+        assert_eq!(scanning.session.last, 1012);
+        assert_eq!(scanning.session.deadline, 10000);
+        assert_eq!(scanning.offer.lock_open_boottime_ms, 1005);
+        assert!(!scanning.proof.ready());
+        let record = record.lock().unwrap();
+        assert!(record.scan_seen);
+        assert_eq!(record.writes.len(), 3);
+        let command: Value = serde_json::from_slice(&record.writes[2]).unwrap();
+        assert_eq!(
+            command,
+            json!({"schema_version":1,"id":3,"operation":"scan_admitted","scan_started_boottime_ms":1010})
+        );
+    }
+
+    #[test]
+    fn malformed_or_mismatched_offer_never_attaches_or_acknowledges_scan() {
+        for change in 0..16 {
+            let fixture = Fixture::new();
+            let session = negotiated();
+            let mut journal = fixture.ready(&session);
+            let intent = journal
+                .admit_native_collection(REPORT, 1, 1, &clock(1001), "bbbbbbbbbbbbbbbb", &session)
+                .unwrap();
+            let before = saved(&fixture);
+            let (mut exchange, record) = scan_scripted(&fixture);
+            let mut frame: Value = serde_json::from_slice(&proposal()).unwrap();
+            match change {
+                0 => frame["offer"]["nonce"] = json!("0000000000000008cccccccccccccccc"),
+                1 => frame["offer"]["boot_id"] = json!("00000000-0000-4000-8000-000000000003"),
+                2 => frame["offer"]["cache_generation"] = json!("d".repeat(32)),
+                3 => frame["offer"]["policy_generation"] = json!("d".repeat(64)),
+                4 => frame["offer"]["lock_open_boottime_ms"] = json!(1000),
+                5 => frame["scan_started_boottime_ms"] = json!(1004),
+                6 => frame["scan_started_boottime_ms"] = json!(1013),
+                7 => frame["offer"]["expires_boottime_ms"] = json!(1004),
+                8 => frame["offer"]["expires_boottime_ms"] = json!(121006),
+                9 => frame["offer"]["expires_boottime_ms"] = json!(1012),
+                10 => frame["scan_started_boottime_ms"] = json!(true),
+                11 => frame["offer"]["lock_open_boottime_ms"] = json!(1005.0),
+                12 => frame["offer"]["extra"] = json!(0),
+                13 => frame["id"] = json!(3),
+                14 => frame["extra"] = json!(0),
+                _ => frame["offer"]["expires_boottime_ms"] = json!(SAFE + 1),
+            }
+            exchange.frames[2] = format!("{frame}\n").into_bytes();
+            let published = PinnedSession::admit(exchange, expected())
+                .unwrap()
+                .publish(&mut journal, intent, &session)
+                .unwrap();
+            assert!(
+                published.admit_scan(&mut journal, &session).is_err(),
+                "case {change}"
+            );
+            let record = record.lock().unwrap();
+            assert_eq!(record.writes.len(), 2);
+            assert!(!record.scan_seen);
+            assert_eq!(record.closes, 1);
+            drop(record);
+            drop(journal);
+            unfinished(&fixture, &before);
+        }
+    }
+
+    #[test]
+    fn lost_offer_authority_allows_metadata_exchange_but_never_scan_ack() {
+        for change in 0..4 {
+            let fixture = Fixture::new();
+            let session = negotiated();
+            let mut journal = fixture.ready(&session);
+            let intent = journal
+                .admit_native_collection(REPORT, 1, 1, &clock(1001), "bbbbbbbbbbbbbbbb", &session)
+                .unwrap();
+            let before = saved(&fixture);
+            let (exchange, record) = scan_scripted(&fixture);
+            let published = PinnedSession::admit(exchange, expected())
+                .unwrap()
+                .publish(&mut journal, intent, &session)
+                .unwrap();
+            let current = if change == 0 {
+                negotiated()
+            } else {
+                session.clone()
+            };
+            match change {
+                1 => {
+                    journal.unconfirmed(Capability::Collection).unwrap();
+                }
+                2 => {
+                    let pending = journal.pending(Capability::Collection).unwrap().unwrap();
+                    journal
+                        .canonical(
+                            Capability::Collection,
+                            &Canonical {
+                                schema_version: 1,
+                                request: CanonicalRequest {
+                                    request_id: pending.request_id,
+                                    delivery_sequence: pending.delivery_sequence,
+                                    status: CanonicalStatus::Failed,
+                                    reason: Some("inventory_authority_changed".into()),
+                                    report_id: None,
+                                    report_sha256: None,
+                                    operation_nonce: pending.operation_nonce,
+                                },
+                                receipt: None,
+                            },
+                        )
+                        .unwrap();
+                }
+                3 => {
+                    let path = fixture.dir.join("requests.json");
+                    let mut bytes = std::fs::read(&path).unwrap();
+                    bytes.push(b'\n');
+                    std::fs::write(path, bytes).unwrap();
+                }
+                _ => {}
+            }
+            assert!(published.admit_scan(&mut journal, &current).is_err());
+            let record = record.lock().unwrap();
+            assert_eq!(record.writes.len(), 2);
+            assert!(!record.scan_seen);
+            drop(record);
+            drop(journal);
+            unfinished(&fixture, &before);
+        }
+    }
+
+    #[test]
+    fn failed_attachment_persistence_never_sends_scan_admitted_ack() {
+        let fixture = Fixture::new();
+        let session = negotiated();
+        let mut journal = fixture.ready(&session);
+        let intent = journal
+            .admit_native_collection(REPORT, 1, 1, &clock(1001), "bbbbbbbbbbbbbbbb", &session)
+            .unwrap();
+        let before = saved(&fixture);
+        let (mut exchange, record) = scan_scripted(&fixture);
+        exchange.fail_attach = true;
+        let published = PinnedSession::admit(exchange, expected())
+            .unwrap()
+            .publish(&mut journal, intent, &session)
+            .unwrap();
+        assert!(published.admit_scan(&mut journal, &session).is_err());
+        assert!(journal.pending(Capability::Collection).is_err());
+        let record = record.lock().unwrap();
+        assert_eq!(record.writes.len(), 2);
+        assert!(!record.scan_seen);
+        drop(record);
+        std::fs::remove_dir(fixture.dir.join("requests.pending")).unwrap();
+        drop(journal);
+        unfinished(&fixture, &before);
+    }
+
+    #[test]
+    fn expired_after_attach_fsync_retains_proof_but_never_sends_scan_ack() {
+        for expiry in [10000, 121002] {
+            let fixture = Fixture::new();
+            let session = negotiated();
+            let mut journal = fixture.ready(&session);
+            let intent = journal
+                .admit_native_collection(REPORT, 1, 1, &clock(1001), "bbbbbbbbbbbbbbbb", &session)
+                .unwrap();
+            let before = saved(&fixture);
+            let (mut exchange, record) = scan_scripted(&fixture);
+            exchange.times[13] = clock(expiry);
+            if expiry == 121002 {
+                let mut frame: Value = serde_json::from_slice(&proposal()).unwrap();
+                frame["offer"]["expires_boottime_ms"] = json!(121005);
+                exchange.frames[2] = format!("{frame}\n").into_bytes();
+            }
+            let published = PinnedSession::admit(exchange, expected())
+                .unwrap()
+                .publish(&mut journal, intent, &session)
+                .unwrap();
+            assert!(published.admit_scan(&mut journal, &session).is_err());
+            assert_eq!(
+                saved(&fixture)["collection"]["active"]["proof"]["evidence"]["scan"]["started_boottime_ms"],
+                1010
+            );
+            let record = record.lock().unwrap();
+            assert_eq!(record.writes.len(), 2);
+            assert!(!record.scan_seen);
+            drop(record);
+            drop(journal);
+            unfinished_at(&fixture, &before, Some(1010));
+        }
+    }
+
+    #[test]
+    fn owner_clock_never_rewinds_to_the_historical_proposal() {
+        let fixture = Fixture::new();
+        let session = negotiated();
+        let mut journal = fixture.ready(&session);
+        let intent = journal
+            .admit_native_collection(REPORT, 1, 1, &clock(1001), "bbbbbbbbbbbbbbbb", &session)
+            .unwrap();
+        let before = saved(&fixture);
+        let (mut exchange, record) = scan_scripted(&fixture);
+        exchange.times[13] = clock(1011);
+        let published = PinnedSession::admit(exchange, expected())
+            .unwrap()
+            .publish(&mut journal, intent, &session)
+            .unwrap();
+        assert!(published.admit_scan(&mut journal, &session).is_err());
+        assert_eq!(record.lock().unwrap().writes.len(), 2);
+        drop(journal);
+        unfinished_at(&fixture, &before, Some(1010));
+    }
+
+    #[test]
+    fn failed_or_malformed_scanning_ack_never_erases_started_evidence() {
+        for change in 0..8 {
+            let fixture = Fixture::new();
+            let session = negotiated();
+            let mut journal = fixture.ready(&session);
+            let intent = journal
+                .admit_native_collection(REPORT, 1, 1, &clock(1001), "bbbbbbbbbbbbbbbb", &session)
+                .unwrap();
+            let before = saved(&fixture);
+            let (mut exchange, record) = scan_scripted(&fixture);
+            let mut frame: Value = serde_json::from_slice(&scanning_ack()).unwrap();
+            match change {
+                0 => frame["id"] = json!(2),
+                1 => frame["scan_started_boottime_ms"] = json!(1011),
+                2 => frame["scan_started_boottime_ms"] = json!(true),
+                3 => frame["phase"] = json!("prepared"),
+                4 => frame["extra"] = json!(0),
+                5 => exchange.fail_scan_ack = true,
+                6 => exchange.change_after_scanning = true,
+                _ => {}
+            }
+            exchange.frames[3] = if change == 7 {
+                b"{\"schema_version\":1".to_vec()
+            } else {
+                format!("{frame}\n").into_bytes()
+            };
+            let published = PinnedSession::admit(exchange, expected())
+                .unwrap()
+                .publish(&mut journal, intent, &session)
+                .unwrap();
+            assert!(
+                published.admit_scan(&mut journal, &session).is_err(),
+                "case {change}"
+            );
+            let record = record.lock().unwrap();
+            assert_eq!(record.writes.len(), 3);
+            assert!(record.scan_seen);
+            assert_eq!(record.closes, 1);
+            drop(record);
+            drop(journal);
+            unfinished_at(&fixture, &before, Some(1010));
+        }
+    }
+
+    #[test]
+    fn final_deadline_check_covers_the_protected_post_ack_journal_read() {
+        let fixture = Fixture::new();
+        let session = negotiated();
+        let mut journal = fixture.ready(&session);
+        let intent = journal
+            .admit_native_collection(REPORT, 1, 1, &clock(1001), "bbbbbbbbbbbbbbbb", &session)
+            .unwrap();
+        let before = saved(&fixture);
+        let (mut exchange, record) = scan_scripted(&fixture);
+        exchange.times[17] = clock(10000);
+        let published = PinnedSession::admit(exchange, expected())
+            .unwrap()
+            .publish(&mut journal, intent, &session)
+            .unwrap();
+        assert!(published.admit_scan(&mut journal, &session).is_err());
+        let record = record.lock().unwrap();
+        assert_eq!(record.reads, 4);
+        assert_eq!(record.samples, 18);
+        assert!(record.scan_seen);
+        drop(record);
+        drop(journal);
+        unfinished_at(&fixture, &before, Some(1010));
     }
 
     #[test]
