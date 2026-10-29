@@ -375,3 +375,12 @@ standard-library shadows. The recipe independently binds generator/template/
 loader/closure/output hashes and checks the generated closure itself. This
 packages code only; actual entry execution, Parent pre-exec admission and every
 activation/completion gate still require separate evidence.
+
+The disposable native test harness now has a read-only artifact verifier. It
+reads bounded nofollow archive/sidecar files, limits gzip expansion while
+decompressing and rejects truncated, concatenated or trailing streams. It
+independently reconstructs the exact complete USTAR bytes from fixed Git inputs,
+including canonical manifest/recipe and generated entry. This detects hidden
+members or nonzero padding after end markers, duplicate metadata and self-forged
+hashes without executing generator/runtime or extracting untrusted paths. It
+does not publish files or establish a running reporter/completion witness.
