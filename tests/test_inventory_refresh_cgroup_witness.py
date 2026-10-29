@@ -79,3 +79,12 @@ class CgroupWitnessTests(unittest.TestCase):
         with patch.object(witness.os,'close',side_effect=uncertain):
             with self.assertRaises(ValueError):witness.observe_single_process(self.parent,'unit',self.group,123,time.monotonic()+1)
         self.assertEqual(len(closed),1)
+
+    def test_proc_stat_start_time_is_bounded_and_pid_specific(self):
+        raw=b'123 (worker ) odd) S '+b' '.join([b'0']*18+[b'98765']+[b'0']*8)+b'\n'
+        self.assertEqual(witness.process_start_ticks(raw,123),98765)
+        linux_stat=Path('/proc/self/stat')
+        if linux_stat.is_file():self.assertGreater(witness.process_start_ticks(linux_stat.read_bytes(),os.getpid()),0)
+        for sample,pid in ((raw,124),(b'123 (x) S 0\n',123),(raw.replace(b'98765',b'0001'),123),
+                (raw.replace(b'98765',b'0'),123),(raw+b'X',123),(b'X'*8193,123)):
+            with self.assertRaises(ValueError):witness.process_start_ticks(sample,pid)

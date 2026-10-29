@@ -96,3 +96,18 @@ def observe_single_process(parent,name,group,pid,deadline):
             try:os.close(fd)
             except BaseException:failed=True
     if failed or time.monotonic()>=deadline:raise ValueError('Cgroup process sample unconfirmed')
+
+
+def process_start_ticks(raw,pid):
+    """Parse a bounded proc-stat fixture; this does not establish PID identity."""
+    try:
+        assert type(raw) is bytes and 0<len(raw)<=8192 and type(pid) is int and 0<pid<=2147483647
+        prefix=str(pid).encode('ascii')+b' (';assert raw.startswith(prefix) and raw.endswith(b'\n')
+        end=raw.rfind(b') ');assert end>=len(prefix)
+        fields=raw[end+2:-1].split(b' ')
+        assert 20<=len(fields)<=64 and all(fields) and re.fullmatch(rb'[A-Za-z]',fields[0])
+        assert all(re.fullmatch(rb'-?(0|[1-9][0-9]*)',field) for field in fields[1:])
+        value=fields[19];assert re.fullmatch(rb'[1-9][0-9]{0,19}',value)
+        ticks=int(value);assert ticks<=18446744073709551615
+        return ticks
+    except BaseException:raise ValueError('Process start time unavailable') from None
