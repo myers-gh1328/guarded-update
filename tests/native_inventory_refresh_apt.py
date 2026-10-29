@@ -40,6 +40,9 @@ from inventory_refresh_rust_parent_fixture import FixtureBinary
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT/'scripts'))
+from inventory_refresh_resources import _Chain
+from inventory_refresh_cgroup_witness import observe_single_process
+from inventory_refresh_process_snapshot import ProcessProbe
 from inventory_refresh_policy import parse_policy, render_policy, policy_generation, POLICY_ROOT, CACHE_ROOT, RUNTIME_ROOT, STATE_ROOT
 from inventory_refresh_storage import Store
 from inventory_refresh_worker import validate_kernel_identity
@@ -1685,6 +1688,50 @@ def rust_unit_properties(deadline,properties):
     except BaseException:raise ValueError('Rust unit status unconfirmed') from None
 
 
+def read_rust_barrier_marker(fd,deadline):
+    marker=b'INVENTORY-BARRIER-1\n';received=bytearray();poller=select.poll()
+    poller.register(fd,select.POLLIN|select.POLLHUP|select.POLLERR)
+    while len(received)<len(marker):
+        remaining=deadline-time.monotonic();assert remaining>0 and poller.poll(max(1,int(remaining*1000)))
+        try:chunk=os.read(fd,len(marker)+1-len(received))
+        except BlockingIOError:continue
+        assert chunk and time.monotonic()<deadline;received.extend(chunk);assert marker.startswith(received)
+    assert bytes(received)==marker and time.monotonic()<deadline
+
+
+def write_rust_barrier_ack(fd,deadline):
+    ack=b'ACK-1\n';offset=0;poller=select.poll();poller.register(fd,select.POLLOUT|select.POLLHUP|select.POLLERR)
+    while offset<len(ack):
+        remaining=deadline-time.monotonic();assert remaining>0 and poller.poll(max(1,int(remaining*1000)))
+        try:written=os.write(fd,ack[offset:])
+        except BlockingIOError:continue
+        assert written>0 and written<=len(ack)-offset and time.monotonic()<deadline;offset+=written
+
+
+def sample_rust_unit_processes(unit,description,expected,invocation,identity,deadline,properties):
+    value=properties()
+    assert value['Description']==description and value['InvocationID']==invocation and value['ControlGroup']==expected
+    assert value['ActiveState']=='active' and value['Delegate']=='no' and value['ProtectControlGroups']=='yes'
+    assert re.fullmatch('[1-9][0-9]{0,9}',value['MainPID']);pid=int(value['MainPID'])
+    group_chain=None;probe=None
+    try:
+        group_chain=_Chain(('sys','fs','cgroup')+tuple(expected.strip('/').split('/')))
+        group_chain.verify();held=os.fstat(group_chain.fds[-1]);assert (held.st_dev,held.st_ino)==identity
+        probe=ProcessProbe.fixed(pid,(os.major(held.st_dev),os.minor(held.st_dev)),deadline)
+        start=probe.sample()
+        observe_single_process(group_chain.fds[-2],unit,group_chain.fds[-1],pid,deadline)
+        assert probe.sample()==start;group_chain.verify()
+        again=properties()
+        assert again['Description']==description and again['InvocationID']==invocation and again['ControlGroup']==expected
+        assert again['MainPID']==str(pid) and again['ActiveState']=='active' and again['Delegate']=='no' and again['ProtectControlGroups']=='yes'
+        assert time.monotonic()<deadline
+    finally:
+        try:
+            if probe is not None:probe.close()
+        finally:
+            if group_chain is not None:group_chain.close()
+
+
 def prove_rust_reporter_roundtrip(archive,public):
     """Hosted fixture mechanics; no production or process-set completion witness."""
     import select
@@ -1692,7 +1739,7 @@ def prove_rust_reporter_roundtrip(archive,public):
     unit='command-center-inventory.service';description='Rust reporter proof '+secrets.token_hex(16)
     expected='/command.slice/command-center.slice/command-center-inventory.slice/'+unit
     deadline=time.monotonic()+60
-    def properties():return rust_unit_properties(min(deadline,time.monotonic()+2),PROPERTIES)
+    def properties():return rust_unit_properties(min(deadline,time.monotonic()+2),PROPERTIES+('Delegate','ProtectControlGroups'))
     assert properties()['LoadState']=='not-found'
     fixture=stage_rust_reporter_artifact_fixture(archive,deadline)
     process=None;group=None;identity=None;invocation=None;confirmed=False;completed=False
@@ -1701,14 +1748,14 @@ def prove_rust_reporter_roundtrip(archive,public):
             '--description='+description,'--setenv=GITHUB_ACTIONS=true','--setenv=GUARDED_UPDATE_NATIVE_RUST_PROOF=1']
         for item in ('User=60002','Group=60002','Type=exec','Restart=no','RemainAfterExit=no','KillMode=control-group',
             'KillSignal=SIGKILL','TimeoutStopSec=1','RuntimeMaxSec=20','OOMPolicy=kill','TasksMax=8','MemoryAccounting=yes','NoNewPrivileges=yes','CapabilityBoundingSet=',
-            'AmbientCapabilities=','ProtectSystem=strict','ProtectHome=yes','ProtectControlGroups=yes',
+            'AmbientCapabilities=','Delegate=no','ProtectSystem=strict','ProtectHome=yes','ProtectControlGroups=yes',
             'ProtectKernelTunables=yes','PrivateDevices=yes','PrivateTmp=yes','PrivateNetwork=yes',
             'ReadWritePaths=/run/command-center-inventory-refresh/observation /run/command-center-inventory-refresh/release'):
             args+=['-p',item]
         args+=['/usr/local/libexec/command-center-inventory','--exact',
             'inventory::reporter_obs::tests::hosted_real_reporter_rust_journal_roundtrip','--ignored','--test-threads=1','--nocapture']
         fixture['binary'].verify_published();assert time.monotonic()<deadline
-        process=subprocess.Popen(args,env=ENV,stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL)
+        process=subprocess.Popen(args,env=ENV,stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
         while True:
             value=properties()
             if value['LoadState']=='loaded' and value['InvocationID'] and value['ControlGroup']==expected:
@@ -1717,6 +1764,19 @@ def prove_rust_reporter_roundtrip(archive,public):
                 info=os.fstat(group);identity=(info.st_dev,info.st_ino);break
             assert value['LoadState'] in ('loaded','not-found') and process.poll() is None and time.monotonic()<deadline
             time.sleep(.02)
+        # The control stream is separate from libtest output and every endpoint
+        # is checked before changing shared open-file-description flags.
+        endpoints=((process.stdin,os.O_WRONLY),(process.stdout,os.O_RDONLY),(process.stderr,os.O_RDONLY));identities=[]
+        for stream,direction in endpoints:
+            info=os.fstat(stream.fileno());flags=fcntl.fcntl(stream.fileno(),fcntl.F_GETFL)
+            assert stat.S_ISFIFO(info.st_mode) and flags&os.O_ACCMODE==direction
+            identities.append((info.st_dev,info.st_ino))
+        assert len(set(identities))==3
+        for stream,_ in endpoints:os.set_blocking(stream.fileno(),False)
+        read_rust_barrier_marker(process.stderr.fileno(),deadline)
+        sample_rust_unit_processes(unit,description,expected,invocation,identity,deadline,properties)
+        write_rust_barrier_ack(process.stdin.fileno(),deadline)
+        process.stdin.close();process.stdin=None
         fd=process.stdout.fileno();info=os.fstat(fd);flags=fcntl.fcntl(fd,fcntl.F_GETFL)
         assert stat.S_ISFIFO(info.st_mode) and flags&os.O_ACCMODE==os.O_RDONLY
         os.set_blocking(fd,False);output=bytearray();poller=select.poll();poller.register(fd,select.POLLIN|select.POLLHUP|select.POLLERR)
@@ -1727,6 +1787,9 @@ def prove_rust_reporter_roundtrip(archive,public):
             assert time.monotonic()<deadline
             if not chunk:break
             output.extend(chunk);assert len(output)<=8192
+        poller=select.poll();poller.register(process.stderr.fileno(),select.POLLIN|select.POLLHUP|select.POLLERR)
+        remaining=deadline-time.monotonic();assert remaining>0 and poller.poll(max(1,int(remaining*1000)))
+        assert os.read(process.stderr.fileno(),1)==b'' and time.monotonic()<deadline
         assert process.wait(timeout=max(0,deadline-time.monotonic()))==0 and time.monotonic()<deadline
         validate_rust_proof_output(bytes(output))
         status=public();receipt=status['observation_receipt']
@@ -1739,9 +1802,10 @@ def prove_rust_reporter_roundtrip(archive,public):
         if process is not None:
             try:process.wait(timeout=max(0,deadline-time.monotonic()))
             except BaseException:failed=True
-            if process.stdout is not None:
-                try:process.stdout.close()
-                except BaseException:failed=True
+            for stream in (process.stdin,process.stdout,process.stderr):
+                if stream is not None:
+                    try:stream.close()
+                    except BaseException:failed=True
         try:
             value=properties()
             if invocation is not None:

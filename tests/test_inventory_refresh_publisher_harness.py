@@ -116,12 +116,91 @@ class PublisherHarnessTests(unittest.TestCase):
             self.assertEqual(process.Popen.call_args.args[0][0],'/bin/systemctl')
         finally:os.close(write_fd)
 
+    def test_native_harness_imports_without_running_main(self):
+        root=Path(__file__).parent.parent
+        result=subprocess.run([sys.executable,'-B','-c',
+            "import runpy,sys; sys.path.insert(0,'tests'); runpy.run_path('tests/native_inventory_refresh_apt.py',run_name='fixture_import_check')"],
+            cwd=root,stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=5)
+        self.assertEqual(result.returncode,0,result.stderr.decode(errors='replace'))
+
     def test_real_coordinator_runs_rust_reporter_after_packaged_reporter(self):
         tree=ast.parse((Path(__file__).parent/'native_inventory_refresh_apt.py').read_bytes())
         node=next(node for node in tree.body if isinstance(node,ast.FunctionDef) and node.name=='prove_actual_coordinator_entry_loop')
         code=ast.unparse(node)
         self.assertLess(code.index('prove_packaged_reporter_roundtrip'),code.index('prove_rust_reporter_roundtrip'))
         self.assertIn('restricted_rust_parent_real_reporter_journal_mechanics_verified',code)
+
+    def test_rust_barrier_control_frames_are_bounded(self):
+        tree=ast.parse((Path(__file__).parent/'native_inventory_refresh_apt.py').read_bytes())
+        names=('read_rust_barrier_marker','write_rust_barrier_ack')
+        nodes=[node for node in tree.body if isinstance(node,ast.FunctionDef) and node.name in names]
+        self.assertEqual(len(nodes),2)
+        scope={'os':os,'time':time,'select':__import__('select')}
+        exec(compile(ast.Module(body=nodes,type_ignores=[]),'<barrier-frames>','exec'),scope)
+        for frame,valid in ((b'INVENTORY-BARRIER-1\n',True),(b'bad\n',False),(b'INVENTORY-BARRIER-1\nextra',False)):
+            read_fd,write_fd=os.pipe()
+            try:
+                os.set_blocking(read_fd,False);os.write(write_fd,frame)
+                if valid:scope[names[0]](read_fd,time.monotonic()+.1)
+                else:
+                    with self.assertRaises(AssertionError):scope[names[0]](read_fd,time.monotonic()+.1)
+            finally:os.close(read_fd);os.close(write_fd)
+        read_fd,write_fd=os.pipe()
+        try:
+            os.set_blocking(read_fd,False);os.set_blocking(write_fd,False)
+            with self.assertRaises(AssertionError):scope[names[0]](read_fd,time.monotonic()+.02)
+            scope[names[1]](write_fd,time.monotonic()+.1);self.assertEqual(os.read(read_fd,100),b'ACK-1\n')
+            actual=os.write
+            with patch.object(os,'write',side_effect=lambda fd,raw:actual(fd,raw[:2])):
+                scope[names[1]](write_fd,time.monotonic()+.1)
+            self.assertEqual(os.read(read_fd,100),b'ACK-1\n')
+            with patch.object(os,'write',side_effect=OSError('failed write')):
+                with self.assertRaises(OSError):scope[names[1]](write_fd,time.monotonic()+.1)
+        finally:os.close(read_fd);os.close(write_fd)
+
+    def test_rust_barrier_sample_rejects_unit_drift_and_closes_owners(self):
+        tree=ast.parse((Path(__file__).parent/'native_inventory_refresh_apt.py').read_bytes())
+        node=next(node for node in tree.body if isinstance(node,ast.FunctionDef) and node.name=='sample_rust_unit_processes')
+        events=[];info=SimpleNamespace(st_dev=7,st_ino=9)
+        chain=SimpleNamespace(fds=[10,11],verify=lambda:events.append('chain-verify'),close=lambda:events.append('chain-close'))
+        probe=SimpleNamespace(sample=lambda:(events.append('process-sample') or 1234),close=lambda:events.append('process-close'))
+        base={'Description':'proof','InvocationID':'abc','ControlGroup':'/unit','ActiveState':'active',
+            'Delegate':'no','ProtectControlGroups':'yes','MainPID':'123'}
+        values=[dict(base),dict(base)]
+        scope={'re':re,'time':time,'os':SimpleNamespace(fstat=lambda fd:info,major=lambda dev:0,minor=lambda dev:27),
+            '_Chain':lambda parts:chain,'ProcessProbe':SimpleNamespace(fixed=lambda *args:probe),
+            'observe_single_process':lambda *args:events.append('singleton')}
+        exec(compile(ast.Module(body=[node],type_ignores=[]),'<sample-unit>','exec'),scope)
+        sample=scope['sample_rust_unit_processes']
+        sample('unit','proof','/unit','abc',(7,9),time.monotonic()+1,lambda:values.pop(0))
+        self.assertIn('singleton',events);self.assertEqual(events[-2:],['process-close','chain-close'])
+        events.clear();values=[dict(base),dict(base,InvocationID='changed')]
+        with self.assertRaises(AssertionError):sample('unit','proof','/unit','abc',(7,9),time.monotonic()+1,lambda:values.pop(0))
+        self.assertEqual(events[-2:],['process-close','chain-close'])
+        for changed in (dict(base,MainPID='124'),dict(base,Delegate='yes'),dict(base,ProtectControlGroups='no')):
+            values=[dict(base),changed]
+            with self.assertRaises(AssertionError):sample('unit','proof','/unit','abc',(7,9),time.monotonic()+1,lambda:values.pop(0))
+        values=[dict(base),dict(base)]
+        with self.assertRaises(AssertionError):sample('unit','proof','/unit','abc',(7,10),time.monotonic()+1,lambda:values.pop(0))
+        starts=iter((1234,1235));probe.sample=lambda:next(starts);values=[dict(base),dict(base)]
+        with self.assertRaises(AssertionError):sample('unit','proof','/unit','abc',(7,9),time.monotonic()+1,lambda:values.pop(0))
+        probe.sample=lambda:1234
+        def bad_close():events.append('process-close');raise OSError('uncertain close')
+        probe.close=bad_close;events.clear();values=[dict(base),dict(base)]
+        with self.assertRaises(OSError):sample('unit','proof','/unit','abc',(7,9),time.monotonic()+1,lambda:values.pop(0))
+        self.assertEqual(events[-2:],['process-close','chain-close'])
+        probe.close=lambda:events.append('process-close')
+        chain.close=lambda:(_ for _ in ()).throw(OSError('uncertain chain close'));values=[dict(base),dict(base)]
+        with self.assertRaises(OSError):sample('unit','proof','/unit','abc',(7,9),time.monotonic()+1,lambda:values.pop(0))
+
+    def test_rust_barrier_samples_pinned_process_before_ack(self):
+        tree=ast.parse((Path(__file__).parent/'native_inventory_refresh_apt.py').read_bytes())
+        node=next(node for node in tree.body if isinstance(node,ast.FunctionDef) and node.name=='prove_rust_reporter_roundtrip')
+        code=ast.unparse(node)
+        for item in ('read_rust_barrier_marker','write_rust_barrier_ack','sample_rust_unit_processes','ProtectControlGroups'):
+            self.assertIn(item,code)
+        self.assertLess(code.index('sample_rust_unit_processes'),code.index('write_rust_barrier_ack'))
+        self.assertIn('reporter_barrier::handshake',(Path(__file__).parent.parent/'src/inventory/reporter_obs.rs').read_text())
 
     def test_rust_reporter_unit_has_fixed_identity_scope_and_cleanup_gate(self):
         tree=ast.parse((Path(__file__).parent/'native_inventory_refresh_apt.py').read_bytes())
