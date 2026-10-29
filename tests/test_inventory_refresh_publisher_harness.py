@@ -12,10 +12,24 @@ from types import SimpleNamespace
 from pathlib import Path
 import unittest
 import tempfile
+import subprocess
 from unittest.mock import Mock,patch
 
 
 class PublisherHarnessTests(unittest.TestCase):
+    def test_fixed_c_parent_has_two_literal_entry_cases_and_no_forwarded_program(self):
+        tree=ast.parse((Path(__file__).parent/'native_inventory_refresh_apt.py').read_bytes())
+        factory=next(node for node in tree.body if isinstance(node,ast.FunctionDef) and node.name=='parent_fixture_c_source')
+        scope={};exec(compile(ast.Module(body=[factory],type_ignores=[]),'<fixed-parent-source>','exec'),scope)
+        for reporter,name in ((False,'reporter-parent-proof.py'),(True,'reporter.py')):
+            code=scope['parent_fixture_c_source'](reporter)
+            self.assertIn('/usr/local/libexec/command-center-inventory-refresh/'+name,code)
+            self.assertIn('int main(void)',code);self.assertNotIn('argv[',code);self.assertNotIn('kill(',code)
+            result=subprocess.run(['/usr/bin/cc','-Wall','-Wextra','-Werror','-x','c','-fsyntax-only','-'],
+                input=code.encode(),stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=5)
+            self.assertEqual(result.returncode,0,result.stderr.decode(errors='replace'))
+        with self.assertRaises(AssertionError):scope['parent_fixture_c_source'](1)
+
     def test_parent_mechanics_program_has_only_fixed_readonly_sources(self):
         tree=ast.parse((Path(__file__).parent/'native_inventory_refresh_apt.py').read_bytes())
         factory=next(node for node in tree.body if isinstance(node,ast.FunctionDef) and node.name=='parent_mechanics_program')

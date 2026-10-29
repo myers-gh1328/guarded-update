@@ -1255,7 +1255,7 @@ print(json.dumps({'phase':'complete','evidence':{'environment_pin_mechanics':Tru
 
 
 def publish_parent_fixture_file(fixture,directory,name,raw,mode):
-    assert (name,mode) in (('command-center-inventory',0o555),('reporter-parent-proof.py',0o444))
+    assert (name,mode) in (('command-center-inventory',0o555),('reporter-parent-proof.py',0o444),('reporter.py',0o444))
     assert type(raw) is bytes and 0<len(raw)<=1024*1024
     fd=os.open(name,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW|os.O_NONBLOCK,0o600,dir_fd=directory)
     try:
@@ -1292,20 +1292,10 @@ def retire_parent_fixture(fixture,confirmed_empty):
     assert not failed,'Synthetic parent fixture cleanup unconfirmed'
 
 
-def install_parent_fixture(program):
-    from inventory_refresh_resources import _Chain
-    assert sys.platform=='linux' and os.geteuid()==0 and os.environ.get('GITHUB_ACTIONS')=='true'
-    fixture={'files':[],'directories':[]}
-    try:
-        binary=_Chain(('usr','local','libexec'));fixture['directories'].append(binary)
-        library=_Chain(('usr','local','libexec','command-center-inventory-refresh'));fixture['directories'].append(library)
-        for directory,name in ((binary.fds[-1],'command-center-inventory'),(library.fds[-1],'reporter-parent-proof.py')):
-            try:os.stat(name,dir_fd=directory,follow_symlinks=False)
-            except FileNotFoundError:pass
-            else:raise AssertionError('Fixed synthetic parent path already exists')
-        # Exact fixed exec, closed environment and own-child wait only. No
-        # forwarded argument, shell, signal or reporting/controller operation.
-        source=r'''
+def parent_fixture_c_source(reporter=False):
+    assert type(reporter) is bool
+    # Two literal CI-only cases, no forwarded program/argument or signal.
+    source=r'''
 #include <unistd.h>
 #include <sys/wait.h>
 #include <errno.h>
@@ -1319,12 +1309,28 @@ int main(void) {
  return WIFEXITED(status)?WEXITSTATUS(status):74;
 }
 '''
+    return source.replace('reporter-parent-proof.py','reporter.py') if reporter else source
+
+
+def install_parent_fixture(program,*,reporter=False):
+    from inventory_refresh_resources import _Chain
+    assert sys.platform=='linux' and os.geteuid()==0 and os.environ.get('GITHUB_ACTIONS')=='true' and type(reporter) is bool
+    name='reporter.py' if reporter else 'reporter-parent-proof.py'
+    fixture={'files':[],'directories':[]}
+    try:
+        binary=_Chain(('usr','local','libexec'));fixture['directories'].append(binary)
+        library=_Chain(('usr','local','libexec','command-center-inventory-refresh'));fixture['directories'].append(library)
+        for directory,filename in ((binary.fds[-1],'command-center-inventory'),(library.fds[-1],name)):
+            try:os.stat(filename,dir_fd=directory,follow_symlinks=False)
+            except FileNotFoundError:pass
+            else:raise AssertionError('Fixed synthetic parent path already exists')
+        source=parent_fixture_c_source(reporter)
         with tempfile.TemporaryDirectory(prefix='inventory-parent-mechanics-') as temporary:
             root=Path(temporary);(root/'parent.c').write_text(source)
             command(['/usr/bin/cc','-Wall','-Wextra','-Werror','-o',str(root/'parent'),str(root/'parent.c')],timeout=15)
             with (root/'parent').open('rb') as compiled:raw=compiled.read(1024*1024+1)
             publish_parent_fixture_file(fixture,binary.fds[-1],'command-center-inventory',raw,0o555)
-        publish_parent_fixture_file(fixture,library.fds[-1],'reporter-parent-proof.py',program.encode(),0o444)
+        publish_parent_fixture_file(fixture,library.fds[-1],name,program.encode(),0o444)
         return fixture
     except BaseException:
         retire_parent_fixture(fixture,True)  # This installer never starts Parent.
