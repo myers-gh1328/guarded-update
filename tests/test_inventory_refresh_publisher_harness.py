@@ -43,6 +43,8 @@ class PublisherHarnessTests(unittest.TestCase):
         self.assertEqual(sources[-2:],(('inventory_refresh_reader_session','inventory_refresh_reader_session.py'),('inventory_refresh_reporter_io','inventory_refresh_reporter_io.py')))
         self.assertIn('Synthetic seam only',code)
         self.assertIn("session.policy(['inventory-proof'])",code)
+        self.assertIn('frozen=session.frozen_scan_bounds()',code)
+        self.assertIn('evidence[key]==value for key,value in frozen.items()',code)
         for method in ('installed','native_architecture','holds'):
             self.assertIn('session.'+method+'()',code)
         self.assertNotIn('subprocess.run(',code)

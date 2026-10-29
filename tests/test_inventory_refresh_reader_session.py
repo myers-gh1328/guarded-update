@@ -70,6 +70,31 @@ class ReaderSessionTests(unittest.TestCase):
         with self.assertRaises(ValueError):session.finish(self.status(receipt=receipt))
         os.fstat(self.dpkg_fd)
 
+    def test_frozen_scan_bounds_keep_actual_end_before_release_without_recomputing_it(self):
+        session=self.pin();self.start(session);self.now=130
+        hashes=session.finish_scan();self.now=140
+        first=session.frozen_scan_bounds()
+        self.assertEqual(first,{'scan_started_boottime_ms':120,'scan_finished_boottime_ms':130})
+        first['scan_finished_boottime_ms']=999
+        self.now=145
+        self.assertEqual(session.frozen_scan_bounds()['scan_finished_boottime_ms'],130)
+        receipt=dict(self.offer(),lock_held_until_boottime_ms=150,released_boottime_ms=155,outcome='released',**hashes)
+        self.now=160;evidence=json.loads(session.finish(self.status(receipt=receipt)))
+        self.assertEqual(evidence['scan_finished_boottime_ms'],130)
+        with self.assertRaises(ValueError):session.frozen_scan_bounds()
+
+    def test_scan_bounds_are_unavailable_before_freeze_or_after_clock_uncertainty(self):
+        for phase in ('pinned','scanning','expired','rewound','reboot'):
+            self.now=100;session=self.pin()
+            if phase!='pinned':self.start(session)
+            if phase in ('expired','rewound','reboot'):
+                self.now=130;session.finish_scan()
+                if phase=='expired':self.now=1001
+                elif phase=='rewound':self.now=129
+                else:session._clock=lambda:('22222222-2222-4222-8222-222222222222',140)
+            with self.subTest(phase=phase),self.assertRaises(ValueError):session.frozen_scan_bounds()
+            with self.assertRaises(ValueError):session.finish_scan()
+
     def test_fixed_policy_query_is_available_only_inside_the_admitted_scan(self):
         session=self.pin()
         with self.assertRaises(ValueError):session.policy(['synthetic'])

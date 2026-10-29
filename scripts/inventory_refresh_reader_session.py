@@ -149,6 +149,16 @@ class ReaderSession:
             self.close()
             raise
 
+    def frozen_scan_bounds(self):
+        """Data-only endpoints frozen before release, never a cleanup witness."""
+        try:
+            _require(not self._closed and self._phase=='awaiting_receipt')
+            self._scan_time()
+            return {'scan_started_boottime_ms':self._started,'scan_finished_boottime_ms':self._finished}
+        except BaseException:
+            self.close()
+            raise
+
     def installed(self):
         return self._fixed_data('installed')
 

@@ -199,3 +199,10 @@ initial namespace/unit provenance, allocation history, workload fit or native
 cleanup. The current baseline reporting unit lacks the requested aggregate
 placement and cannot pass this sampler. No unit, mount, account or capability is
 changed by the library; full environment and source admission remain unfinished.
+
+After the final fingerprint, the session exposes a copy of its frozen native
+scan endpoints for the future coordinator handshake. Reading them does not
+recompute the end time or assert Root cleanup; invalid phases, clock uncertainty
+or a closed session return no endpoints. Final receipt evidence must preserve
+those exact endpoints. The coordinator must still validate and durably bind the
+same actual start and end around release before publishing a report.

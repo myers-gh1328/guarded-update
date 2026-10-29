@@ -1147,6 +1147,7 @@ try:
  for chain in chains:chain.verify()
  resources.sample()
  session.finish_scan()
+ frozen=session.frozen_scan_bounds()
  print(json.dumps({'phase':'scan_finished'}),flush=True)
  while True:
   clock();value=public();current=document(value)
@@ -1155,6 +1156,7 @@ try:
  for chain in chains:chain.verify()
  resources.sample()
  evidence=json.loads(session.finish(value));session=None
+ assert all(evidence[key]==value for key,value in frozen.items())
 finally:
  failed=False
  for owned in (session,reader,sources,*reversed(chains),resources):
