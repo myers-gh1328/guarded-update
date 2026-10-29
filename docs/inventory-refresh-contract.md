@@ -1063,18 +1063,33 @@ or complete provisioning/startup-allocation/target-fit readiness claim.
 
 ### Inactive helper source artifact
 
-`scripts/package-inventory-helper.py OUTPUT_PARENT` builds a separate helper
-archive without installing or enabling anything. It pins one full Git commit,
-reads every regular source/doc/builder blob by that commit, rejects relevant dirty
-files, and derives the exact known root module closure from a strict literal AST
-without executing project code. Unrelated worktree changes are excluded.
+`python3 -I -B -S scripts/package-inventory-helper.py OUTPUT_PARENT` builds a separate helper
+archive without installing or enabling anything. CLI isolation is checked before
+non-built-in imports, so local files cannot shadow its standard library. It pins
+one full Git commit with replacement objects disabled for every Git read, admits
+every regular source/doc/builder/generator/template blob by that commit and
+directly compares bounded nofollow worktree bytes with those blobs before and
+after generation. Index hints cannot hide relevant dirt; unrelated worktree
+changes are excluded.
 
-The archive contains fixed relative readonly regular files: root modules, the
-coordinator, worker, identical native/guardian observation entry copies and this
-public contract. It contains no account, service, policy, key, runtime state or
+Strict AST checks select the unchanged27-module Root mapping and fixed18-module
+reporter mapping. Only the selected trusted build-time generator is executed;
+it parses/extracts/compiles runtime source without running that runtime code.
+This is a trusted build boundary, not an arbitrary-Python sandbox. A private
+execution namespace alone does not establish isolation.
+
+The archive contains fixed relative readonly regular files: the union of Root
+and reporter modules, coordinator, worker, identical native/guardian observation
+entry copies, generated `reporter.py` and this public contract. Build-only
+generator/template inputs are hashed rather than installed as runtime choices.
+It contains no account, service, policy, key, runtime state or
 installation hook. Sorted USTAR metadata and gzip filename/mtime are fixed;
 `manifest.json` records source commit, builder digest, file hashes/sizes/modes and
-literal install destinations. The Python 3.10 language floor is not proof of
+literal install destinations. Its `reporter_bootstrap` recipe independently binds
+loader source, template, generator, fixed closure and generated-entry hashes;
+the generated source's closure is checked separately from those hash claims.
+Root and reporter source sums each stay within512KiB, generated entry64KiB and
+all archive source data2MiB. The Python 3.10 language floor is not proof of
 systemd, kernel, python-apt, architecture or real-device repository compatibility.
 
 Archive and SHA sidecar are fully staged before exclusive generation publication.

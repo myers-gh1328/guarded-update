@@ -366,3 +366,12 @@ real owned pipe wrappers and silent profile rejection. This generator/template
 is not yet packaged, installed or activated. Parent admission of the exact
 entry bytes before execution, actual restricted entry/native Root roundtrip,
 Rust durable ownership and complete process-set cleanup remain required.
+
+The inactive helper artifact now includes that generated entry and the fixed
+Root/reporter module union. It executes only the selected trusted build-time
+generator after direct byte comparison of all tested sources against one pinned
+Git commit, with replacement objects disabled. CLI isolation prevents local
+standard-library shadows. The recipe independently binds generator/template/
+loader/closure/output hashes and checks the generated closure itself. This
+packages code only; actual entry execution, Parent pre-exec admission and every
+activation/completion gate still require separate evidence.

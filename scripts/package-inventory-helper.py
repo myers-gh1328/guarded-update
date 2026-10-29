@@ -4,6 +4,11 @@
 Archive integrity is not trusted release provenance. PR artifacts are review
 only; target compatibility, privileged provisioning and activation are separate.
 """
+import sys
+if __name__=='__main__' and not (sys.flags.isolated and sys.flags.dont_write_bytecode and sys.flags.no_site):
+    sys.stderr.write('Inactive helper artifact requires isolated Python (-I -B -S)\n')
+    sys.exit(1)
+
 import ast
 import gzip
 import hashlib
@@ -14,7 +19,6 @@ from pathlib import Path
 import re
 import stat
 import subprocess
-import sys
 import tarfile
 import tempfile
 
@@ -33,6 +37,13 @@ EXPECTED_MODULES=('inventory_refresh_protocol','inventory_refresh_receipt','inve
     'inventory_refresh_resources','inventory_refresh_materializer','inventory_refresh_writer_exclusion',
     'inventory_refresh_io','inventory_refresh_coordinator','inventory_refresh_contention','inventory_refresh_transaction',
     'inventory_refresh_observation_transaction','inventory_refresh_dispatch','inventory_refresh_runtime')
+REPORTER_GENERATOR='scripts/inventory_refresh_reporter_build.py'
+REPORTER_TEMPLATE='scripts/inventory_refresh_reporter_template.py'
+EXPECTED_REPORTER_MODULES=('inventory_refresh_protocol','inventory_refresh_receipt','inventory_refresh_state','inventory_refresh_storage',
+    'inventory_refresh_status','inventory_refresh_observation','inventory_refresh_resources','inventory_refresh_reporter_resources',
+    'inventory_refresh_reporter_parent','inventory_refresh_reader_tools','inventory_refresh_reader_session',
+    'inventory_refresh_reporter_io','inventory_refresh_reporter_environment','inventory_refresh_io',
+    'inventory_refresh_reporter_runtime','inventory_refresh_reporter_protocol','inventory_refresh_reporter_pipe','inventory_refresh_reporter_dialogue')
 
 
 def require(condition):
@@ -40,7 +51,7 @@ def require(condition):
 
 
 def git(repo,*args):
-    result=subprocess.run(('git','-c','core.fsmonitor=false',*args),cwd=repo,
+    result=subprocess.run(('git','--no-replace-objects','-c','core.fsmonitor=false',*args),cwd=repo,
         stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,timeout=20)
     require(result.returncode==0);return result.stdout
 
@@ -69,20 +80,79 @@ def source_mapping(raw):
         for name in EXPECTED_MODULES}
 
 
+def _source_metadata(info):
+    return (info.st_dev,info.st_ino,info.st_uid,info.st_gid,info.st_mode,info.st_nlink,
+        info.st_size,info.st_mtime_ns,info.st_ctime_ns)
+
+
+def checked_worktree_source(path,expected):
+    """Direct comparison: index hints must not hide untested source bytes."""
+    fd=os.open(path,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK)
+    try:
+        before=os.fstat(fd)
+        require(stat.S_ISREG(before.st_mode) and before.st_nlink==1 and before.st_size==len(expected))
+        raw=bytearray()
+        while True:
+            chunk=os.read(fd,min(65536,len(expected)+1-len(raw)))
+            if not chunk:break
+            raw.extend(chunk);require(len(raw)<=len(expected))
+        require(bytes(raw)==expected and _source_metadata(os.fstat(fd))==_source_metadata(before)==
+            _source_metadata(os.stat(path,follow_symlinks=False)))
+    finally:os.close(fd)
+
+
+def reporter_mapping(raw,variable='MODULES'):
+    tree=ast.parse(raw)
+    assignments=[node for node in tree.body if type(node) is ast.Assign and len(node.targets)==1 and
+        type(node.targets[0]) is ast.Name and node.targets[0].id==variable]
+    require(len(assignments)==1 and sum(isinstance(node,ast.Name) and isinstance(node.ctx,ast.Store) and node.id==variable for node in ast.walk(tree))==1)
+    expected=EXPECTED_REPORTER_MODULES if variable=='MODULES' else tuple((name,name+'.py') for name in EXPECTED_REPORTER_MODULES)
+    require(ast.dump(assignments[0].value)==ast.dump(ast.parse(repr(expected),mode='eval').body))
+    return {LIB+name+'.py':'scripts/'+name+'.py' for name in EXPECTED_REPORTER_MODULES}
+
+
+def execute_reporter_generator(generator,entry,template):
+    """Selected build-time trusted code, NOT an arbitrary-Python sandbox."""
+    namespace={'__name__':'fixed_reporter_artifact_generator','__file__':REPORTER_GENERATOR}
+    exec(compile(generator,REPORTER_GENERATOR,'exec',dont_inherit=True),namespace)
+    require(namespace['MODULES']==EXPECTED_REPORTER_MODULES)
+    generated,recipe=namespace['generate'](entry,template)
+    require(type(generated) is bytes and 0<len(generated)<=65536 and type(recipe) is dict)
+    digest=lambda raw:hashlib.sha256(raw).hexdigest()
+    expected=dict(loader_source_sha256=digest(entry),template_sha256=digest(template),
+        closure_sha256=digest(json.dumps(tuple((name,name+'.py') for name in EXPECTED_REPORTER_MODULES),separators=(',',':')).encode('ascii')),
+        generated_entry_sha256=digest(generated))
+    require(recipe==expected);reporter_mapping(generated,'SOURCES')
+    return generated,dict(recipe,generator_sha256=digest(generator),entry_path=LIB+'reporter.py',module_names=list(EXPECTED_REPORTER_MODULES))
+
+
 def contents(repo):
     commit=git(repo,'rev-parse','--verify','HEAD^{commit}').decode().strip()
     require(re.fullmatch('[0-9a-f]{40}',commit) is not None)
     entry=blob(repo,commit,ENTRY,65536);mapping=source_mapping(entry)
+    generator=blob(repo,commit,REPORTER_GENERATOR,65536);template=blob(repo,commit,REPORTER_TEMPLATE,65536)
+    reporter_sources=reporter_mapping(generator)
+    for destination,source in reporter_sources.items():
+        require(destination not in mapping or mapping[destination]==source)
+        mapping[destination]=source
     mapping.update({LIB+'coordinator.py':ENTRY,LIB+'worker.py':'scripts/inventory_refresh_worker.py',
         LIB+'observation-native.py':'scripts/inventory_refresh_entry.py',
         LIB+'observation-guardian.py':'scripts/inventory_refresh_entry.py',
         'share/doc/command-center-inventory-refresh/contract.md':DOC})
     builder=blob(repo,commit,BUILDER,65536)
-    paths=sorted(set(mapping.values())|{BUILDER})
+    paths=sorted(set(mapping.values())|{BUILDER,REPORTER_GENERATOR,REPORTER_TEMPLATE})
     # Compare the tested worktree with the one pinned commit, never mutable HEAD.
     git(repo,'diff','--quiet','--no-ext-diff','--no-textconv',commit,'--',*paths)
-    data={name:blob(repo,commit,path,262144 if path==DOC else 65536) for name,path in mapping.items()}
+    pinned={path:blob(repo,commit,path,262144 if path==DOC else 65536) for path in paths}
+    for path,raw in pinned.items():checked_worktree_source(Path(repo)/path,raw)
+    checked_worktree_source(Path(__file__),builder)
+    data={name:pinned[path] for name,path in mapping.items()}
+    generated,reporter_recipe=execute_reporter_generator(generator,entry,template)
+    for path,raw in pinned.items():checked_worktree_source(Path(repo)/path,raw)
+    checked_worktree_source(Path(__file__),builder)
+    data[LIB+'reporter.py']=generated
     require(sum(len(data[LIB+('guardian.py' if name=='inventory_refresh_guardian' else name+'.py')]) for name in EXPECTED_MODULES)<=512*1024)
+    require(sum(len(data[LIB+name+'.py']) for name in EXPECTED_REPORTER_MODULES)<=512*1024)
     require(data[LIB+'coordinator.py']==entry and
         data[LIB+'observation-native.py']==data[LIB+'observation-guardian.py']==data[LIB+'inventory_refresh_entry.py'])
     require(sum(map(len,data.values()))<=2*1024*1024)
@@ -91,6 +161,7 @@ def contents(repo):
     manifest={'schema_version':1,'application':'command-center-inventory-metadata-helper','source_commit':commit,
         'build_script_sha256':hashlib.sha256(builder).hexdigest(),'python_language_floor':'3.10',
         'public_status_schema':1,'private_journal_schema':3,'installs_or_enables_services':False,
+        'reporter_bootstrap':reporter_recipe,
         'files':[{'path':name,'install_path':INSTALL+name[len(LIB):] if name.startswith(LIB) else None,
             'sha256':hashlib.sha256(value).hexdigest(),'size':len(value),'mode':'0444','uid':0,'gid':0}
             for name,value in sorted(data.items())]}
