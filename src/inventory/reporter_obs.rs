@@ -30,6 +30,7 @@ trait Exchange {
     fn write(&mut self, raw: &[u8]) -> Result<()>;
     fn close(&mut self) -> Result<()>;
     fn host_metadata(&mut self, kind: HostMetadata) -> Result<String>;
+    fn root_receipt(&mut self) -> Result<serde_json::Value>;
 }
 #[derive(Clone, Copy)]
 enum HostMetadata {
@@ -147,10 +148,190 @@ struct ScanningSession<E: Exchange> {
     offer: RootOffer,
     data: DataSession,
     next_id: u64,
+    request_id: String,
 }
 struct NormalizedSession<E: Exchange> {
     scanning: ScanningSession<E>,
     scan: serde_json::Value,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FrozenScan {
+    scan_started_boottime_ms: u64,
+    scan_finished_boottime_ms: u64,
+    installed_before_sha256: String,
+    installed_after_sha256: String,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RootReceipt {
+    nonce: String,
+    boot_id: String,
+    cache_generation: String,
+    policy_generation: String,
+    lock_open_boottime_ms: u64,
+    expires_boottime_ms: u64,
+    lock_held_until_boottime_ms: u64,
+    released_boottime_ms: u64,
+    outcome: String,
+    installed_before_sha256: String,
+    installed_after_sha256: String,
+}
+struct PreparedSession<E: Exchange> {
+    scanning: ScanningSession<E>,
+    frozen: FrozenScan,
+    scan: serde_json::Value,
+}
+
+fn phase_frame(
+    raw: &[u8],
+    id: u64,
+    operation: &str,
+    phase: &str,
+    count: usize,
+) -> Result<serde_json::Value> {
+    let value = parse_frame(raw).map_err(|_| ERROR.to_owned())?;
+    require(
+        value
+            .as_object()
+            .is_some_and(|object| object.len() == count)
+            && value["schema_version"].as_u64() == Some(1)
+            && value["id"].as_u64() == Some(id)
+            && value["operation"] == operation
+            && value["phase"] == phase,
+    )?;
+    Ok(value)
+}
+fn send_command<E: Exchange>(
+    session: &mut PinnedSession<E>,
+    value: serde_json::Value,
+) -> Result<()> {
+    session.check()?;
+    let mut raw = serde_json::to_vec(&value).map_err(|_| ERROR.to_owned())?;
+    raw.push(b'\n');
+    session.port()?.write(&raw).map_err(|_| ERROR.to_owned())?;
+    session.check()?;
+    Ok(())
+}
+fn read_phase<E: Exchange>(
+    session: &mut PinnedSession<E>,
+    id: u64,
+    operation: &str,
+    phase: &str,
+    count: usize,
+) -> Result<serde_json::Value> {
+    session.check()?;
+    let raw = session.port()?.read().map_err(|_| ERROR.to_owned())?;
+    session.check()?;
+    let result = phase_frame(&raw, id, operation, phase, count)?;
+    session.check()?;
+    Ok(result)
+}
+impl<E: Exchange> NormalizedSession<E> {
+    fn prepare(self, journal: &mut RequestJournal<'_>) -> Result<PreparedSession<E>> {
+        let Self { mut scanning, scan } = self;
+        let id = scanning.next_id;
+        require(id <= SAFE - 2 && scanning.session.phase == Phase::Scanning)?;
+        send_command(
+            &mut scanning.session,
+            json!({"schema_version":1,"id":id,"operation":"freeze_scan"}),
+        )?;
+        let frame = read_phase(&mut scanning.session, id, "freeze_scan", "scan_frozen", 5)?;
+        let frozen: FrozenScan =
+            serde_json::from_value(frame["scan"].clone()).map_err(|_| ERROR.to_owned())?;
+        let start = scanning
+            .proof
+            .scan
+            .as_ref()
+            .ok_or(ERROR)?
+            .started_boottime_ms;
+        let now = scanning.session.check()?;
+        require(
+            frozen.scan_started_boottime_ms == start
+                && frozen.scan_finished_boottime_ms >= start
+                && frozen.scan_finished_boottime_ms <= now.boottime_ms
+                && frozen.scan_finished_boottime_ms < scanning.session.deadline
+                && hex(&frozen.installed_before_sha256, 64)
+                && frozen.installed_before_sha256 == frozen.installed_after_sha256,
+        )?;
+        let release = journal
+            .prepare_native_release(&scanning.request_id, &now)
+            .map_err(|_| ERROR.to_owned())?;
+        require(release.observation_nonce() == scanning.offer.nonce)?;
+        let current = scanning.session.check()?;
+        journal.publish_native_release(release,&current,|nonce| {
+            send_command(&mut scanning.session,json!({"schema_version":1,"id":id+1,"operation":"publish_release","nonce":nonce}))?;
+            read_phase(&mut scanning.session,id+1,"publish_release","published",4)?;
+            Ok(())
+        }).map_err(|_| ERROR.to_owned())?;
+        scanning.session.check()?;
+        send_command(
+            &mut scanning.session,
+            json!({"schema_version":1,"id":id+2,"operation":"await_receipt"}),
+        )?;
+        let prepared = read_phase(
+            &mut scanning.session,
+            id + 2,
+            "await_receipt",
+            "prepared",
+            5,
+        )?;
+        let evidence = prepared["evidence"].as_object().ok_or(ERROR)?;
+        require(
+            evidence.len() == 5
+                && evidence
+                    .get("schema_version")
+                    .and_then(serde_json::Value::as_u64)
+                    == Some(1)
+                && evidence
+                    .get("scan_started_boottime_ms")
+                    .and_then(serde_json::Value::as_u64)
+                    == Some(start)
+                && evidence
+                    .get("scan_finished_boottime_ms")
+                    .and_then(serde_json::Value::as_u64)
+                    == Some(frozen.scan_finished_boottime_ms)
+                && evidence
+                    .get("successful_checked_at")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(scanning.session.context.successful_checked_at.as_str()),
+        )?;
+        let receipt_value = evidence.get("observation_receipt").ok_or(ERROR)?;
+        let receipt: RootReceipt =
+            serde_json::from_value(receipt_value.clone()).map_err(|_| ERROR.to_owned())?;
+        scanning.session.check()?;
+        let root = scanning
+            .session
+            .port()?
+            .root_receipt()
+            .map_err(|_| ERROR.to_owned())?;
+        let now = scanning.session.check()?;
+        let offer = &scanning.offer;
+        require(
+            &root == receipt_value
+                && receipt.nonce == offer.nonce
+                && receipt.boot_id == offer.boot_id
+                && receipt.cache_generation == offer.cache_generation
+                && receipt.policy_generation == offer.policy_generation
+                && receipt.lock_open_boottime_ms == offer.lock_open_boottime_ms
+                && receipt.expires_boottime_ms == offer.expires_boottime_ms
+                && receipt.outcome == "released"
+                && receipt.installed_before_sha256 == frozen.installed_before_sha256
+                && receipt.installed_after_sha256 == frozen.installed_after_sha256
+                && offer.lock_open_boottime_ms <= start
+                && frozen.scan_finished_boottime_ms <= receipt.lock_held_until_boottime_ms
+                && receipt.lock_held_until_boottime_ms <= receipt.released_boottime_ms
+                && receipt.released_boottime_ms <= offer.expires_boottime_ms
+                && receipt.released_boottime_ms <= now.boottime_ms,
+        )?;
+        scanning.session.check()?;
+        Ok(PreparedSession {
+            scanning,
+            frozen,
+            scan,
+        })
+    }
 }
 
 // Sync is required by the existing normalizer. Contention/reentry must fail
@@ -434,6 +615,7 @@ impl<E: Exchange> PublishedSession<E> {
             offer,
             data: DataSession::new(),
             next_id: 4,
+            request_id: pending.request_id,
         })
     }
 }
@@ -562,6 +744,7 @@ mod tests {
 
     const BOOT: &str = "00000000-0000-4000-8000-000000000001";
     const REPORT: &str = "00000000-0000-4000-8000-000000000002";
+    const REQUEST: &str = "00000000-0000-4000-8000-000000000003";
     fn clock(time: u64) -> Clock {
         Clock {
             boot_id: BOOT.into(),
@@ -621,7 +804,7 @@ mod tests {
             journal
                 .admit(
                     Delivery::Collection(CollectionDelivery {
-                        request_id: REPORT.into(),
+                        request_id: REQUEST.into(),
                         delivery_sequence: 1,
                         not_before: "2026-01-01T00:00:00.000Z".into(),
                         source_revision: 1,
@@ -684,6 +867,8 @@ mod tests {
         data_fault: Option<&'static str>,
         poison_on_data_write: Option<Arc<AtomicBool>>,
         poison_on_data_final: Option<Arc<AtomicBool>>,
+        finish_reply: bool,
+        finish_fault: Option<&'static str>,
     }
     impl Exchange for Scripted {
         fn sample(&mut self) -> Result<Clock> {
@@ -709,6 +894,20 @@ mod tests {
                 std::fs::write(&self.path, bytes).unwrap();
             }
             let frame = self.frames.pop_front().ok_or("Synthetic EOF")?;
+            if self.finish_fault == Some("postrelease")
+                && serde_json::from_slice::<Value>(&frame)
+                    .is_ok_and(|value| value["operation"] == "publish_release")
+            {
+                let mut bytes = std::fs::read(&self.path).unwrap();
+                bytes.push(b'\n');
+                std::fs::write(&self.path, bytes).unwrap();
+            }
+            if self.finish_fault == Some("after_fsync")
+                && serde_json::from_slice::<Value>(&frame)
+                    .is_ok_and(|value| value["phase"] == "scan_frozen")
+            {
+                self.times = VecDeque::from([clock(1012), clock(1012), clock(1012), clock(10000)]);
+            }
             if let Some(flag) = &self.poison_on_data_final
                 && serde_json::from_slice::<Value>(&frame)
                     .is_ok_and(|value| value["phase"] == "data_complete")
@@ -792,6 +991,61 @@ mod tests {
                         flag.store(true, Ordering::SeqCst);
                     }
                 }
+                "freeze_scan" if self.finish_reply => {
+                    assert!(scan["finished_boottime_ms"].is_null());
+                    let id = command["id"].as_u64().unwrap();
+                    let mut frame = json!({"schema_version":1,"id":id,"operation":"freeze_scan","phase":"scan_frozen","scan":{"scan_started_boottime_ms":1010,"scan_finished_boottime_ms":1012,"installed_before_sha256":"c".repeat(64),"installed_after_sha256":"c".repeat(64)}});
+                    match self.finish_fault {
+                        Some("start") => frame["scan"]["scan_started_boottime_ms"] = json!(1011),
+                        Some("finish") => frame["scan"]["scan_finished_boottime_ms"] = json!(1013),
+                        Some("hash") => {
+                            frame["scan"]["installed_after_sha256"] = json!("d".repeat(64))
+                        }
+                        _ => {}
+                    }
+                    self.frames.push_back(format!("{frame}\n").into_bytes());
+                }
+                "publish_release" if self.finish_reply => {
+                    assert!(scan["finished_boottime_ms"].is_null());
+                    assert_eq!(
+                        retained["native_attempt"]["observation_nonce"],
+                        command["nonce"]
+                    );
+                    assert!(retained["native_attempt"]["release_requested_boottime_ms"].is_u64());
+                    let id = command["id"].as_u64().unwrap();
+                    let phase = if self.finish_fault == Some("release_ack") {
+                        "failed"
+                    } else {
+                        "published"
+                    };
+                    self.frames.push_back(format!("{}\n",json!({"schema_version":1,"id":id,"operation":"publish_release","phase":phase})).into_bytes());
+                }
+                "await_receipt" if self.finish_reply => {
+                    let id = command["id"].as_u64().unwrap();
+                    let mut frame = json!({"schema_version":1,"id":id,"operation":"await_receipt","phase":"prepared","evidence":{"schema_version":1,"scan_started_boottime_ms":1010,"scan_finished_boottime_ms":1012,"successful_checked_at":"2026-01-01T00:00:00.123456Z","observation_receipt":scripted_receipt()}});
+                    match self.finish_fault {
+                        Some("checked") => {
+                            frame["evidence"]["successful_checked_at"] =
+                                json!("2026-01-01T00:00:00Z")
+                        }
+                        Some("receipt") => {
+                            frame["evidence"]["observation_receipt"]["nonce"] =
+                                json!("0000000000000009bbbbbbbbbbbbbbbb")
+                        }
+                        Some("extra") => frame["evidence"]["extra"] = json!(1),
+                        _ => {}
+                    }
+                    let encoded = format!("{frame}\n");
+                    let encoded = if self.finish_fault == Some("duplicate") {
+                        encoded.replace(
+                            "\"outcome\":\"released\"",
+                            "\"outcome\":\"released\",\"outcome\":\"released\"",
+                        )
+                    } else {
+                        encoded
+                    };
+                    self.frames.push_back(encoded.into_bytes());
+                }
                 _ => panic!("Unexpected scripted operation"),
             }
             record.writes.push(raw.to_vec());
@@ -819,6 +1073,16 @@ mod tests {
             }
             .into())
         }
+        fn root_receipt(&mut self) -> Result<Value> {
+            let mut value = scripted_receipt();
+            if self.finish_fault == Some("root") {
+                value["outcome"] = json!("expired");
+            }
+            Ok(value)
+        }
+    }
+    fn scripted_receipt() -> Value {
+        json!({"nonce":"0000000000000008bbbbbbbbbbbbbbbb","boot_id":BOOT,"cache_generation":"a".repeat(32),"policy_generation":"b".repeat(64),"lock_open_boottime_ms":1005,"expires_boottime_ms":10000,"lock_held_until_boottime_ms":1012,"released_boottime_ms":1012,"outcome":"released","installed_before_sha256":"c".repeat(64),"installed_after_sha256":"c".repeat(64)})
     }
     fn scripted(fixture: &Fixture) -> (Scripted, Arc<Mutex<Recorded>>) {
         let record = Arc::new(Mutex::new(Recorded::default()));
@@ -837,6 +1101,8 @@ mod tests {
                 data_fault: None,
                 poison_on_data_write: None,
                 poison_on_data_final: None,
+                finish_reply: false,
+                finish_fault: None,
             },
             record,
         )
@@ -879,6 +1145,107 @@ mod tests {
         exchange.data_reply = true;
         exchange.times.extend((0..400).map(|_| clock(1012)));
         (exchange, record)
+    }
+
+    #[test]
+    fn prepared_receipt_keeps_journal_scan_unfinished() {
+        let fixture = Fixture::new();
+        let negotiated = negotiated();
+        let mut journal = fixture.ready(&negotiated);
+        let (mut exchange, record) = data_scripted(&fixture);
+        exchange.finish_reply = true;
+        let scanning = data_scanning(&fixture, &mut journal, &negotiated, exchange);
+        let normalized = scanning.collect_selected("2026-01-01T00:00:00Z").unwrap();
+        let before = saved(&fixture);
+        let prepared = normalized.prepare(&mut journal).unwrap();
+        assert_eq!(prepared.frozen.scan_finished_boottime_ms, 1012);
+        assert_eq!(prepared.scanning.request_id, REQUEST);
+        assert_eq!(prepared.scan["scanId"], REPORT);
+        assert!(
+            prepared
+                .scanning
+                .proof
+                .scan
+                .as_ref()
+                .unwrap()
+                .finished_boottime_ms
+                .is_none()
+        );
+        assert_eq!(
+            prepared.scanning.offer.nonce,
+            "0000000000000008bbbbbbbbbbbbbbbb"
+        );
+        drop(prepared);
+        let commands: Vec<String> = record
+            .lock()
+            .unwrap()
+            .writes
+            .iter()
+            .map(|raw| {
+                serde_json::from_slice::<Value>(raw).unwrap()["operation"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned()
+            })
+            .collect();
+        assert_eq!(
+            &commands[commands.len() - 3..],
+            ["freeze_scan", "publish_release", "await_receipt"]
+        );
+        unfinished_at(&fixture, &before, Some(1010));
+    }
+
+    #[test]
+    fn malformed_frozen_or_receipt_never_produces_prepared_evidence() {
+        for fault in [
+            "start",
+            "finish",
+            "hash",
+            "release_ack",
+            "checked",
+            "receipt",
+            "extra",
+            "root",
+            "duplicate",
+            "postrelease",
+        ] {
+            let fixture = Fixture::new();
+            let negotiated = negotiated();
+            let mut journal = fixture.ready(&negotiated);
+            let (mut exchange, record) = data_scripted(&fixture);
+            exchange.finish_reply = true;
+            exchange.finish_fault = Some(fault);
+            let scanning = data_scanning(&fixture, &mut journal, &negotiated, exchange);
+            let normalized = scanning.collect_selected("2026-01-01T00:00:00Z").unwrap();
+            let before = saved(&fixture);
+            assert!(normalized.prepare(&mut journal).is_err(), "{fault}");
+            if ["start", "finish", "hash"].contains(&fault) {
+                assert!(!record.lock().unwrap().writes.iter().any(|raw| {
+                    serde_json::from_slice::<Value>(raw).unwrap()["operation"] == "publish_release"
+                }));
+            }
+            unfinished_at(&fixture, &before, Some(1010));
+        }
+    }
+
+    #[test]
+    fn expired_after_release_intent_never_sends_release() {
+        let fixture = Fixture::new();
+        let negotiated = negotiated();
+        let mut journal = fixture.ready(&negotiated);
+        let (mut exchange, record) = data_scripted(&fixture);
+        exchange.finish_reply = true;
+        exchange.finish_fault = Some("after_fsync");
+        let normalized = data_scanning(&fixture, &mut journal, &negotiated, exchange)
+            .collect_selected("2026-01-01T00:00:00Z")
+            .unwrap();
+        let before = saved(&fixture);
+        assert!(normalized.prepare(&mut journal).is_err());
+        assert!(!record.lock().unwrap().writes.iter().any(|raw| {
+            serde_json::from_slice::<Value>(raw).unwrap()["operation"] == "publish_release"
+        }));
+        assert!(saved(&fixture)["collection"]["active"]["native_attempt"]["release_requested_boottime_ms"].is_u64());
+        unfinished_at(&fixture, &before, Some(1010));
     }
 
     fn unfinished(fixture: &Fixture, before: &Value) {
