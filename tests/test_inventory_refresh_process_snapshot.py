@@ -118,6 +118,14 @@ class ProcessSnapshotTests(unittest.TestCase):
         with self.assertRaises(ValueError):validate_snapshot(self.pid,self.stat,self.status,self.cgroup,self.mounts,(0,28))
         with self.assertRaises(ValueError):validate_snapshot(True,self.stat,self.status,self.cgroup,self.mounts,(0,27))
 
+    def test_writable_mount_fixed_path_categories(self):
+        for path,label in ((b'/sys/fs/cgroup/leaf','profile_mount_writable_nested'),
+            (b'/sys/other','profile_mount_writable_sys'),(b'/run/other','profile_mount_writable_run'),
+            (b'/var/other','profile_mount_writable_var'),(b'/proc/other','profile_mount_writable_proc')):
+            mount=self.mounts+b'43 1 0:27 / '+path+b' rw - cgroup2 cgroup rw\n'
+            with self.assertRaisesRegex(ValueError,label):
+                validate_snapshot(self.pid,self.stat,self.status,self.cgroup,mount,(0,27))
+
     def test_writable_mount_category_distinguishes_root_and_other(self):
         for mount,label in ((self.mounts.replace(b' ro,nosuid',b' rw,nosuid'),'profile_mount_writable_root'),
             (self.mounts+b'43 1 0:27 / /other rw - cgroup2 cgroup rw\n','profile_mount_writable_other')):

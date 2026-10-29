@@ -45,7 +45,12 @@ def validate_snapshot(pid,stat,status,cgroup,mountinfo,device):
         groups=[row for row in rows if row['fs']==b'cgroup2']
         stage='profile_mount_missing';assert groups
         writable=[row for row in groups if b'ro' not in row['options']]
-        stage='profile_mount_writable_root' if any(row['path']=='/sys/fs/cgroup' for row in writable) else 'profile_mount_writable_other'
+        categories=(('root',lambda path:path=='/sys/fs/cgroup'),('nested',lambda path:path.startswith('/sys/fs/cgroup/')),
+            ('sys',lambda path:path.startswith('/sys/')),('run',lambda path:path.startswith('/run/')),
+            ('var',lambda path:path.startswith('/var/')),('proc',lambda path:path.startswith('/proc/')))
+        stage='profile_mount_writable_other'
+        for label,match in categories:
+            if any(match(row['path']) for row in writable):stage='profile_mount_writable_'+label;break
         assert not writable
         stage='profile_mount_device';assert all(row['device']==device for row in groups)
         stage='profile_mount_root';root=[row for row in groups if row['path']=='/sys/fs/cgroup' and row['root']=='/']
@@ -158,7 +163,9 @@ class ProcessProbe:
             labels={'check','stat','status','cgroup','mountinfo','profile','stat_recheck','final',
                 'profile_device','profile_stat','profile_view','profile_identity_fields','profile_uid','profile_gid',
                 'profile_groups','profile_nnp','profile_caps','profile_cgroup','profile_mount_parse','profile_mount_missing',
-                'profile_mount_writable_root','profile_mount_writable_other','profile_mount_device','profile_mount_root','profile_mount_nested'}
+                'profile_mount_writable_root','profile_mount_writable_nested','profile_mount_writable_sys',
+                'profile_mount_writable_run','profile_mount_writable_var','profile_mount_writable_proc',
+                'profile_mount_writable_other','profile_mount_device','profile_mount_root','profile_mount_nested'}
             if isinstance(exc,ProfileError) and str(exc) in labels:stage=str(exc)
             if os.geteuid()==0 and os.environ.get('GITHUB_ACTIONS')=='true' and stage in labels:
                 print('Native fixture process probe stage='+stage,file=sys.stderr)
