@@ -9,10 +9,14 @@ import io
 import json
 import os
 from pathlib import Path
+import pwd
 import re
+import selectors
 import stat
 import subprocess
+import sys
 import tarfile
+import time
 import zlib
 
 ARCHIVE='command-center-inventory-metadata-helper.tar.gz'
@@ -36,7 +40,9 @@ ENTRY='scripts/inventory_refresh_root_entry.py'
 GENERATOR='scripts/inventory_refresh_reporter_build.py'
 TEMPLATE='scripts/inventory_refresh_reporter_template.py'
 DOC='docs/inventory-refresh-contract.md'
-ENV={'PATH':'/usr/sbin:/usr/bin:/sbin:/bin','LC_ALL':'C','LANG':'C'}
+ENV={'PATH':'/usr/sbin:/usr/bin:/sbin:/bin','LC_ALL':'C','LANG':'C','HOME':'/nonexistent',
+    'GIT_CONFIG_NOSYSTEM':'1','GIT_CONFIG_GLOBAL':'/dev/null','GIT_NO_LAZY_FETCH':'1',
+    'GIT_TERMINAL_PROMPT':'0','GIT_OPTIONAL_LOCKS':'0'}
 
 
 def require(condition):
@@ -62,12 +68,87 @@ def _read(path,limit):
     finally:os.close(fd)
 
 
+def _git_command(repo,arguments,uid,account,platform,marker):
+    require(isinstance(repo,Path) and repo.is_absolute() and type(arguments) is tuple)
+    allowed=(arguments==('rev-parse','--verify','HEAD^{commit}') or
+        len(arguments)==3 and arguments[:2] in (('cat-file','-s'),('cat-file','blob')) and
+            re.fullmatch('[0-9a-f]{40}',arguments[2]) is not None or
+        len(arguments)==5 and arguments[:2]==('ls-tree','-z') and re.fullmatch('[0-9a-f]{40}',arguments[2]) is not None and
+            arguments[3]=='--' and re.fullmatch('[A-Za-z0-9_./-]{1,255}',arguments[4]) is not None and
+            all(part not in ('','.','..') for part in arguments[4].split('/')))
+    require(allowed)
+    git=['/usr/bin/git','--no-replace-objects','-c','core.fsmonitor=false',
+        '-c','safe.directory='+str(repo),*arguments]
+    if uid!=0:return git
+    require(platform=='linux' and marker=='true' and account is not None and type(account.pw_uid) is int and
+        type(account.pw_gid) is int and account.pw_uid>0 and account.pw_gid>0 and account.pw_dir=='/home/runner')
+    return ['/usr/bin/setpriv','--reuid='+str(account.pw_uid),'--regid='+str(account.pw_gid),'--clear-groups',
+        '--inh-caps=-all','--ambient-caps=-all','--bounding-set=-all','--no-new-privs','--',*git]
+
+
+def _bounded_git(command,repo,timeout=10):
+    """No timeout signals: setpriv may not yet have dropped Root privileges."""
+    require(type(timeout) in (int,float) and 0<timeout<=10)
+    child=None;selector=None;output=bytearray();failed=False;deadline=time.monotonic()+timeout
+    try:
+        child=subprocess.Popen(command,cwd=repo,env=ENV,stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL)
+        os.set_blocking(child.stdout.fileno(),False);selector=selectors.DefaultSelector();selector.register(child.stdout,selectors.EVENT_READ)
+        eof=False
+        while not eof:
+            remaining=deadline-time.monotonic();require(remaining>0)
+            for key,_ in selector.select(min(.05,remaining)):
+                try:raw=os.read(key.fileobj.fileno(),min(65536,2*1024*1024+1-len(output)))
+                except BlockingIOError:continue
+                require(time.monotonic()<deadline)
+                if not raw:eof=True;break
+                output.extend(raw);require(len(output)<=2*1024*1024)
+        remaining=deadline-time.monotonic();require(remaining>0 and child.wait(timeout=remaining)==0 and time.monotonic()<deadline)
+    except BaseException:failed=True
+    finally:
+        if selector is not None:
+            try:selector.close()
+            except BaseException:failed=True
+        if child is not None and child.stdout is not None:
+            try:child.stdout.close()
+            except BaseException:failed=True
+    if failed or time.monotonic()>=deadline:raise ValueError('Native fixture artifact admission unavailable') from None
+    return bytes(output)
+
+
 def _git(repo,*arguments):
-    result=subprocess.run(['/usr/bin/git','--no-replace-objects','-c','core.fsmonitor=false',
-        '-c','safe.directory='+str(Path(repo).resolve()),*arguments],cwd=repo,env=ENV,stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,timeout=10)
-    require(result.returncode==0 and len(result.stdout)<=2*1024*1024)
-    return result.stdout
+    try:
+        repo=Path(repo).resolve();uid=os.geteuid();account=pwd.getpwnam('runner') if uid==0 else None
+        command=_git_command(repo,arguments,uid,account,sys.platform,os.environ.get('GITHUB_ACTIONS'))
+        return _bounded_git(command,repo)
+    except BaseException:raise ValueError('Native fixture artifact admission unavailable') from None
+
+
+def _privilege_probe_command(repo,account):
+    """Fixed CI-only profile probe; no caller-selectable executable/source."""
+    prefix=_git_command(repo,('rev-parse','--verify','HEAD^{commit}'),0,account,'linux','true')[:9]
+    code='''import os,sys
+uid=int(sys.argv[1]);gid=int(sys.argv[2])
+assert os.getresuid()==(uid,uid,uid) and os.getresgid()==(gid,gid,gid) and os.getgroups()==[]
+fields={};raw=open('/proc/self/status','rb').read(65537);assert len(raw)<=65536
+for line in raw.splitlines():
+ key,sep,value=line.partition(b':')
+ if key in (b'CapInh',b'CapPrm',b'CapEff',b'CapBnd',b'CapAmb',b'NoNewPrivs'):
+  assert sep and key not in fields;fields[key]=value.strip()
+assert set(fields)=={b'CapInh',b'CapPrm',b'CapEff',b'CapBnd',b'CapAmb',b'NoNewPrivs'}
+assert all(int(fields[key],16)==0 for key in (b'CapInh',b'CapPrm',b'CapEff',b'CapBnd',b'CapAmb'))
+assert fields[b'NoNewPrivs']==b'1'
+print('restricted-git-profile-ok')'''
+    return [*prefix,'/usr/bin/python3','-I','-B','-S','-c',code,str(account.pw_uid),str(account.pw_gid)]
+
+
+def _verify_privilege_drop(repo):
+    if os.geteuid()!=0:return
+    try:
+        require(sys.platform=='linux' and os.environ.get('GITHUB_ACTIONS')=='true')
+        account=pwd.getpwnam('runner')
+        command=_privilege_probe_command(Path(repo).resolve(),account)
+        require(_bounded_git(command,repo)==b'restricted-git-profile-ok\n')
+    except BaseException:raise ValueError('Native fixture artifact admission unavailable') from None
 
 
 def _blob(repo,commit,path):
@@ -78,7 +159,8 @@ def _blob(repo,commit,path):
         parts[1]==b'blob' and re.fullmatch(rb'[0-9a-f]{40}',parts[2]) is not None)
     size=_git(repo,'cat-file','-s',parts[2].decode()).strip();limit=262144 if path==DOC else 65536
     require(re.fullmatch(rb'[1-9][0-9]{0,7}',size) is not None and int(size)<=limit)
-    data=_git(repo,'cat-file','blob',parts[2].decode());require(len(data)==int(size));return data
+    data=_git(repo,'cat-file','blob',parts[2].decode());require(len(data)==int(size) and
+        hashlib.sha1(b'blob '+str(len(data)).encode()+b'\0'+data).hexdigest().encode()==parts[2]);return data
 
 
 def _literal(raw,name,expected):
@@ -149,6 +231,7 @@ def verify_archive(repo,archive):
         digest=hashlib.sha256(raw).hexdigest();require(sidecar==(digest+'  '+ARCHIVE+'\n').encode('ascii'))
         stream=zlib.decompressobj(16+zlib.MAX_WBITS);expanded=stream.decompress(raw,4*1024*1024+1)
         require(len(expanded)<=4*1024*1024 and stream.eof and not stream.unused_data and not stream.unconsumed_tail)
+        _verify_privilege_drop(repo)
         commit,data=expected_files(repo)
         # Exact deterministic USTAR comparison rejects hidden trailing members,
         # nonzero end padding, duplicate JSON keys/rows and every alias/extra.
