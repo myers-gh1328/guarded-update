@@ -185,3 +185,17 @@ Candidates and holds retain Unknown update status; this context does not verify
 a metadata refresh or authenticate native evidence. The default executable still
 uses host-cached collection. A managed bridge must place every retained OS read
 inside the verified observation interval before this context can be enabled.
+
+The separate staged reporter resource sampler checks current non-root numeric
+identity, zero capabilities, no new privileges and exact intended unit membership
+before opening cache capabilities. It requires the existing bounded inventory
+aggregate and a read-only cache view, including the held FD's read-only mount
+flag. Mount geometry, aliases, capacity and ancestor limits remain strict; the
+Root publisher's separate writable-view checks are unchanged. Failed checks
+poison the sampler, and cleanup attempts every owned root once.
+
+These observations do not prove dedicated NSS account mapping, parent identity,
+initial namespace/unit provenance, allocation history, workload fit or native
+cleanup. The current baseline reporting unit lacks the requested aggregate
+placement and cannot pass this sampler. No unit, mount, account or capability is
+changed by the library; full environment and source admission remain unfinished.

@@ -1073,7 +1073,8 @@ def reporter_library_program():
     # implementation with a fixed reader-only closure, not a production entry.
     prefix=(ROOT/'scripts/inventory_refresh_root_entry.py').read_text().split('\ndef main():',1)[0]
     modules=('inventory_refresh_protocol','inventory_refresh_receipt','inventory_refresh_state','inventory_refresh_storage',
-        'inventory_refresh_status','inventory_refresh_observation','inventory_refresh_reader_tools','inventory_refresh_reader_session','inventory_refresh_reporter_io')
+        'inventory_refresh_status','inventory_refresh_observation','inventory_refresh_resources','inventory_refresh_reporter_resources',
+        'inventory_refresh_reader_tools','inventory_refresh_reader_session','inventory_refresh_reporter_io')
     body=r'''
 import json,subprocess
 assert len(sys.argv)==2 and re.fullmatch('[0-9a-f]{32}',sys.argv[1])
@@ -1082,7 +1083,7 @@ fields=dict(line.split(':',1) for line in open('/proc/self/status').read().split
 assert all(fields[key].split()==['60002']*4 for key in ('Uid','Gid'))
 assert fields['Groups'].split() in ([],['60002']) and fields['NoNewPrivs'].split()==['1']
 assert all(int(fields[key].strip(),16)==0 for key in ('CapInh','CapPrm','CapEff','CapBnd','CapAmb'))
-assert open('/proc/self/cgroup').read()=='0::/command.slice/command-center.slice/command-center-inventory.slice/command-center-inventory-session-proof.service\n'
+assert open('/proc/self/cgroup').read()=='0::/command.slice/command-center.slice/command-center-inventory.slice/command-center-inventory.service\n'
 boot=open('/proc/sys/kernel/random/boot_id').read().strip()
 budget=time.clock_gettime_ns(time.CLOCK_BOOTTIME)//1000000+15000
 previous=None
@@ -1092,9 +1093,10 @@ def clock():
  assert (previous is None or current>=previous) and current<budget
  assert open('/proc/sys/kernel/random/boot_id').read().strip()==boot
  previous=current;return boot,current
-sources=None;reader=None;session=None;root=None;chains=[]
+sources=None;reader=None;session=None;root=None;chains=[];resources=None
 try:
  sources=RootSources.fixed();loaded=sources.execute();closing,sources=sources,None;closing.close()
+ resources=loaded['inventory_refresh_reporter_resources'].ReporterResources.fixed()
  observation=loaded['inventory_refresh_observation'];root=os.open('/',os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
  for parts in (('run','command-center-inventory-refresh','status'),('var','cache','command-center-inventory-refresh'),('var','lib','dpkg')):
   chains.append(observation._Ancestry.open(root,parts))
@@ -1143,6 +1145,7 @@ try:
  assert re.search(r'(?m)^\s*Candidate: 1\.0\s*$',result)
  assert re.search(r'(?m)^\s*(?:\*\*\*\s+)?1\.0\s+123\s*$',result)
  for chain in chains:chain.verify()
+ resources.sample()
  session.finish_scan()
  print(json.dumps({'phase':'scan_finished'}),flush=True)
  while True:
@@ -1150,10 +1153,11 @@ try:
   if current is not None and current['observation_receipt'] is not None and current['observation_receipt']['nonce']==nonce:break
   time.sleep(.01)
  for chain in chains:chain.verify()
+ resources.sample()
  evidence=json.loads(session.finish(value));session=None
 finally:
  failed=False
- for owned in (session,reader,sources,*reversed(chains)):
+ for owned in (session,reader,sources,*reversed(chains),resources):
   if owned is not None:
    try:owned.close()
    except BaseException:failed=True
@@ -1197,9 +1201,9 @@ def close_reporter_parent(stream,group):
 def prove_reporter_library_roundtrip(actor,public):
     """Native library seam; synthetic admission, not executable-client readiness."""
     from inventory_refresh_unit_status import PROPERTIES
-    for name in ('inventory_refresh_reader_tools','inventory_refresh_reader_session','inventory_refresh_reporter_io'):
+    for name in ('inventory_refresh_reporter_resources','inventory_refresh_reader_tools','inventory_refresh_reader_session','inventory_refresh_reporter_io'):
         target=LIB_ROOT/(name+'.py');shutil.copyfile(ROOT/'scripts'/(name+'.py'),target);target.chmod(0o444)
-    unit='command-center-inventory-session-proof.service';description='Disposable reporter session '+secrets.token_hex(16)
+    unit='command-center-inventory.service';description='Disposable reporter session '+secrets.token_hex(16)
     nonce='0000000000000007'+'e'*16
     def properties():
         result=subprocess.run(['/bin/systemctl','show','--property='+','.join(PROPERTIES),unit],env=ENV,
@@ -1427,6 +1431,7 @@ def prove_actual_coordinator_entry_loop():
         'projected_reader_policy_native_query_verified':True,
         'restricted_reporter_fingerprint_matches_root_receipt_verified':True,
         'restricted_reporter_session_root_status_roundtrip_verified':True,
+        'restricted_reporter_current_readonly_resource_admission_verified':True,
         'restricted_reporter_request_writer_roundtrip_verified':True}
 
 def is_live_worker(raw,*,parent=None):

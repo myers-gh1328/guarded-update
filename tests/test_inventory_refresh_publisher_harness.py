@@ -35,8 +35,11 @@ class PublisherHarnessTests(unittest.TestCase):
         body=ast.parse(code)
         assignments=[node.value for node in body.body if isinstance(node,ast.Assign) and any(isinstance(t,ast.Name) and t.id=='SOURCES' for t in node.targets)]
         sources=ast.literal_eval(assignments[-1])
-        self.assertEqual(len(sources),9)
+        self.assertEqual(len(sources),11)
         self.assertIn(('inventory_refresh_reader_tools','inventory_refresh_reader_tools.py'),sources)
+        self.assertIn(('inventory_refresh_reporter_resources','inventory_refresh_reporter_resources.py'),sources)
+        self.assertIn("resources=loaded['inventory_refresh_reporter_resources'].ReporterResources.fixed()",code)
+        self.assertIn('command-center-inventory.service',code)
         self.assertEqual(sources[-2:],(('inventory_refresh_reader_session','inventory_refresh_reader_session.py'),('inventory_refresh_reporter_io','inventory_refresh_reporter_io.py')))
         self.assertIn('Synthetic seam only',code)
         self.assertIn("session.policy(['inventory-proof'])",code)
@@ -100,13 +103,14 @@ class PublisherHarnessTests(unittest.TestCase):
         cleanup=next(node for node in body.body if isinstance(node,ast.Try) and node.finalbody)
         output=body.body[-1]
         owned=SimpleNamespace(close=Mock(side_effect=OSError('synthetic close failure')))
-        reader=Mock();chain=Mock();scope={'session':owned,'reader':reader,'sources':None,'chains':[chain],'root':None,
+        reader=Mock();chain=Mock();resources=Mock();scope={'session':owned,'reader':reader,'sources':None,'chains':[chain],'root':None,'resources':resources,
             'evidence':{'synthetic':True},'json':json}
         attempt=ast.Try(body=[ast.Pass()],handlers=[],orelse=[],finalbody=cleanup.finalbody)
         code=ast.fix_missing_locations(ast.Module(body=[attempt,output],type_ignores=[]))
         stdout=io.StringIO()
         with contextlib.redirect_stdout(stdout),self.assertRaises(ValueError):exec(compile(code,'<actual-child-cleanup>','exec'),scope)
         self.assertEqual(stdout.getvalue(),'');reader.close.assert_called_once();chain.close.assert_called_once()
+        resources.close.assert_called_once()
 
     def test_actual_writer_actor_uses_only_admitted_fixed_dependencies_and_capabilities(self):
         tree=ast.parse((Path(__file__).parent/'native_inventory_refresh_apt.py').read_bytes())
