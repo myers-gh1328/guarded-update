@@ -1250,3 +1250,20 @@ factory, executable route or capability is enabled. The disposable native actor
 loads the actual writer from a nine-module admitted fixture closure for the
 observation/release roundtrip; synthetic authorization does not verify production
 Control ownership or durable client intent.
+
+Before observation publication, the request journal now consumes the admitted
+intent and rechecks its original epoch, current negotiation, native clock,
+protected disk snapshot, acknowledged active request and exact saved native
+mapping. The existing global journal mutex and process lock remain held through
+a bounded fixed callback that ends at fsynced nonce-publication acknowledgment.
+A second snapshot check rejects out-of-band changes after that callback. No
+journal operation, other handle, recovery, report/transport callback or Root
+lease/scan/receipt wait may reenter this critical section.
+
+Only a successful callback produces the distinct, non-cloneable published token
+bound to the new epoch. Scan attachment consumes that type and rechecks the exact
+mapping after the adapter admits the opened Root lease. Errors, possible visible
+writes, or callback panic yield no published token, retain durable submitted
+uncertainty, and grant no retry or scan-resumption permission. This gate remains
+an inactive library seam; fixed Control/bridge integration must supply the actual
+native clock, current negotiation and protected sender implementation.

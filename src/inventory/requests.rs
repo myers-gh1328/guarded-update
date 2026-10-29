@@ -986,6 +986,21 @@ impl Entry {
         }
         Ok(())
     }
+    fn matches_native_intent(&self, intent: &NativeCollectionIntent) -> bool {
+        self.submitted
+            && self.pending_status == ClientStatus::Running
+            && self.delivery.id() == intent.request_id
+            && self.proof.nonce() == intent.operation_nonce
+            && self.acknowledged_nonce.as_deref() == Some(intent.operation_nonce.as_str())
+            && self.source_revision == intent.scan.source_revision
+            && self.proof.boot() == intent.boot_id
+            && self.proof.scan().is_none()
+            && self.native_attempt.as_ref().is_some_and(|native| {
+                native.observation_nonce == intent.observation_nonce
+                    && native.boot_id == intent.boot_id
+                    && native.admitted_boottime_ms == intent.admitted_boottime_ms
+            })
+    }
     fn status(&self, enrollment: &str) -> Result<StatusMessage> {
         Ok(StatusMessage {
             schema_version: 1,
@@ -1163,6 +1178,31 @@ impl NativeCollectionIntent {
     pub fn observation_nonce(&self) -> &str {
         &self.observation_nonce
     }
+}
+/// Consumed admission after bounded fixed-inbox publication ACK, not Root
+/// acceptance/liveness/coherence. Cannot be recreated from durable metadata.
+pub struct PublishedNativeCollection {
+    intent: NativeCollectionIntent,
+}
+impl PublishedNativeCollection {
+    pub fn observation_nonce(&self) -> &str {
+        self.intent.observation_nonce()
+    }
+}
+fn native_authority(
+    intent: &NativeCollectionIntent,
+    epoch: &std::sync::Arc<()>,
+    clock: &Clock,
+    session: &Negotiated,
+) -> Result<()> {
+    clock.validate()?;
+    require(
+        std::sync::Arc::ptr_eq(epoch, &intent.epoch)
+            && std::sync::Arc::ptr_eq(&session.identity, &intent.negotiation)
+            && session.allows(Capability::Collection)
+            && clock.boot_id == intent.boot_id
+            && clock.boottime_ms >= intent.admitted_boottime_ms,
+    )
 }
 pub struct RequestJournal<'a> {
     epoch: std::sync::Arc<()>,
@@ -1561,24 +1601,61 @@ impl<'a> RequestJournal<'a> {
             scan,
         })
     }
+    fn native_snapshot(&mut self) -> Result<()> {
+        if self.poisoned
+            || !super::state::read(&self.dir.join("requests.json"), MAX_JOURNAL)
+                .is_ok_and(|bytes| bytes == self.snapshot)
+        {
+            self.poisoned = true;
+            return Err("Native publication journal unavailable or stale".into());
+        }
+        Ok(())
+    }
+    /// The trusted fixed callback does only bounded fsynced nonce publication.
+    /// It MUST NOT call ANY RequestJournal/open/pending/read/recovery operation,
+    /// even through another handle, or wait for Root lease/scan/receipt: the
+    /// global journal mutex and caller's existing process lock remain held.
+    pub fn publish_native_observation(
+        &mut self,
+        mut intent: NativeCollectionIntent,
+        clock: &Clock,
+        session: &Negotiated,
+        publish: impl FnOnce(&str) -> Result<()>,
+    ) -> Result<PublishedNativeCollection> {
+        let admitted_epoch = self.epoch.clone();
+        self.revoke_native_intents();
+        native_authority(&intent, &admitted_epoch, clock, session)?;
+        let _access = JOURNAL_ACCESS
+            .lock()
+            .map_err(|_| "Request journal access uncertain; restart and reconcile")?;
+        self.native_snapshot()?;
+        self.journal.collection_only_safe()?;
+        require(
+            self.journal
+                .collection
+                .active
+                .as_ref()
+                .is_some_and(|entry| entry.matches_native_intent(&intent)),
+        )?;
+        publish(&intent.observation_nonce)?;
+        // Also detect out-of-band/callback-side state replacement, not merely
+        // cooperative mutex writers. Never roll back a possibly visible effect.
+        self.native_snapshot()?;
+        intent.epoch = self.epoch.clone();
+        Ok(PublishedNativeCollection { intent })
+    }
     /// Consume same-run authority only after the adapter admits Root's opened
     /// lease. The supplied native clock becomes the actual scan start before reads.
     pub fn attach_native_scan(
         &mut self,
-        intent: NativeCollectionIntent,
+        published: PublishedNativeCollection,
         clock: &Clock,
         session: &Negotiated,
     ) -> Result<CollectionProof> {
         let admitted_epoch = self.epoch.clone();
         self.revoke_native_intents();
-        clock.validate()?;
-        require(
-            std::sync::Arc::ptr_eq(&admitted_epoch, &intent.epoch)
-                && std::sync::Arc::ptr_eq(&session.identity, &intent.negotiation)
-                && session.allows(Capability::Collection)
-                && clock.boot_id == intent.boot_id
-                && clock.boottime_ms >= intent.admitted_boottime_ms,
-        )?;
+        let intent = published.intent;
+        native_authority(&intent, &admitted_epoch, clock, session)?;
         self.change(|j| {
             j.collection_only_safe()?;
             let entry = j
@@ -1586,15 +1663,7 @@ impl<'a> RequestJournal<'a> {
                 .active
                 .as_mut()
                 .ok_or("No active collection request")?;
-            require(
-                entry.submitted
-                    && entry.pending_status == ClientStatus::Running
-                    && entry.delivery.id() == intent.request_id
-                    && entry.proof.nonce() == intent.operation_nonce
-                    && entry.acknowledged_nonce.as_deref() == Some(intent.operation_nonce.as_str())
-                    && entry.source_revision == intent.scan.source_revision
-                    && entry.proof.boot() == intent.boot_id,
-            )?;
+            require(entry.matches_native_intent(&intent))?;
             let Proof::Collection(mut proof) = entry.proof.clone() else {
                 return Err("Invalid native collection proof".into());
             };
@@ -1993,6 +2062,159 @@ impl<'a> RequestJournal<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn native_publication_rejects_stale_scope_before_calling_sender() {
+        for action in 0..6 {
+            let fixture = Fixture::new();
+            let session = session();
+            let mut journal = native_ready(&fixture, &session);
+            let intent = journal
+                .admit_native_collection(REPORT, 1, 1, &clock(1001), "bbbbbbbbbbbbbbbb", &session)
+                .unwrap();
+            let mut now = clock(1002);
+            let mut current = session.clone();
+            match action {
+                0 => {
+                    journal
+                        .reserve_nonce(OperationDomain::Observation, "cccccccccccccccc")
+                        .unwrap();
+                }
+                1 => {
+                    current =
+                        Negotiated::new(&[Capability::Collection], &[Capability::Collection], true)
+                            .unwrap()
+                }
+                2 => {
+                    fixture
+                        .open()
+                        .reserve_nonce(OperationDomain::Observation, "cccccccccccccccc")
+                        .unwrap();
+                }
+                3 => now.boot_id = "00000000-0000-4000-8000-000000000099".into(),
+                4 => now.boottime_ms = 1000,
+                _ => {
+                    journal
+                        .journal
+                        .collection
+                        .active
+                        .as_mut()
+                        .unwrap()
+                        .native_attempt
+                        .as_mut()
+                        .unwrap()
+                        .observation_nonce = "0000000000000008dddddddddddddddd".into()
+                }
+            }
+            let mut called = false;
+            assert!(
+                journal
+                    .publish_native_observation(intent, &now, &current, |_| {
+                        called = true;
+                        Ok(())
+                    })
+                    .is_err()
+            );
+            assert!(!called, "action {action}");
+        }
+    }
+    #[test]
+    fn failed_native_sender_keeps_scope_unfinished_without_replay_authority() {
+        let fixture = Fixture::new();
+        let session = session();
+        let mut journal = native_ready(&fixture, &session);
+        let intent = journal
+            .admit_native_collection(REPORT, 1, 1, &clock(1001), "bbbbbbbbbbbbbbbb", &session)
+            .unwrap();
+        let before = std::fs::read(fixture.dir.join("requests.json")).unwrap();
+        let marker = fixture.dir.join("synthetic-visible-request");
+        assert!(
+            journal
+                .publish_native_observation(intent, &clock(1002), &session, |nonce| {
+                    std::fs::write(&marker, nonce).unwrap();
+                    Err("Synthetic publication uncertain".into())
+                })
+                .is_err()
+        );
+        assert_eq!(
+            std::fs::read(fixture.dir.join("requests.json")).unwrap(),
+            before
+        );
+        assert_eq!(
+            std::fs::read_to_string(marker).unwrap(),
+            "0000000000000008bbbbbbbbbbbbbbbb"
+        );
+        assert_eq!(
+            journal.recover_collection(None).unwrap(),
+            CollectionRecovery::Unfinished
+        );
+        assert!(
+            journal
+                .admit_native_collection(REPORT, 1, 1, &clock(1010), "cccccccccccccccc", &session)
+                .is_err()
+        );
+    }
+    #[test]
+    fn native_sender_out_of_band_journal_change_cannot_mint_published_token() {
+        let fixture = Fixture::new();
+        let session = session();
+        let mut journal = native_ready(&fixture, &session);
+        let intent = journal
+            .admit_native_collection(REPORT, 1, 1, &clock(1001), "bbbbbbbbbbbbbbbb", &session)
+            .unwrap();
+        let path = fixture.dir.join("requests.json");
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes.push(b'\n');
+        assert!(
+            journal
+                .publish_native_observation(intent, &clock(1002), &session, |_| {
+                    std::fs::write(&path, &bytes).unwrap();
+                    Ok(())
+                })
+                .is_err()
+        );
+        assert!(journal.pending(Capability::Collection).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    }
+    #[test]
+    fn native_sender_panic_retains_scope_and_poison_is_fail_closed() {
+        const FLAG: &str = "GUARDED_UPDATE_TEST_PUBLICATION_PANIC";
+        if std::env::var_os(FLAG).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "inventory::requests::tests::native_sender_panic_retains_scope_and_poison_is_fail_closed"])
+                .env(FLAG, "1").output().unwrap();
+            assert!(
+                output.status.success(),
+                "Isolated panic verification failed"
+            );
+            return;
+        }
+        let fixture = Fixture::new();
+        let session = session();
+        let mut journal = native_ready(&fixture, &session);
+        let intent = journal
+            .admit_native_collection(REPORT, 1, 1, &clock(1001), "bbbbbbbbbbbbbbbb", &session)
+            .unwrap();
+        let path = fixture.dir.join("requests.json");
+        let before = std::fs::read(&path).unwrap();
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = journal.publish_native_observation(intent, &clock(1002), &session, |_| {
+                panic!("Synthetic publisher panic")
+            });
+        }));
+        assert!(outcome.is_err());
+        assert!(journal.pending(Capability::Collection).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+    fn published_test(
+        journal: &mut RequestJournal<'_>,
+        session: &Negotiated,
+        intent: NativeCollectionIntent,
+    ) -> PublishedNativeCollection {
+        let now = clock(intent.admitted_boottime_ms);
+        journal
+            .publish_native_observation(intent, &now, session, |_| Ok(()))
+            .unwrap()
+    }
     fn native_ready<'a>(fixture: &'a Fixture, session: &Negotiated) -> RequestJournal<'a> {
         let mut journal = fixture.open();
         journal
@@ -2006,6 +2228,45 @@ mod tests {
             )
             .unwrap();
         journal
+    }
+    #[test]
+    fn native_publication_checks_durable_scope_before_one_shot_effect() {
+        let fixture = Fixture::new();
+        let session = session();
+        let mut journal = native_ready(&fixture, &session);
+        let intent = journal
+            .admit_native_collection(REPORT, 1, 1, &clock(1001), "bbbbbbbbbbbbbbbb", &session)
+            .unwrap();
+        let mut calls = 0;
+        let published = journal
+            .publish_native_observation(intent, &clock(1002), &session, |nonce| {
+                calls += 1;
+                let value: Value = serde_json::from_slice(
+                    &std::fs::read(fixture.dir.join("requests.json")).unwrap(),
+                )
+                .unwrap();
+                assert_eq!(
+                    value["collection"]["active"]["native_attempt"]["observation_nonce"],
+                    nonce
+                );
+                assert_eq!(value["collection"]["active"]["submitted"], true);
+                assert!(
+                    value["collection"]["active"]["proof"]["evidence"]
+                        .get("scan")
+                        .unwrap()
+                        .is_null()
+                );
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(calls, 1);
+        assert_eq!(
+            published.observation_nonce(),
+            "0000000000000008bbbbbbbbbbbbbbbb"
+        );
+        journal
+            .attach_native_scan(published, &clock(1010), &session)
+            .unwrap();
     }
     #[test]
     fn retained_native_and_manual_observations_cannot_reuse_counter_prefix() {
@@ -2069,6 +2330,7 @@ mod tests {
         let intent = journal
             .admit_native_collection(REPORT, 1, 1, &clock(1001), "bbbbbbbbbbbbbbbb", &session)
             .unwrap();
+        let intent = published_test(&mut journal, &session, intent);
         journal
             .attach_native_scan(intent, &clock(1010), &session)
             .unwrap();
@@ -2167,6 +2429,7 @@ mod tests {
         let intent = journal
             .admit_native_collection(REPORT, 1, 1, &clock(1001), "bbbbbbbbbbbbbbbb", &session)
             .unwrap();
+        let intent = published_test(&mut journal, &session, intent);
         let bytes = std::fs::read(fixture.dir.join("requests.json")).unwrap();
         let value: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(value["schema_version"], 2);
@@ -2202,6 +2465,7 @@ mod tests {
             let intent = journal
                 .admit_native_collection(REPORT, 1, 1, &clock(1001), "bbbbbbbbbbbbbbbb", &session)
                 .unwrap();
+            let intent = published_test(&mut journal, &session, intent);
             match action {
                 0 => assert!(
                     journal
@@ -2270,6 +2534,7 @@ mod tests {
             } else {
                 None
             };
+            let intent = intent.map(|intent| published_test(&mut journal, &session, intent));
             let before = std::fs::read(fixture.dir.join("requests.json")).unwrap();
             std::fs::set_permissions(&fixture.dir, std::fs::Permissions::from_mode(0o500)).unwrap();
             if let Some(intent) = intent {
@@ -2312,6 +2577,7 @@ mod tests {
         let intent = first
             .admit_native_collection(REPORT, 1, 1, &clock(1001), "bbbbbbbbbbbbbbbb", &session)
             .unwrap();
+        let intent = published_test(&mut first, &session, intent);
         let mut reopened = fixture.open();
         assert!(
             reopened
@@ -2337,6 +2603,7 @@ mod tests {
             let intent = journal
                 .admit_native_collection(REPORT, 1, 1, &clock(1001), "bbbbbbbbbbbbbbbb", &session)
                 .unwrap();
+            let intent = published_test(&mut journal, &session, intent);
             let next = match action {
                 0 => {
                     journal
@@ -2446,6 +2713,7 @@ mod tests {
             let intent = journal
                 .admit_native_collection(REPORT, 1, 1, &clock(1002), "bbbbbbbbbbbbbbbb", &session)
                 .unwrap();
+            let intent = published_test(&mut journal, &session, intent);
             if stale {
                 fixture
                     .open()
@@ -2482,6 +2750,7 @@ mod tests {
         let intent = journal
             .admit_native_collection(REPORT, 1, 1, &clock(1001), "bbbbbbbbbbbbbbbb", &session)
             .unwrap();
+        let intent = published_test(&mut journal, &session, intent);
         assert_eq!(
             intent.observation_nonce(),
             "0000000000000008bbbbbbbbbbbbbbbb"
