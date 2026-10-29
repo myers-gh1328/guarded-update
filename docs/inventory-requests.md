@@ -206,3 +206,19 @@ recompute the end time or assert Root cleanup; invalid phases, clock uncertainty
 or a closed session return no endpoints. Final receipt evidence must preserve
 those exact endpoints. The coordinator must still validate and durably bind the
 same actual start and end around release before publishing a report.
+
+The staged read-only parent owner first admits reporter resources, then checks
+the fixed reporting/refresh NSS mappings, a live derived parent pidfd, consistent
+numeric proc/PID-namespace views, and the parent's fixed Root-owned executable.
+It deliberately reopens the current Kernel `exe` link around verification; an
+old executable FD alone cannot establish current origin. The only proc boot-path
+overmount exception is the canonical read-only `/proc/sys` protection. Native
+clock reads use the held Kernel boot-ID FD and BOOTTIME, with parent liveness
+checked before and after the read. Failures poison the owner and cleanup attempts
+all owned capabilities once.
+
+This owner exposes no inventory, source execution, request publication or
+completion authority. Same UID remains a trusted-code boundary. It does not
+establish initial host namespace, selected release/code-hash origin or fit.
+Native verification uses an explicitly synthetic fixed-path C parent to check
+these admission mechanics; it does not establish the Rust coordinator lifecycle.

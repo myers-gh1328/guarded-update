@@ -11,10 +11,64 @@ import sys
 from types import SimpleNamespace
 from pathlib import Path
 import unittest
+import tempfile
 from unittest.mock import Mock,patch
 
 
 class PublisherHarnessTests(unittest.TestCase):
+    def test_parent_mechanics_program_has_only_fixed_readonly_sources(self):
+        tree=ast.parse((Path(__file__).parent/'native_inventory_refresh_apt.py').read_bytes())
+        factory=next(node for node in tree.body if isinstance(node,ast.FunctionDef) and node.name=='parent_mechanics_program')
+        scope={'ROOT':Path(__file__).resolve().parents[1]}
+        exec(compile(ast.Module(body=[factory],type_ignores=[]),'<parent-factory>','exec'),scope)
+        code=scope['parent_mechanics_program']();compile(code,'<parent-mechanics>','exec')
+        body=ast.parse(code)
+        assignments=[node.value for node in body.body if isinstance(node,ast.Assign) and any(isinstance(target,ast.Name) and target.id=='SOURCES' for target in node.targets)]
+        self.assertEqual(ast.literal_eval(assignments[-1]),tuple((name,name+'.py') for name in (
+            'inventory_refresh_resources','inventory_refresh_reporter_resources','inventory_refresh_reporter_parent')))
+        self.assertIn("owner=loaded['inventory_refresh_reporter_parent'].ReporterParent.fixed()",code)
+        self.assertNotIn('ReporterRequestWriter',code)
+        coordinator=next(node for node in tree.body if isinstance(node,ast.FunctionDef) and node.name=='prove_actual_coordinator_entry_loop')
+        self.assertIn('prove_reporter_parent_mechanics()',ast.unparse(coordinator))
+
+    def parent_file_helpers(self):
+        tree=ast.parse((Path(__file__).parent/'native_inventory_refresh_apt.py').read_bytes())
+        helpers=[node for node in tree.body if isinstance(node,ast.FunctionDef) and node.name in ('publish_parent_fixture_file','retire_parent_fixture')]
+        scope={'os':os,'stat':stat};exec(compile(ast.Module(body=helpers,type_ignores=[]),'<parent-files>','exec'),scope)
+        return scope['publish_parent_fixture_file'],scope['retire_parent_fixture']
+
+    def test_parent_fixture_preserves_preexisting_and_foreign_files(self):
+        publish,retire=self.parent_file_helpers()
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary);directory=os.open(root,os.O_RDONLY|os.O_DIRECTORY)
+            try:
+                target=root/'command-center-inventory';target.write_bytes(b'foreign')
+                fixture={'files':[],'directories':[]}
+                with self.assertRaises(FileExistsError):publish(fixture,directory,target.name,b'synthetic',0o555)
+                self.assertEqual(target.read_bytes(),b'foreign');self.assertEqual(fixture['files'],[])
+                target.unlink();publish(fixture,directory,target.name,b'synthetic',0o555)
+                held=os.open(target,os.O_RDONLY)
+                try:
+                    target.unlink();target.write_bytes(b'foreign replacement')
+                    with self.assertRaises(AssertionError):retire(fixture,True)
+                    self.assertEqual(target.read_bytes(),b'foreign replacement')
+                finally:os.close(held)
+            finally:os.close(directory)
+
+    def test_parent_fixture_retirement_requires_unit_empty_and_closes_caps(self):
+        publish,retire=self.parent_file_helpers()
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary);directory=os.open(root,os.O_RDONLY|os.O_DIRECTORY)
+            try:
+                cap=Mock();fixture={'files':[],'directories':[cap]}
+                publish(fixture,directory,'command-center-inventory',b'synthetic',0o555)
+                with self.assertRaises(AssertionError):retire(fixture,False)
+                self.assertTrue((root/'command-center-inventory').exists());cap.close.assert_called_once()
+                (root/'command-center-inventory').unlink()
+                fixture={'files':[],'directories':[]};publish(fixture,directory,'command-center-inventory',b'synthetic',0o555)
+                retire(fixture,True);self.assertFalse((root/'command-center-inventory').exists())
+            finally:os.close(directory)
+
     def test_restricted_reporter_phase_is_bounded_exact_and_duplicate_strict(self):
         tree=ast.parse((Path(__file__).parent/'native_inventory_refresh_apt.py').read_bytes())
         decoder=next(node for node in tree.body if isinstance(node,ast.FunctionDef) and node.name=='decode_reporter_phase')

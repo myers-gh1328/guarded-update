@@ -30,6 +30,7 @@ import subprocess
 import sys
 import threading
 import time
+import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT/'scripts'))
@@ -1200,6 +1201,163 @@ def close_reporter_parent(stream,group):
         if group is not None:os.close(group)
 
 
+def parent_mechanics_program():
+    # Synthetic trusted Parent only: prove the actual readonly admission
+    # mechanics, never a production Rust lifecycle or source-bootstrap claim.
+    prefix=(ROOT/'scripts/inventory_refresh_root_entry.py').read_text().split('\ndef main():',1)[0]
+    modules=('inventory_refresh_resources','inventory_refresh_reporter_resources','inventory_refresh_reporter_parent')
+    body=r'''
+import json
+assert len(sys.argv)==1
+sources=None;owner=None
+try:
+ sources=RootSources.fixed();loaded=sources.execute();closing,sources=sources,None;closing.close()
+ owner=loaded['inventory_refresh_reporter_parent'].ReporterParent.fixed()
+ owner.verify();boot,now=owner.clock();owner.verify()
+finally:
+ failed=False
+ for value in (owner,sources):
+  if value is not None:
+   try:value.close()
+   except BaseException:failed=True
+ if failed:raise ValueError('Parent mechanics cleanup unconfirmed')
+print(json.dumps({'phase':'complete','evidence':{'parent_origin_mechanics':True,'boot_id':boot,'boottime_ms':now}}),flush=True)
+'''
+    return prefix+'\nSOURCES='+repr(tuple((name,name+'.py') for name in modules))+'\n'+body
+
+
+def publish_parent_fixture_file(fixture,directory,name,raw,mode):
+    assert (name,mode) in (('command-center-inventory',0o555),('reporter-parent-proof.py',0o444))
+    assert type(raw) is bytes and 0<len(raw)<=1024*1024
+    fd=os.open(name,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW|os.O_NONBLOCK,0o600,dir_fd=directory)
+    try:
+        info=os.fstat(fd)
+        fixture['files'].append((directory,name,(info.st_dev,info.st_ino)))
+        assert stat.S_ISREG(info.st_mode) and info.st_nlink==1 and info.st_uid==os.geteuid()
+        offset=0
+        while offset<len(raw):
+            written=os.write(fd,raw[offset:]);assert written>0;offset+=written
+        os.fchmod(fd,mode);os.fsync(fd)
+        final=os.fstat(fd);named=os.stat(name,dir_fd=directory,follow_symlinks=False)
+        assert (final.st_dev,final.st_ino)==(named.st_dev,named.st_ino)==(info.st_dev,info.st_ino)
+        assert final.st_size==len(raw) and final.st_nlink==1 and stat.S_IMODE(final.st_mode)==mode
+    finally:os.close(fd)
+    os.fsync(directory)
+
+
+def retire_parent_fixture(fixture,confirmed_empty):
+    files,fixture['files']=fixture['files'],[]
+    directories,fixture['directories']=fixture['directories'],[]
+    failed=not confirmed_empty
+    try:
+        if confirmed_empty:
+            for directory,name,identity in reversed(files):
+                try:
+                    info=os.stat(name,dir_fd=directory,follow_symlinks=False)
+                    assert stat.S_ISREG(info.st_mode) and info.st_nlink==1 and (info.st_dev,info.st_ino)==identity
+                    os.unlink(name,dir_fd=directory);os.fsync(directory)
+                except BaseException:failed=True
+    finally:
+        for directory in reversed(directories):
+            try:directory.close()
+            except BaseException:failed=True
+    assert not failed,'Synthetic parent fixture cleanup unconfirmed'
+
+
+def install_parent_fixture():
+    from inventory_refresh_resources import _Chain
+    assert sys.platform=='linux' and os.geteuid()==0 and os.environ.get('GITHUB_ACTIONS')=='true'
+    fixture={'files':[],'directories':[]}
+    try:
+        binary=_Chain(('usr','local','libexec'));fixture['directories'].append(binary)
+        library=_Chain(('usr','local','libexec','command-center-inventory-refresh'));fixture['directories'].append(library)
+        for directory,name in ((binary.fds[-1],'command-center-inventory'),(library.fds[-1],'reporter-parent-proof.py')):
+            try:os.stat(name,dir_fd=directory,follow_symlinks=False)
+            except FileNotFoundError:pass
+            else:raise AssertionError('Fixed synthetic parent path already exists')
+        # Exact fixed exec, closed environment and own-child wait only. No
+        # forwarded argument, shell, signal or reporting/controller operation.
+        source=r'''
+#include <unistd.h>
+#include <sys/wait.h>
+#include <errno.h>
+int main(void) {
+ char *args[] = {"/usr/bin/python3", "-I", "-B", "-S", "/usr/local/libexec/command-center-inventory-refresh/reporter-parent-proof.py", 0};
+ char *env[] = {"PATH=/usr/sbin:/usr/bin:/sbin:/bin", "LC_ALL=C", "LANG=C", 0};
+ pid_t child=fork(); if(child<0) return 74;
+ if(child==0) {execve(args[0],args,env);_exit(74);}
+ int status=0;
+ while(waitpid(child,&status,0)<0) {if(errno!=EINTR) return 74;}
+ return WIFEXITED(status)?WEXITSTATUS(status):74;
+}
+'''
+        with tempfile.TemporaryDirectory(prefix='inventory-parent-mechanics-') as temporary:
+            root=Path(temporary);(root/'parent.c').write_text(source)
+            command(['/usr/bin/cc','-Wall','-Wextra','-Werror','-o',str(root/'parent'),str(root/'parent.c')],timeout=15)
+            with (root/'parent').open('rb') as compiled:raw=compiled.read(1024*1024+1)
+            publish_parent_fixture_file(fixture,binary.fds[-1],'command-center-inventory',raw,0o555)
+        publish_parent_fixture_file(fixture,library.fds[-1],'reporter-parent-proof.py',parent_mechanics_program().encode(),0o444)
+        return fixture
+    except BaseException:
+        retire_parent_fixture(fixture,True)  # This installer never starts Parent.
+        raise
+
+
+def prove_reporter_parent_mechanics():
+    from inventory_refresh_unit_status import PROPERTIES
+    for name in ('inventory_refresh_reporter_parent',):
+        target=LIB_ROOT/(name+'.py');shutil.copyfile(ROOT/'scripts'/(name+'.py'),target);target.chmod(0o444)
+    unit='command-center-inventory.service';description='Synthetic parent admission '+secrets.token_hex(16)
+    expected='/command.slice/command-center.slice/command-center-inventory.slice/'+unit
+    def properties():
+        result=subprocess.run(['/bin/systemctl','show','--property='+','.join(PROPERTIES),unit],env=ENV,
+            stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,timeout=2)
+        assert result.returncode in (0,4) and len(result.stdout)<=4096
+        values={}
+        for line in result.stdout.decode('ascii').splitlines():
+            key,separator,value=line.partition('=');assert separator and key in PROPERTIES and key not in values;values[key]=value
+        assert set(values)==set(PROPERTIES);return values
+    def empty():
+        value=properties()
+        if value['LoadState']!='not-found':
+            assert value['Description']==description and value['ActiveState'] in ('inactive','failed')
+        try:group=os.open('/sys/fs/cgroup'+expected,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+        except FileNotFoundError:return True
+        try:
+            fd=os.open('cgroup.events',os.O_RDONLY|os.O_NOFOLLOW,dir_fd=group)
+            try:assert b'populated 0' in os.read(fd,4096).splitlines()
+            finally:os.close(fd)
+        finally:os.close(group)
+        return True
+    assert properties()['LoadState']=='not-found'
+    fixture=install_parent_fixture();process=None
+    try:
+        args=['/usr/bin/systemd-run','--quiet','--wait','--collect','--pipe','--unit='+unit,'--slice='+PARENT_SLICE,'--description='+description]
+        for item in ('User=60002','Group=60002','Type=exec','Restart=no','RemainAfterExit=no','KillMode=control-group',
+            'KillSignal=SIGKILL','TimeoutStopSec=1','RuntimeMaxSec=20','OOMPolicy=kill','TasksMax=8','MemoryAccounting=yes',
+            'NoNewPrivileges=yes','CapabilityBoundingSet=','AmbientCapabilities=','ProtectSystem=strict',
+            'ProtectHome=yes','ProtectControlGroups=yes','ProtectKernelTunables=yes','PrivateDevices=yes','PrivateTmp=yes','PrivateNetwork=yes'):
+            args+=['-p',item]
+        args+=['/usr/local/libexec/command-center-inventory']
+        process=subprocess.Popen(args,env=ENV,stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL)
+        deadline=time.monotonic()+25
+        evidence=read_reporter_phase(process.stdout,'complete',deadline)['evidence']
+        finish_reporter_output(process,deadline)
+        assert set(evidence)=={'parent_origin_mechanics','boot_id','boottime_ms'} and evidence['parent_origin_mechanics'] is True
+        assert evidence['boot_id']==Path('/proc/sys/kernel/random/boot_id').read_text().strip()
+        assert type(evidence['boottime_ms']) is int and 0<=evidence['boottime_ms']<=time.clock_gettime_ns(time.CLOCK_BOOTTIME)//1000000
+        assert empty()
+    finally:
+        confirmed=False
+        try:
+            if process is not None:process.wait(timeout=25)
+            confirmed=empty()
+        finally:
+            try:retire_parent_fixture(fixture,confirmed)
+            finally:
+                if process is not None:process.stdout.close()
+
+
 def prove_reporter_library_roundtrip(actor,public):
     """Native library seam; synthetic admission, not executable-client readiness."""
     from inventory_refresh_unit_status import PROPERTIES
@@ -1410,6 +1568,7 @@ def prove_actual_coordinator_entry_loop():
         assert value['observation_lease'] is None and all(receipt[key]==item for key,item in offer.items())
         assert match_projected_reader_receipt(offer,reader_proof,receipt)
         receipt=prove_reporter_library_roundtrip(actor,public)
+        prove_reporter_parent_mechanics()
         invalidate_policy()
         assert launcher.wait(timeout=35)==74
         final=confirm_inert();assert final['ExecMainCode']=='1' and final['ExecMainStatus']=='74' and final['Result']=='exit-code'
@@ -1434,6 +1593,7 @@ def prove_actual_coordinator_entry_loop():
         'restricted_reporter_fingerprint_matches_root_receipt_verified':True,
         'restricted_reporter_session_root_status_roundtrip_verified':True,
         'restricted_reporter_current_readonly_resource_admission_verified':True,
+        'restricted_reporter_parent_origin_clock_mechanics_verified':True,
         'restricted_reporter_request_writer_roundtrip_verified':True}
 
 def is_live_worker(raw,*,parent=None):
