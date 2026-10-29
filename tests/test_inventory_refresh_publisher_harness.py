@@ -208,7 +208,7 @@ class PublisherHarnessTests(unittest.TestCase):
         node=next(node for node in tree.body if isinstance(node,ast.FunctionDef) and node.name=='prove_rust_reporter_roundtrip')
         code=ast.unparse(node)
         for item in ('User=60002','Group=60002','NoNewPrivileges=yes','PrivateNetwork=yes','RuntimeMaxSec=20',
-            '--exact','--ignored','--test-threads=1','hosted_real_reporter_rust_journal_roundtrip',
+            '--exact','--ignored','--test-threads=1','ReadOnlyPaths=/sys/fs/cgroup','hosted_real_reporter_rust_journal_roundtrip',
             'InvocationID','cgroup.events','populated 0','validate_rust_proof_output','retire_rust_reporter_artifact_fixture'):
             self.assertIn(item,code)
         self.assertNotIn('.kill(',code);self.assertNotIn('os.kill(',code)
