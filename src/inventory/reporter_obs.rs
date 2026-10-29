@@ -1339,6 +1339,265 @@ command(10,'await_receipt');response(10,'await_receipt','prepared',evidence=dict
         }
     }
 
+    // Hosted fixture only. The real CLOCK_BOOTTIME sampler and existing fixed
+    // tools can terminate their own unprivileged subprocess on timeout. No
+    // Root signal, closed process-set, hard pipe deadline or cleanup witness.
+    #[cfg(target_os = "linux")]
+    struct NativeExchange {
+        child: std::process::Child,
+        pipes: Option<super::super::reporter_pipe::PipePair>,
+        status: super::super::reporter_status::StatusReader,
+        deadline: std::time::Instant,
+        hostname: String,
+        architecture: String,
+    }
+    #[cfg(target_os = "linux")]
+    impl NativeExchange {
+        fn spawn(
+            status: super::super::reporter_status::StatusReader,
+            deadline: std::time::Instant,
+            hostname: String,
+            architecture: String,
+        ) -> Result<Self> {
+            use std::process::{Command, Stdio};
+            require(std::time::Instant::now() < deadline)?;
+            let mut child = Command::new("/usr/bin/python3")
+                .args([
+                    "-I",
+                    "-B",
+                    "-S",
+                    "/usr/local/libexec/command-center-inventory-refresh/reporter.py",
+                ])
+                .env_clear()
+                .env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")
+                .env("LC_ALL", "C")
+                .env("LANG", "C")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .map_err(|_| ERROR.to_owned())?;
+            let pipes = super::super::reporter_pipe::PipePair::new(
+                child.stdin.take().ok_or(ERROR)?,
+                child.stdout.take().ok_or(ERROR)?,
+                deadline,
+            )
+            .map_err(|_| ERROR.to_owned())?;
+            Ok(Self {
+                child,
+                pipes: Some(pipes),
+                status,
+                deadline,
+                hostname,
+                architecture,
+            })
+        }
+        fn finish(mut self) -> Result<()> {
+            let mut pipes = self.pipes.take().ok_or(ERROR)?;
+            let eof = pipes.require_eof().is_ok();
+            let closed = pipes.close().is_ok();
+            let after_close = std::time::Instant::now() < self.deadline;
+            let exit = loop {
+                match self.child.try_wait() {
+                    Ok(Some(status)) => {
+                        break status.success() && std::time::Instant::now() < self.deadline;
+                    }
+                    Err(_) => break false,
+                    Ok(None) => {}
+                }
+                let remaining = self
+                    .deadline
+                    .saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    break false;
+                }
+                std::thread::sleep(remaining.min(std::time::Duration::from_millis(2)));
+            };
+            require(eof && closed && after_close && exit)
+        }
+    }
+    #[cfg(target_os = "linux")]
+    impl Exchange for NativeExchange {
+        fn sample(&mut self) -> Result<Clock> {
+            super::super::clock::snapshot().map_err(|_| ERROR.into())
+        }
+        fn read(&mut self) -> Result<Vec<u8>> {
+            self.pipes
+                .as_mut()
+                .ok_or(ERROR)?
+                .read_frame()
+                .map_err(|_| ERROR.into())
+        }
+        fn write(&mut self, raw: &[u8]) -> Result<()> {
+            self.pipes
+                .as_mut()
+                .ok_or(ERROR)?
+                .write_frame(raw)
+                .map_err(|_| ERROR.into())
+        }
+        fn close(&mut self) -> Result<()> {
+            match self.pipes.take() {
+                Some(pipes) => pipes.close().map_err(|_| ERROR.into()),
+                None => Ok(()),
+            }
+        }
+        fn host_metadata(&mut self, kind: HostMetadata) -> Result<String> {
+            Ok(match kind {
+                HostMetadata::Hostname => self.hostname.clone(),
+                HostMetadata::MachineArchitecture => self.architecture.clone(),
+            })
+        }
+        fn root_status(&mut self, _receipt: bool) -> Result<Value> {
+            self.status.read(self.deadline).map_err(|_| ERROR.into())
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn hosted_native_roundtrip() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{Duration, Instant};
+        require(
+            std::env::var("GUARDED_UPDATE_NATIVE_RUST_PROOF")
+                .ok()
+                .as_deref()
+                == Some("1"),
+        )?;
+        let deadline = Instant::now() + Duration::from_secs(18);
+        let status =
+            super::super::reporter_status::StatusReader::fixed().map_err(|_| ERROR.to_owned())?;
+        let current = status.read(deadline).map_err(|_| ERROR.to_owned())?;
+        super::super::reporter_status::validate_status(&current).map_err(|_| ERROR.to_owned())?;
+        let first = super::super::clock::snapshot().map_err(|_| ERROR.to_owned())?;
+        let expected = ExpectedPin {
+            cache_generation: current["cache_generation"].as_str().ok_or(ERROR)?.into(),
+            policy_generation: current["policy_generation"].as_str().ok_or(ERROR)?.into(),
+            successful_checked_at: current["successful_checked_at"]
+                .as_str()
+                .ok_or(ERROR)?
+                .into(),
+            boot_id: first.boot_id.clone(),
+        };
+        let tools = super::super::process::SystemTools;
+        let hostname = tools
+            .text("/bin/hostname", &[], 4096)
+            .map_err(|_| ERROR.to_owned())?;
+        let architecture = tools
+            .text("/usr/bin/uname", &["-m"], 4096)
+            .map_err(|_| ERROR.to_owned())?;
+        require(!hostname.is_empty() && !architecture.is_empty() && Instant::now() < deadline)?;
+        let dir = std::path::Path::new("/tmp").join(format!(
+            "inventory-native-{}",
+            super::super::transport::report_id().map_err(|_| ERROR.to_owned())?
+        ));
+        std::fs::create_dir(&dir).map_err(|_| ERROR.to_owned())?;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+            .map_err(|_| ERROR.to_owned())?;
+        let lock = super::super::state::Lock::acquire(&dir).map_err(|_| ERROR.to_owned())?;
+        RequestJournal::initialize(
+            &dir,
+            BOOT,
+            CounterSeeds {
+                helper: 5,
+                observation: 8,
+            },
+            &lock,
+        )
+        .map_err(|_| ERROR.to_owned())?;
+        let negotiated = negotiated();
+        let mut journal = RequestJournal::open(&dir, BOOT, &lock).map_err(|_| ERROR.to_owned())?;
+        let accepted = super::super::clock::snapshot().map_err(|_| ERROR.to_owned())?;
+        journal
+            .admit(
+                Delivery::Collection(CollectionDelivery {
+                    request_id: REQUEST.into(),
+                    delivery_sequence: 1,
+                    not_before: "2026-01-01T00:00:00.000Z".into(),
+                    source_revision: 1,
+                }),
+                1,
+                &accepted,
+                "aaaaaaaaaaaaaaaa",
+                &negotiated,
+            )
+            .map_err(|_| ERROR.to_owned())?;
+        let pending = journal
+            .pending(Capability::Collection)
+            .map_err(|_| ERROR.to_owned())?
+            .ok_or(ERROR)?;
+        journal
+            .canonical(
+                Capability::Collection,
+                &Canonical {
+                    schema_version: 1,
+                    request: CanonicalRequest {
+                        request_id: pending.request_id,
+                        delivery_sequence: 1,
+                        status: CanonicalStatus::Delivered,
+                        reason: None,
+                        report_id: None,
+                        report_sha256: None,
+                        operation_nonce: pending.operation_nonce,
+                    },
+                    receipt: None,
+                },
+            )
+            .map_err(|_| ERROR.to_owned())?;
+        let admitted = super::super::clock::snapshot().map_err(|_| ERROR.to_owned())?;
+        let intent = journal
+            .admit_native_collection(REPORT, 1, 1, &admitted, "dddddddddddddddd", &negotiated)
+            .map_err(|_| ERROR.to_owned())?;
+        require(
+            intent.observation_nonce() == "0000000000000009dddddddddddddddd"
+                && Instant::now() < deadline,
+        )?;
+        let exchange = NativeExchange::spawn(status, deadline, hostname, architecture)?;
+        let mut prepared = PinnedSession::admit(exchange, expected)?
+            .publish(&mut journal, intent, &negotiated)?
+            .admit_scan(&mut journal, &negotiated)?
+            .collect_selected(&crate::timefmt::rfc3339(crate::timefmt::now_secs()))?
+            .prepare(&mut journal)?;
+        require(
+            prepared.scan["inventoryComplete"] == true
+                && prepared.scan["packages"]
+                    .as_array()
+                    .is_some_and(|packages| !packages.is_empty())
+                && prepared.scanning.request_id == REQUEST
+                && prepared
+                    .scanning
+                    .proof
+                    .scan
+                    .as_ref()
+                    .is_some_and(|scan| scan.finished_boottime_ms.is_none())
+                && prepared.scanning.offer.nonce == "0000000000000009dddddddddddddddd",
+        )?;
+        prepared.scanning.session.check()?;
+        let boot = prepared.scanning.session.context.boot_id.clone();
+        let last = prepared.scanning.session.last;
+        let lease_deadline = prepared.scanning.session.deadline;
+        prepared
+            .scanning
+            .session
+            .exchange
+            .take()
+            .ok_or(ERROR)?
+            .finish()?;
+        require(
+            journal
+                .recover_collection(None)
+                .map_err(|_| ERROR.to_owned())?
+                == super::super::requests::CollectionRecovery::Unfinished,
+        )?;
+        let final_clock = super::super::clock::snapshot().map_err(|_| ERROR.to_owned())?;
+        final_native_clock(&boot, last, lease_deadline, &final_clock)?;
+        require(Instant::now() < deadline)?;
+        Ok(())
+    }
+
+    fn final_native_clock(boot: &str, last: u64, deadline: u64, now: &Clock) -> Result<()> {
+        now.validate().map_err(|_| ERROR.to_owned())?;
+        require(now.boot_id == boot && now.boottime_ms >= last && now.boottime_ms < deadline)
+    }
+
     #[test]
     fn prepared_receipt_keeps_journal_scan_unfinished() {
         let fixture = Fixture::new();
@@ -1429,6 +1688,24 @@ command(10,'await_receipt');response(10,'await_receipt','prepared',evidence=dict
             .finish()
             .unwrap();
         unfinished_at(&fixture, &before, Some(1010));
+    }
+
+    /// Disposable hosted fixture only. Success is not a production witness.
+    #[test]
+    #[ignore = "requires the dedicated restricted native CI service"]
+    #[cfg(target_os = "linux")]
+    fn hosted_real_reporter_rust_journal_roundtrip() {
+        hosted_native_roundtrip().unwrap();
+    }
+
+    #[test]
+    fn final_native_sample_must_keep_boot_and_original_deadline() {
+        assert!(final_native_clock(BOOT, 1012, 10000, &clock(1012)).is_ok());
+        assert!(final_native_clock(BOOT, 1012, 10000, &clock(1011)).is_err());
+        assert!(final_native_clock(BOOT, 1012, 10000, &clock(10000)).is_err());
+        let mut changed = clock(1012);
+        changed.boot_id = "00000000-0000-4000-8000-000000000003".into();
+        assert!(final_native_clock(BOOT, 1012, 10000, &changed).is_err());
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
