@@ -51,7 +51,7 @@ class ProcessSnapshotTests(unittest.TestCase):
     def test_hosted_status_diagnostic_distinguishes_reporter_group(self):
         with tempfile.TemporaryDirectory() as temp:
             root=Path(temp);proc=root/'123';proc.mkdir()
-            status=self.status.replace(b'Groups:\t\n',b'Groups:\t60002\n')
+            status=self.status.replace(b'Groups:\t\n',b'Groups:\t7\n')
             for name,raw in (('stat',self.stat),('status',status),('cgroup',self.cgroup),('mountinfo',self.mounts)):(proc/name).write_bytes(raw)
             fd=os.open(root,os.O_RDONLY|os.O_DIRECTORY);output=io.StringIO()
             try:
@@ -95,6 +95,15 @@ class ProcessSnapshotTests(unittest.TestCase):
             finally:actual(fd)
 
     def test_exact_restricted_fixture(self):self.assertEqual(self.validate(),98765)
+    def test_reporter_primary_group_only_is_admitted(self):
+        original=self.status
+        self.status=original.replace(b'Groups:\t\n',b'Groups:\t60002\n')
+        self.assertEqual(self.validate(),98765)
+        for groups in (b'7',b'60002 7',b'60002 60002'):
+            self.status=original.replace(b'Groups:\t\n',b'Groups:\t'+groups+b'\n')
+            with self.assertRaises(ValueError):self.validate()
+        self.status=original
+
     def test_wrong_process_or_privileges_are_rejected(self):
         for replacement in (self.status.replace(b'Pid:\t123',b'Pid:\t124',1),self.status.replace(b'NoNewPrivs:\t1',b'NoNewPrivs:\t0'),
                 self.status+b'Uid:\t60002 60002 60002 60002\n',self.status.replace(b'Groups:\t\n',b'Groups:\t7\n')):

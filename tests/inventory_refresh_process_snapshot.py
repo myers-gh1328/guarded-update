@@ -2,7 +2,7 @@
 from inventory_refresh_cgroup_witness import process_start_ticks
 from inventory_refresh_reporter_parent import validate_process_view
 from inventory_refresh_resources import mount_rows
-from inventory_refresh_worker import validate_kernel_identity
+from inventory_refresh_reporter_resources import validate_identity
 
 class ProfileError(ValueError):
     pass
@@ -23,7 +23,7 @@ def identity_failure_category(raw):
         if set(fields)!=needed:return 'profile_identity_fields'
         if fields[b'Uid']!=[b'60002']*4:return 'profile_uid'
         if fields[b'Gid']!=[b'60002']*4:return 'profile_gid'
-        if fields[b'Groups']!=[]:return 'profile_groups'
+        if fields[b'Groups'] not in ([],[b'60002']):return 'profile_groups'
         if fields[b'NoNewPrivs']!=[b'1']:return 'profile_nnp'
         if any(fields[key]!=[b'0000000000000000'] for key in needed if key.startswith(b'Cap')):return 'profile_caps'
     except BaseException:pass
@@ -37,7 +37,7 @@ def validate_snapshot(pid,stat,status,cgroup,mountinfo,device):
         stage='profile_stat';start=process_start_ticks(stat,pid)
         stage='profile_view';validate_process_view(status,pid,None)
         stage='profile_identity_fields'
-        try:validate_kernel_identity(status,60002,60002)
+        try:validate_identity(status,60002,60002)
         except BaseException:
             stage=identity_failure_category(status);raise
         stage='profile_cgroup';assert type(cgroup) is bytes and cgroup==CGROUP
