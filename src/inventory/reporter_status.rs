@@ -329,12 +329,34 @@ pub(super) fn validate_status(value: &Value) -> Result<()> {
     Ok(())
 }
 
-struct StatusReader {
+pub(super) struct StatusReader {
     dirs: Vec<File>,
     owner: u32,
     group: u32,
 }
 impl StatusReader {
+    #[cfg(target_os = "linux")]
+    pub(super) fn fixed() -> Result<Self> {
+        unsafe extern "C" {
+            fn geteuid() -> u32;
+            fn getegid() -> u32;
+        }
+        // SAFETY: these identity queries take no pointers and do not modify state.
+        let (uid, gid) = unsafe { (geteuid(), getegid()) };
+        let marker = std::env::var("GITHUB_ACTIONS").ok();
+        admit_fixed(
+            uid,
+            gid,
+            marker.as_deref(),
+            || {
+                let file = File::open("/proc/self/cgroup").map_err(|_| ERROR)?;
+                let mut raw = Vec::new();
+                file.take(4097).read_to_end(&mut raw).map_err(|_| ERROR)?;
+                Ok(raw)
+            },
+            || Self::open_from(File::open("/").map_err(|_| ERROR)?, 0, 60002),
+        )
+    }
     fn open_from(root: File, owner: u32, group: u32) -> Result<Self> {
         let mut dirs = vec![root];
         for part in PARTS {
@@ -382,7 +404,7 @@ impl StatusReader {
             && info.size() > 0
             && info.size() <= 65536
     }
-    fn read(&self, deadline: Instant) -> Result<Value> {
+    pub(super) fn read(&self, deadline: Instant) -> Result<Value> {
         self.read_with(deadline, || {})
     }
     fn read_with(&self, deadline: Instant, after_read: impl FnOnce()) -> Result<Value> {
@@ -436,12 +458,63 @@ impl StatusReader {
     }
 }
 
+fn admit_fixed<T>(
+    uid: u32,
+    gid: u32,
+    marker: Option<&str>,
+    read_group: impl FnOnce() -> Result<Vec<u8>>,
+    open: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    if uid != 60002 || gid != 60002 || marker != Some("true") {
+        return Err(ERROR);
+    }
+    let group = read_group()?;
+    if group!=b"0::/command.slice/command-center.slice/command-center-inventory.slice/command-center-inventory.service\n" {return Err(ERROR);}
+    open()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{StatusReader, validate_status};
     use serde_json::{Value, json};
     use std::os::unix::fs::PermissionsExt;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn fixed_status_gate_denies_before_reading_or_opening_any_status() {
+        use std::cell::Cell;
+        let reads = Cell::new(0);
+        let opens = Cell::new(0);
+        let run = |uid, gid, marker, cgroup: &[u8]| {
+            super::admit_fixed(
+                uid,
+                gid,
+                marker,
+                || {
+                    reads.set(reads.get() + 1);
+                    Ok(cgroup.to_vec())
+                },
+                || {
+                    opens.set(opens.get() + 1);
+                    Ok(())
+                },
+            )
+        };
+        assert!(run(0, 60002, Some("true"), b"ignored").is_err());
+        assert!(run(60002, 0, Some("true"), b"ignored").is_err());
+        assert!(run(60002, 60002, None, b"ignored").is_err());
+        assert_eq!((reads.get(), opens.get()), (0, 0));
+        assert!(run(60002, 60002, Some("true"), b"0::/wrong\n").is_err());
+        assert_eq!((reads.get(), opens.get()), (1, 0));
+        assert!(run(60002,60002,Some("true"),b"0::/command.slice/command-center.slice/command-center-inventory.slice/command-center-inventory.service\n").is_ok());
+        assert_eq!((reads.get(), opens.get()), (2, 1));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn fixed_status_constructor_rejects_ordinary_test_runner() {
+        assert!(StatusReader::fixed().is_err());
+    }
 
     fn status() -> Value {
         json!({"schema_version":1,"operation_nonce":null,"phase":"deferred","reason":"cache_unavailable","policy_generation":"b".repeat(64),"cache_generation":"a".repeat(32),"successful_checked_at":"2026-01-01T00:00:00.123456Z","started_at":null,"finished_at":null,"attempt":null,"observation_lease":null,"observation_receipt":null})
