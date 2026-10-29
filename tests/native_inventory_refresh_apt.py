@@ -1749,7 +1749,7 @@ def prove_rust_reporter_roundtrip(archive,public):
         for item in ('User=60002','Group=60002','Type=exec','Restart=no','RemainAfterExit=no','KillMode=control-group',
             'KillSignal=SIGKILL','TimeoutStopSec=1','RuntimeMaxSec=20','OOMPolicy=kill','TasksMax=8','MemoryAccounting=yes','NoNewPrivileges=yes','CapabilityBoundingSet=',
             'AmbientCapabilities=','Delegate=no','ProtectSystem=strict','ProtectHome=yes','ProtectControlGroups=yes',
-            'ProtectKernelTunables=yes','PrivateDevices=yes','PrivateTmp=yes','PrivateNetwork=yes','ReadOnlyPaths=/sys/fs/cgroup',
+            'ProtectKernelTunables=yes','PrivateDevices=yes','PrivateTmp=yes','PrivateNetwork=yes','ReadOnlyPaths=/sys/fs/cgroup','MountFlags=private',
             'ReadWritePaths=/run/command-center-inventory-refresh/observation /run/command-center-inventory-refresh/release'):
             args+=['-p',item]
         args+=['/usr/local/libexec/command-center-inventory','--exact',
