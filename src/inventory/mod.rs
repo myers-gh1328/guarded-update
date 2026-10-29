@@ -394,6 +394,45 @@ mod tests {
     fn synthetic_revoked_signature_is_rejected() {
         assert_eq!(fixture_signature_status("device.key"), 401);
     }
+    #[test]
+    #[ignore = "requires the private disposable Command Center TLS fixture"]
+    fn synthetic_offline_preserves_latest() {
+        let root = std::path::PathBuf::from(
+            std::env::var("GUARDED_UPDATE_INVENTORY_FIXTURE_ROOT").unwrap(),
+        );
+        state::protected(&root, true).unwrap();
+        let port = std::fs::read_to_string(root.join("port"))
+            .unwrap()
+            .parse::<u16>()
+            .unwrap();
+        let mut config = config(&root);
+        config.server_url = format!("https://127.0.0.1:{port}");
+        config.device_id = "test-pi".into();
+        config.enrollment_id = "00000000-0000-4000-8000-000000000001".into();
+        config.key_id = "synthetic-key".into();
+        config.reporting_private_key_file = root.join("device.key");
+        config.state_dir = root.join("agent-state");
+        let mut store = Store::load(&config.state_dir, &config.enrollment_id).unwrap();
+        let before = state::read(&config.state_dir.join("latest.json"), state::MAX_REPORT).unwrap();
+        let acknowledged = store.schedule.acknowledged_sha256.clone();
+        let now = crate::timefmt::now_secs() as u64;
+        assert!(
+            pass(
+                &config,
+                &mut store,
+                &FailedCollector,
+                &FixtureNetwork(root.join("server.pem")),
+                now + 2
+            )
+            .is_err()
+        );
+        assert_eq!(
+            state::read(&config.state_dir.join("latest.json"), state::MAX_REPORT).unwrap(),
+            before
+        );
+        assert_eq!(store.schedule.acknowledged_sha256, acknowledged);
+        assert_eq!(store.schedule.sequence, 1);
+    }
     struct FakeNetwork {
         offline: bool,
         calls: RefCell<Vec<Value>>,
