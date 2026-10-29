@@ -91,6 +91,10 @@ class ReporterEnvironment:
         except BaseException as exc:self._consume(exc)
 
     def pin_current(self):
+        return self._pin_with_clock(None)
+
+    def _pin_with_clock(self,clock):
+        """Private trusted composition seam; never a wire clock/deadline option."""
         try:
             _require(not self._closed and not self._poisoned and not self._pin_attempted)
             self._pin_attempted=True  # Latch before status or any acquisition.
@@ -100,7 +104,7 @@ class ReporterEnvironment:
             boot,_=self.clock()
             self._session=ReaderSession.pin(self._cache,cache_generation=document['cache_generation'],
                 policy_generation=document['policy_generation'],successful_checked_at=document['successful_checked_at'],
-                boot_id=boot,clock=self._parent.clock)
+                boot_id=boot,clock=self._parent.clock if clock is None else clock)
             return self.pinned_context()
         except BaseException as exc:self._consume(exc)
 

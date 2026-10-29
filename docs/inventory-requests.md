@@ -297,3 +297,28 @@ these ports supply no durable authorization themselves. Actual inbox write
 access requires separately reviewed provisioning under the intended restricted
 profile. The owner is not wired into an executable or admitted production
 source bundle.
+
+Its staged scan phases now wait for a fresh Root offer matching the bound nonce
+and pass the exact proposed native start through a trusted acknowledgment
+callback before the first installed-state fingerprint. The future parent must
+fsync that exact start before acknowledging it. Missing or unrelated status may
+poll within the original budget; a matching nonce with the wrong boot,
+generation or policy consumes the owner. Fixed data reads run only inside this
+scan. Freeze records the actual final fingerprint and endpoints before release.
+
+The runtime's absolute120second admission budget also reaches every session
+fingerprint and query supervisor, even if a later Root lease lasts longer. A
+private capped clock latches failure without prematurely closing a running
+query's cache pin: query pipes/child and hash descriptors unwind first, then the
+session pin and remaining environment close. The public read-only environment's
+default pin behavior is unchanged; this composition seam is not a wire clock
+or caller deadline option.
+
+Only a frozen scan followed by its exact release can prepare evidence. The
+session verifies the own Root receipt, all hashes and actual interval and closes
+its pin before returning bounded evidence. Prepared evidence is still an
+uncommitted proposal. It permits no further tools or publication, while its
+admitted clock stays alive for the eventual terminal pipe write. A cleanup-only
+release without a scan cannot prepare evidence. These phase fixtures establish
+neither production source bootstrap nor the parent journal handshake, native
+Root composition, all-producer quiescence or a completion witness.
