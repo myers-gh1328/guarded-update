@@ -1592,13 +1592,7 @@ command(10,'await_receipt');response(10,'await_receipt','prepared',evidence=dict
         require(Instant::now() < deadline)?;
         #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
         {
-            // The fixture owns these control pipes exclusively until restoration.
-            super::super::reporter_barrier::handshake(
-                &std::io::stdin(),
-                &std::io::stderr(),
-                deadline,
-            )
-            .map_err(|_| ERROR.to_owned())?;
+            hosted_barrier(deadline)?;
             let after = super::super::reporter_direct_clock::snapshot(deadline)
                 .map_err(|_| ERROR.to_owned())?;
             final_native_clock(&boot, final_clock.boottime_ms, lease_deadline, &after)?;
@@ -1608,6 +1602,18 @@ command(10,'await_receipt');response(10,'await_receipt','prepared',evidence=dict
         {
             Err(ERROR.into())
         }
+    }
+
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "aarch64", target_arch = "x86_64")
+    ))]
+    #[allow(clippy::disallowed_methods)]
+    fn hosted_barrier(deadline: std::time::Instant) -> Result<()> {
+        // Stderr is the fixture's private control pipe, not a logging surface.
+        // Both shared descriptions remain exclusively owned through restoration.
+        super::super::reporter_barrier::handshake(&std::io::stdin(), &std::io::stderr(), deadline)
+            .map_err(|_| ERROR.to_owned())
     }
 
     fn final_native_clock(boot: &str, last: u64, deadline: u64, now: &Clock) -> Result<()> {

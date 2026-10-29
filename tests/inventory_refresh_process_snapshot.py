@@ -4,29 +4,35 @@ from inventory_refresh_reporter_parent import validate_process_view
 from inventory_refresh_resources import mount_rows
 from inventory_refresh_worker import validate_kernel_identity
 
+class ProfileError(ValueError):
+    pass
+
+
 CGROUP=b'0::/command.slice/command-center.slice/command-center-inventory.slice/command-center-inventory.service\n'
 
 
 def validate_snapshot(pid,stat,status,cgroup,mountinfo,device):
+    stage='profile_device'
     try:
         assert type(device) is tuple and len(device)==2 and all(type(v) is int and v>=0 for v in device)
-        start=process_start_ticks(stat,pid)
-        validate_process_view(status,pid,None);validate_kernel_identity(status,60002,60002)
-        assert type(cgroup) is bytes and cgroup==CGROUP
-        rows=mount_rows(mountinfo).values()
+        stage='profile_stat';start=process_start_ticks(stat,pid)
+        stage='profile_status';validate_process_view(status,pid,None);validate_kernel_identity(status,60002,60002)
+        stage='profile_cgroup';assert type(cgroup) is bytes and cgroup==CGROUP
+        stage='profile_mount';rows=mount_rows(mountinfo).values()
         groups=[row for row in rows if row['fs']==b'cgroup2']
         assert groups and all(b'ro' in row['options'] and row['device']==device for row in groups)
         root=[row for row in groups if row['path']=='/sys/fs/cgroup' and row['root']=='/']
         assert len(root)==1
         assert not any(row['path'].startswith('/sys/fs/cgroup/') for row in rows)
         return start
-    except BaseException:raise ValueError('Process profile unavailable') from None
+    except BaseException:raise ProfileError(stage) from None
 
 
 import math
 import os
 import stat as filetype
 import time
+import sys
 
 
 class ProcessProbe:
@@ -110,15 +116,24 @@ class ProcessProbe:
         self._check();return bytes(raw)
 
     def sample(self):
+        stage='check'
         try:
-            self._check();first=self._read('stat',8192)
-            status=self._read('status',65536);group=self._read('cgroup',4096);mount=self._read('mountinfo',1024*1024)
-            start=validate_snapshot(self._pid,first,status,group,mount,self._device)
-            assert process_start_ticks(self._read('stat',8192),self._pid)==start
+            self._check();stage='stat';first=self._read('stat',8192)
+            stage='status';status=self._read('status',65536)
+            stage='cgroup';group=self._read('cgroup',4096)
+            stage='mountinfo';mount=self._read('mountinfo',1024*1024)
+            stage='profile';start=validate_snapshot(self._pid,first,status,group,mount,self._device)
+            stage='stat_recheck';assert process_start_ticks(self._read('stat',8192),self._pid)==start
             assert self._start is None or self._start==start
-            self._start=start;self._check();return start
-        except BaseException:
-            self._failed=True;raise ValueError('Process profile unavailable') from None
+            stage='final';self._start=start;self._check();return start
+        except BaseException as exc:
+            self._failed=True
+            labels={'check','stat','status','cgroup','mountinfo','profile','stat_recheck','final',
+                'profile_device','profile_stat','profile_status','profile_cgroup','profile_mount'}
+            if isinstance(exc,ProfileError) and str(exc) in labels:stage=str(exc)
+            if os.geteuid()==0 and os.environ.get('GITHUB_ACTIONS')=='true' and stage in labels:
+                print('Native fixture process probe stage='+stage,file=sys.stderr)
+            raise ValueError('Process profile unavailable') from None
 
     def close(self):
         if self._closed:

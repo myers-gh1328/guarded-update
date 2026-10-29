@@ -1,6 +1,8 @@
 """Untrusted fixture bytes: no live PID or namespace authority."""
 import unittest
 import os
+import io
+import contextlib
 import tempfile
 import time
 from unittest.mock import patch
@@ -43,6 +45,20 @@ class ProcessSnapshotTests(unittest.TestCase):
                 owner=ProcessProbe._from_directory(fd,123,(0,27),time.monotonic()+2,owner=os.getuid())
                 proc.rename(root/'old');proc.mkdir()
                 with self.assertRaises(ValueError):owner.sample()
+                owner.close()
+            finally:os.close(fd)
+
+    def test_hosted_failure_reports_only_fixed_probe_stage(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp);proc=root/'123';proc.mkdir()
+            for name,raw in (('stat',self.stat),('status',self.status),('cgroup',self.cgroup),('mountinfo',self.mounts.replace(b' ro,nosuid',b' rw,nosuid'))):
+                (proc/name).write_bytes(raw)
+            fd=os.open(root,os.O_RDONLY|os.O_DIRECTORY);output=io.StringIO()
+            try:
+                owner=ProcessProbe._from_directory(fd,123,(0,27),time.monotonic()+2,owner=os.getuid())
+                with patch('inventory_refresh_process_snapshot.os.geteuid',return_value=0),patch.dict(os.environ,{'GITHUB_ACTIONS':'true'}),contextlib.redirect_stderr(output):
+                    with self.assertRaises(ValueError):owner.sample()
+                self.assertEqual(output.getvalue(),'Native fixture process probe stage=profile_mount\n')
                 owner.close()
             finally:os.close(fd)
 

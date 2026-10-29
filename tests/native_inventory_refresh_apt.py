@@ -1974,6 +1974,9 @@ def prove_actual_coordinator_entry_loop(archive):
         packaged=prove_packaged_reporter_roundtrip(archive,public)
         receipt=packaged['evidence']['observation_receipt']
         assert receipt['nonce']=='0000000000000008'+'d'*16 and packaged['mechanics_only'] is True
+        # The Rust attempt may publish a newer receipt even when its witness
+        # fails. Do not demand the obsolete OBS8 receipt during failure cleanup.
+        receipt=None
         receipt=prove_rust_reporter_roundtrip(archive,public)
         assert receipt['nonce']=='0000000000000009'+'d'*16
         invalidate_policy()

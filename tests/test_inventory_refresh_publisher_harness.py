@@ -129,6 +129,7 @@ class PublisherHarnessTests(unittest.TestCase):
         code=ast.unparse(node)
         self.assertLess(code.index('prove_packaged_reporter_roundtrip'),code.index('prove_rust_reporter_roundtrip'))
         self.assertIn('restricted_rust_parent_real_reporter_journal_mechanics_verified',code)
+        self.assertIn('receipt = None\n        receipt = prove_rust_reporter_roundtrip',code)
 
     def test_rust_barrier_control_frames_are_bounded(self):
         tree=ast.parse((Path(__file__).parent/'native_inventory_refresh_apt.py').read_bytes())
