@@ -109,3 +109,41 @@ native work and keeps new request intake outside the daily scan. The daily outpu
 cannot be retroactively assigned to a request received during collection. Runtime
 configuration, executable wiring and native observation verification remain gates;
 this library slice alone does not enable device requests.
+
+## Native observation and release staging
+
+Private client journal version 2 retains a required nullable `native_attempt`.
+Its observation nonce, boot identity and admission time correlate one Root scope;
+its required nullable `release_requested_boottime_ms` freezes the first cleanup
+intent. These are recovery metadata, not authority to restart an observation.
+Runtime opening rejects earlier or incomplete journal formats without changing
+their bytes. Root journal, public status and report schemas are unchanged.
+
+Native collection admission first commits the submitted marker and observation
+counter. A separate one-use publication gate checks the current negotiation,
+boot, journal snapshot and process-lock ownership before the fixed bounded
+nonce-publication callback. Only its successful return yields the token accepted
+by native scan attachment. Generic progress and report binding cannot introduce
+the first native scan. Scan attachment still requires the adapter to verify the
+actual Root opening before any OS reads.
+
+Release preparation persists the first cleanup-intent time before any release
+publication. It revokes earlier work tokens and remains available for the exact
+retained scope after logical source cancellation, canonical failure or reopening.
+It never allocates a new observation nonce. A separate one-use release gate checks
+the persisted scope, boot, monotonic time and snapshot before and after its fixed
+callback. Repeated preparation preserves the first time. That time describes
+local intent, including release of an observation still pending at Root; it does
+not assert that Root opened or accepted anything.
+
+Both callbacks run while the existing process lock and journal mutex protect the
+snapshot. They must finish at bounded fsynced nonce publication and must not call
+any journal operation, even through another handle, or wait for a lease, scan or
+receipt. The trusted bridge must bind the release callback to the literal release
+port. These staged APIs alone do not enforce that external binding.
+
+Publication failure, missing status, elapsed time or a release file cannot clear
+the physical-work fence. Even successful release publication leaves the attempt
+unfinished until verified Root cleanup and all reporter-owned resources closing
+can be bound to that exact scope. There is no cleanup-completion transition in
+this slice, and no executable, capability advertisement or device activation.
