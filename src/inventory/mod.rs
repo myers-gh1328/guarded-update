@@ -14,6 +14,8 @@ mod process;
 mod reporter_frame;
 #[cfg(test)]
 mod reporter_obs;
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+mod reporter_pipe;
 #[cfg(test)]
 mod requests;
 mod state;
