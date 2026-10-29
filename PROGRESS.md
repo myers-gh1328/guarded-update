@@ -12,14 +12,15 @@ Updated: 2026-10-29
 - [x] Fixed reader/environment, durable journal gates, selected-generation normalization and bounded codec/pipe libraries.
 - [x] Fixed publication owner, reviewed and tested.
 - [x] Scan phases with a shared capped native clock, exact start ACK before hashing, frozen end and own-receipt prepared evidence.
-- [ ] Managed dispatcher, fixed source bootstrap, Rust Tools/coordinator bridge and native end-to-end proof. <- next
+- [x] Managed bounded dialogue, exact nested scan ACK and prepared-only terminal output with all-owner cleanup.
+- [ ] Fixed source bootstrap, Rust Tools/coordinator bridge and native end-to-end proof. <- next
 - [ ] Concrete process-set cleanup witness, owned cache retirement, measured fit, disabled provisioning and rollout verification.
 
 ## Last check
-554 helper tests passed11.163s, including50 runtime tests; both independent source reviews and diff checks clear. Publication commit31a0fd5 passed all14 hosted jobs in run40819116613. No production activation.
+569 helper tests passed11.375s, including15 real-pipe dialogue tests; both independent source reviews and diff checks clear. Scan phase ef65de0 passed all14 hosted jobs in CI40820627723. No production activation.
 
 ## Next action
-Complete full helper verification and commit the scan phases, then connect their bounded pipe dialogue. Keep this draft integration PR open; remove this temporary progress file before merge.
+Verify and commit the dialogue, then implement the fixed reporter source bootstrap and native managed roundtrip. Keep this draft integration PR open; remove this temporary progress file before merge.
 
 ## Waiting on
 Nothing for current implementation; no owner clarification is needed.

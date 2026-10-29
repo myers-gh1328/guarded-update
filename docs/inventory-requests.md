@@ -322,3 +322,19 @@ admitted clock stays alive for the eventual terminal pipe write. A cleanup-only
 release without a scan cannot prepare evidence. These phase fixtures establish
 neither production source bootstrap nor the parent journal handshake, native
 Root composition, all-producer quiescence or a completion witness.
+
+The staged managed dialogue now joins these owners over bounded pipes. Its
+channel must use this runtime's exact bound clock. One command decoder spans
+the nested admission handshake: an actual Root offer produces a proposed start,
+and only the next exact `scan_admitted` command for that same start can permit
+the first fingerprint. Publication acknowledgements are written before the
+dialogue waits for Root. Fixed data responses exhaust their bounded chunk
+iterator before accepting another command.
+
+Its terminal `prepared` response carries receipt-checked evidence while the
+clock owner remains alive. It then closes runtime and channel, attempting both
+even after error. A close failure still fails the dialogue after visible final
+bytes; no further command is processed. Caller-owned original descriptors,
+child exit, process-set cleanup and durable journal/source gates remain
+separate. This is a private capability composition library with real-pipe
+fixtures, not an activated executable or native completion proof.
