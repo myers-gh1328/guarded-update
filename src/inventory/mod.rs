@@ -13,6 +13,8 @@ mod process;
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 mod reporter_barrier;
 #[cfg(test)]
+mod reporter_direct_clock;
+#[cfg(test)]
 mod reporter_frame;
 #[cfg(all(
     test,

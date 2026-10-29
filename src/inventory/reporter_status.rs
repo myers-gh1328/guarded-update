@@ -43,7 +43,7 @@ fn before(deadline: Instant) -> Result<()> {
         Err(ERROR)
     }
 }
-fn open_child(parent: &File, name: &[u8], directory: bool) -> Result<File> {
+pub(super) fn open_child(parent: &File, name: &[u8], directory: bool) -> Result<File> {
     if !name.ends_with(&[0]) || name[..name.len() - 1].contains(&0) {
         return Err(ERROR);
     }
