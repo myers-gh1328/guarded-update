@@ -279,3 +279,21 @@ and clock still close before exit. EOF, exit status, producer quiescence and all
 parent cleanup must be verified separately before any completion witness. Real
 pipe tests establish I/O mechanics only; this layer is not wired into production
 or the native Root proof source closure.
+
+The staged fixed publication owner admits the environment before constructing
+exactly two literal ports: observation and release. It exposes no capability,
+path or identity selection. A pin is required before its one observation
+publication, and its one release must carry exactly that original nonce.
+Transferred fixture capabilities must have distinct correct roles and belong
+to the same environment runtime ancestor and current numerical identity.
+
+Each phase latches before effects, with parent and ancestry verification on
+both sides. A failed write or postverification consumes every owner, even if
+the request file is visible. Release, observation and environment closes are
+all attempted once. Neither successful publication nor a logical failure
+proves Root acceptance, physical cleanup, cancellation or readiness. The parent
+must still hold its existing process lock and use its fsynced journal gate;
+these ports supply no durable authorization themselves. Actual inbox write
+access requires separately reviewed provisioning under the intended restricted
+profile. The owner is not wired into an executable or admitted production
+source bundle.
