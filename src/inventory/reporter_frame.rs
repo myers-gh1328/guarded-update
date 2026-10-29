@@ -60,7 +60,7 @@ impl<'de> Deserialize<'de> for Unique {
     }
 }
 
-fn parse_frame(raw: &[u8]) -> Result<Value, &'static str> {
+pub(super) fn parse_frame(raw: &[u8]) -> Result<Value, &'static str> {
     const ERROR: &str = "Invalid private reporter frame";
     if raw.is_empty()
         || raw.len() > 256 * 1024

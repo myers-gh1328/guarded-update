@@ -13,6 +13,8 @@ mod process;
 #[cfg(test)]
 mod reporter_frame;
 #[cfg(test)]
+mod reporter_obs;
+#[cfg(test)]
 mod requests;
 mod state;
 mod transport;
