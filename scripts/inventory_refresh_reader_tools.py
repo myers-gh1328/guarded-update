@@ -1,4 +1,4 @@
-"""Fixed reporter policy query; not an executable or general subprocess API.
+"""Fixed reporter data reads; not an executable or general subprocess API.
 
 The managed reporter must prove its own cgroup teardown separately. A timeout or
 failed child cleanup here can never become a Root receipt or retry permission.
@@ -54,6 +54,25 @@ def _fixed_generation(cache,generation):
 
 def _policy(cache,generation,packages,clock,expiry,limit):
     packages=_ids(packages)
+    return _query(cache,generation,['/usr/bin/apt-cache','policy',*packages],clock,expiry,limit)
+
+
+def _fixed_read(cache,generation,operation,clock,expiry,limit):
+    commands={
+        'installed':(['/usr/bin/dpkg-query','--admindir=/var/lib/dpkg','--show',
+            '--showformat=${db:Status-Status}\\t${binary:Package}\\t${Version}\\t${Architecture}\\n'],8*1024*1024),
+        'architecture':(['/usr/bin/dpkg','--admindir=/var/lib/dpkg','--print-architecture'],128),
+        'holds':(['/usr/bin/apt-mark','-o','Dir::Cache::pkgcache=','-o','Dir::Cache::srcpkgcache=','showhold'],1024*1024),
+        'owners':(['/usr/bin/dpkg-query','--admindir=/var/lib/dpkg','--search','/usr/share/applications/*.desktop'],1024*1024),
+    }
+    _require(type(operation) is str and operation in commands)
+    argv,maximum=commands[operation]
+    return _query(cache,generation,argv,clock,expiry,min(maximum,limit))
+
+
+def _query(cache,generation,argv,clock,expiry,limit):
+    # Only this module's fixed operation constructors select argv. No session,
+    # native protocol or executable interface exposes this private supervisor.
     _require(type(limit) is int and 0<limit<=16*1024*1024)
     # Keep one second of the original observation for finishing/release. This
     # reserve is not a guarantee that Root or reporter cleanup will finish.
@@ -66,7 +85,7 @@ def _policy(cache,generation,packages,clock,expiry,limit):
         remaining();verify();remaining()
         process=None;selector=None;output=bytearray();failed=False
         try:
-            process=subprocess.Popen(['/usr/bin/apt-cache','policy',*packages],
+            process=subprocess.Popen(argv,
                 env={'PATH':'/usr/sbin:/usr/bin:/sbin:/bin','LC_ALL':'C','LANG':'C','APT_CONFIG':config},
                 cwd='/',stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,
                 close_fds=True,start_new_session=True)

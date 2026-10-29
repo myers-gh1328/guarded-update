@@ -81,6 +81,65 @@ class ReaderSessionTests(unittest.TestCase):
         with self.assertRaises(ValueError):session.policy(['synthetic'])
         session.close()
 
+    def test_fixed_installed_read_is_once_only_and_within_the_same_scan(self):
+        session=self.pin();self.start(session)
+        self.assertTrue(callable(getattr(session,'installed',None)))
+        with patch('inventory_refresh_reader_tools._fixed_read',return_value='installed\tsynthetic\t1\tall\n') as read:
+            self.assertEqual(session.installed(),'installed\tsynthetic\t1\tall\n')
+            self.assertEqual(read.call_args.args[2],'installed')
+            with self.assertRaises(ValueError):session.installed()
+            read.assert_called_once()
+        with self.assertRaises(ValueError):session.finish_scan()
+
+    def test_fixed_data_methods_have_no_inputs_and_each_runs_once(self):
+        for name,operation in [('native_architecture','architecture'),('holds','holds'),('desktop_owners','owners')]:
+            self.now=100;session=self.pin();self.start(session)
+            method=getattr(session,name)
+            with self.subTest(name=name),patch('inventory_refresh_reader_tools._fixed_read',return_value='synthetic') as read:
+                self.assertEqual(method(),'synthetic')
+                self.assertEqual(read.call_args.args[2],operation)
+                with self.assertRaises(ValueError):method()
+                read.assert_called_once()
+            with self.assertRaises(ValueError):session.finish_scan()
+
+    def test_data_and_policy_reads_share_one_aggregate_output_budget(self):
+        session=self.pin();self.start(session)
+        with patch('inventory_refresh_reader_tools._fixed_read',return_value='a'*(8*1024*1024)) as read:
+            session.installed()
+            with patch('inventory_refresh_reader_tools._policy',side_effect=['a'*(16*1024*1024)]*3+['a'*(8*1024*1024)]) as query:
+                for _ in range(4):session.policy(['synthetic'])
+                self.assertEqual(query.call_args.args[-1],8*1024*1024)
+                with self.assertRaises(ValueError):session.holds()
+            read.assert_called_once()
+
+    def test_optional_owner_failure_is_not_empty_success_or_scan_completion(self):
+        session=self.pin();self.start(session)
+        with patch('inventory_refresh_reader_tools._fixed_read',side_effect=ValueError('synthetic no matches')) as read:
+            with self.assertRaises(ValueError):session.desktop_owners()
+            with self.assertRaises(ValueError):session.policy(['synthetic'])
+            with self.assertRaises(ValueError):session.finish_scan()
+            read.assert_called_once()
+
+    def test_data_read_before_admission_never_calls_a_tool(self):
+        for name in ('installed','native_architecture','holds','desktop_owners'):
+            self.now=100;session=self.pin()
+            with self.subTest(name=name),patch('inventory_refresh_reader_tools._fixed_read') as read:
+                with self.assertRaises(ValueError):getattr(session,name)()
+                read.assert_not_called()
+            with self.assertRaises(ValueError):self.start(session)
+
+    def test_data_tool_cannot_close_or_reenter_session_and_return_output(self):
+        for mutation in ('closed','reentry'):
+            self.now=100;session=self.pin();self.start(session)
+            def invalidated(*_):
+                if mutation=='closed':session.close()
+                else:
+                    with self.assertRaises(ValueError):session.policy(['synthetic'])
+                return 'never publish'
+            with self.subTest(mutation=mutation),patch('inventory_refresh_reader_tools._fixed_read',side_effect=invalidated):
+                with self.assertRaises(ValueError):session.installed()
+                with self.assertRaises(ValueError):session.finish_scan()
+
     def test_policy_query_budget_is_cumulative_and_failure_consumes_session(self):
         session=self.pin();self.start(session)
         with patch('inventory_refresh_reader_tools._policy',return_value='synthetic') as query:

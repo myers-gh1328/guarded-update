@@ -51,6 +51,33 @@ class PolicyToolsTests(unittest.TestCase):
                 with self.assertRaises(ValueError):self.query(packages)
         self.assertEqual(self.calls,[])
 
+    def test_data_operations_select_exact_commands_and_no_caller_options(self):
+        commands={
+            'installed':['/usr/bin/dpkg-query','--admindir=/var/lib/dpkg','--show','--showformat=${db:Status-Status}\\t${binary:Package}\\t${Version}\\t${Architecture}\\n'],
+            'architecture':['/usr/bin/dpkg','--admindir=/var/lib/dpkg','--print-architecture'],
+            'holds':['/usr/bin/apt-mark','-o','Dir::Cache::pkgcache=','-o','Dir::Cache::srcpkgcache=','showhold'],
+            'owners':['/usr/bin/dpkg-query','--admindir=/var/lib/dpkg','--search','/usr/share/applications/*.desktop'],
+        }
+        for operation,argv in commands.items():
+            with self.subTest(operation=operation),self.fixture("print('synthetic')"):
+                self.assertEqual(tools._fixed_read(self,'a'*32,operation,lambda:100,100000,64*1024*1024),'synthetic\n')
+                self.assertEqual(self.calls[-1][0],argv)
+                self.assertEqual(self.calls[-1][1]['env']['APT_CONFIG'],'/synthetic-reader/apt.conf')
+        self.calls.clear()
+        for invalid in ('update','install','/usr/bin/apt-get','architecture --root=/other',[],None):
+            with self.subTest(invalid=invalid),self.fixture("raise Exception('never')"):
+                with self.assertRaises(ValueError):tools._fixed_read(self,'a'*32,invalid,lambda:100,100000,100)
+        self.assertEqual(self.calls,[])
+
+    def test_data_operation_limits_are_enforced_before_returning_output(self):
+        for operation,maximum in [('installed',8*1024*1024),('architecture',128),('holds',1024*1024),('owners',1024*1024)]:
+            with self.subTest(operation=operation),self.fixture('import os;os.write(1,b"a"*'+str(maximum+1)+')'):
+                with self.assertRaises(ValueError):tools._fixed_read(self,'a'*32,operation,lambda:100,100000,64*1024*1024)
+
+    def test_optional_owner_nonzero_is_not_known_empty_output(self):
+        with self.fixture('raise SystemExit(1)'):
+            with self.assertRaises(ValueError):tools._fixed_read(self,'a'*32,'owners',lambda:100,100000,100)
+
     def test_bound_is_streamed_and_exact_bound_is_accepted(self):
         with self.fixture("import os;os.write(1,b'a'*8)"):
             self.assertEqual(self.query(limit=8),'a'*8)

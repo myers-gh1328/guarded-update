@@ -40,6 +40,8 @@ class PublisherHarnessTests(unittest.TestCase):
         self.assertEqual(sources[-2:],(('inventory_refresh_reader_session','inventory_refresh_reader_session.py'),('inventory_refresh_reporter_io','inventory_refresh_reporter_io.py')))
         self.assertIn('Synthetic seam only',code)
         self.assertIn("session.policy(['inventory-proof'])",code)
+        for method in ('installed','native_architecture','holds'):
+            self.assertIn('session.'+method+'()',code)
         self.assertNotIn('subprocess.run(',code)
         setup=next(node for node in tree.body if isinstance(node,ast.FunctionDef) and node.name=='prove_reporter_library_roundtrip')
         copy_loop=next(node for node in setup.body if isinstance(node,ast.For))

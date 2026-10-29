@@ -1123,6 +1123,22 @@ try:
  for chain in chains:chain.verify()
  # Synthetic seam only: this is NOT a durable reporting RequestJournal proof.
  session.begin_scan(value,observation_nonce=nonce,dpkg_fd=chains[2].fds[-1],owner=0,admit_scan=lambda _:True)
+ records=session.installed()
+ rows=[line.split('\t') for line in records.splitlines() if line.startswith('installed\t')]
+ assert rows and all(len(row)==4 and all(row[1:]) for row in rows)
+ architecture=session.native_architecture().strip()
+ assert re.fullmatch('[a-z0-9][a-z0-9-]{0,63}',architecture)
+ holds=session.holds().splitlines()
+ assert all(re.fullmatch('[a-z0-9][a-z0-9+.-]{0,255}(?::[a-z0-9][a-z0-9+.-]{0,255})?',name) for name in holds)
+ # Independent native selection reference only, not a second normalizer. Empty
+ # real hold sets stay empty; no package selection is changed for this proof.
+ with open('/var/lib/dpkg/status','rb') as source:selection_bytes=source.read(64*1024*1024+1)
+ assert len(selection_bytes)<=64*1024*1024
+ selected=set()
+ for paragraph in selection_bytes.decode('utf-8').split('\n\n'):
+  fields=dict(line.split(': ',1) for line in paragraph.splitlines() if ': ' in line and not line.startswith((' ','\t')))
+  if fields.get('Status','').split(' ',1)[0]=='hold':selected.add(fields['Package'])
+ assert {name.split(':')[0] for name in holds}==selected
  result=session.policy(['inventory-proof'])
  assert re.search(r'(?m)^\s*Candidate: 1\.0\s*$',result)
  assert re.search(r'(?m)^\s*(?:\*\*\*\s+)?1\.0\s+123\s*$',result)

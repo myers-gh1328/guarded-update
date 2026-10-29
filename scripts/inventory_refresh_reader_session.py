@@ -35,7 +35,7 @@ class ReaderSession:
         value._generation=cache_generation;value._policy=policy_generation
         value._checked=successful_checked_at
         value._phase='pinned';value._offer=None
-        value._policy_calls=0;value._policy_bytes=0
+        value._policy_calls=0;value._policy_bytes=0;value._data_reads=set()
         try:
             value._time()
             context=cache.lease_current()
@@ -139,6 +139,36 @@ class ReaderSession:
             self._verify_projection();self._scan_time()
             text=_policy(self._cache,self._generation,packages,self._scan_time,
                 self._offer['expires_boottime_ms'],min(16*1024*1024,64*1024*1024-self._policy_bytes))
+            self._policy_bytes+=len(text.encode('utf-8'))
+            _require(not self._closed and self._phase=='querying')
+            self._verify_projection();self._scan_time()
+            _require(not self._closed and self._phase=='querying')
+            self._phase='scanning'
+            return text
+        except BaseException:
+            self.close()
+            raise
+
+    def installed(self):
+        return self._fixed_data('installed')
+
+    def native_architecture(self):
+        return self._fixed_data('architecture')
+
+    def holds(self):
+        return self._fixed_data('holds')
+
+    def desktop_owners(self):
+        return self._fixed_data('owners')
+
+    def _fixed_data(self,operation):
+        try:
+            _require(not self._closed and self._phase=='scanning' and operation not in self._data_reads and self._policy_bytes<64*1024*1024)
+            from inventory_refresh_reader_tools import _fixed_read
+            self._phase='querying';self._data_reads.add(operation)
+            self._verify_projection();self._scan_time()
+            text=_fixed_read(self._cache,self._generation,operation,self._scan_time,
+                self._offer['expires_boottime_ms'],64*1024*1024-self._policy_bytes)
             self._policy_bytes+=len(text.encode('utf-8'))
             _require(not self._closed and self._phase=='querying')
             self._verify_projection();self._scan_time()

@@ -148,7 +148,7 @@ unfinished until verified Root cleanup and all reporter-owned resources closing
 can be bound to that exact scope. There is no cleanup-completion transition in
 this slice, and no executable, capability advertisement or device activation.
 
-The staged reporter session now exposes one fixed APT policy query during its
+The staged reporter session exposes a fixed APT policy query during its
 admitted scan. It accepts at most 300 distinct canonical binary package IDs and
 selects the immutable generation's `APT_CONFIG` internally. It accepts no caller
 command, option, environment or path. Root-owned ancestry and the held generation
@@ -161,5 +161,18 @@ Root lease, reserving one second for later finishing/release. EOF and successful
 direct-child exit are both required; failure consumes the session. Cleanup closes
 owned resources and uses a bounded wait for the directly owned child. It cannot
 prove descendant teardown or Root cleanup; the managed reporter's cgroup and
-receipt gates remain required. Other fixed tools, Rust normalization integration,
-and production source/bootstrap wiring remain unfinished.
+receipt gates remain required.
+
+Four additional reads accept no arguments: installed packages, native package
+architecture, holds and desktop package ownership. Each can run only once per
+scan and shares the same aggregate output and original lease budgets. The dpkg
+commands explicitly select the fingerprinted `/var/lib/dpkg` database. Fixed
+per-operation output caps are 8MiB, 128 bytes, 1MiB and 1MiB respectively. A failed
+optional desktop lookup consumes this strict session; the future Rust adapter
+must explicitly skip unsupported enrichment and retain partial coverage.
+
+Rust normalization integration and production source/bootstrap wiring remain
+unfinished. Native verification exercises installed, architecture and hold reads
+inside the same fingerprint window as policy. It compares real hold selections
+without changing them; a positive nonempty hold or desktop lookup on every target
+is not established by an empty runner hold set.
