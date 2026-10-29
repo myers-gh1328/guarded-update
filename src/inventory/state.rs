@@ -218,6 +218,9 @@ impl Store {
             return Err("Inventory report exceeds 8 MiB encoded limit".into());
         }
         atomic(&self.dir.join("latest.json"), &bytes)?;
+        self.finish_replacement(now)
+    }
+    pub fn finish_replacement(&mut self, now: u64) -> Result<(), String> {
         self.schedule.collected_at_secs = now;
         let jitter = u64::from_str_radix(&super::transport::random_hex(2)?, 16)
             .map_err(|_| "Collection jitter unavailable")?
