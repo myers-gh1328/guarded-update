@@ -30,7 +30,7 @@ trait Exchange {
     fn write(&mut self, raw: &[u8]) -> Result<()>;
     fn close(&mut self) -> Result<()>;
     fn host_metadata(&mut self, kind: HostMetadata) -> Result<String>;
-    fn root_receipt(&mut self) -> Result<serde_json::Value>;
+    fn root_status(&mut self, receipt: bool) -> Result<serde_json::Value>;
 }
 #[derive(Clone, Copy)]
 enum HostMetadata {
@@ -54,7 +54,7 @@ struct Pin {
     pinned_boottime_ms: u64,
 }
 
-fn checked_at(value: &str) -> bool {
+pub(super) fn checked_at(value: &str) -> bool {
     let bytes = value.as_bytes();
     if !(bytes.len() == 20 || (22..=27).contains(&bytes.len())) || bytes.last() != Some(&b'Z') {
         return false;
@@ -304,12 +304,16 @@ impl<E: Exchange> NormalizedSession<E> {
         let root = scanning
             .session
             .port()?
-            .root_receipt()
+            .root_status(true)
             .map_err(|_| ERROR.to_owned())?;
         let now = scanning.session.check()?;
+        super::reporter_status::validate_status(&root).map_err(|_| ERROR.to_owned())?;
         let offer = &scanning.offer;
         require(
-            &root == receipt_value
+            &root["observation_receipt"] == receipt_value
+                && root["cache_generation"] == scanning.session.context.cache_generation
+                && root["policy_generation"] == scanning.session.context.policy_generation
+                && root["successful_checked_at"] == scanning.session.context.successful_checked_at
                 && receipt.nonce == offer.nonce
                 && receipt.boot_id == offer.boot_id
                 && receipt.cache_generation == offer.cache_generation
@@ -547,6 +551,19 @@ impl<E: Exchange> PublishedSession<E> {
             .as_u64()
             .filter(|time| *time <= SAFE)
             .ok_or(ERROR)?;
+        session.check()?;
+        let status = session
+            .port()?
+            .root_status(false)
+            .map_err(|_| ERROR.to_owned())?;
+        session.check()?;
+        super::reporter_status::validate_status(&status).map_err(|_| ERROR.to_owned())?;
+        require(
+            status["observation_lease"] == frame["offer"]
+                && status["cache_generation"] == session.context.cache_generation
+                && status["policy_generation"] == session.context.policy_generation
+                && status["successful_checked_at"] == session.context.successful_checked_at,
+        )?;
         require(
             offer.nonce == published.observation_nonce()
                 && offer.boot_id == session.context.boot_id
@@ -869,6 +886,8 @@ mod tests {
         poison_on_data_final: Option<Arc<AtomicBool>>,
         finish_reply: bool,
         finish_fault: Option<&'static str>,
+        root_lease_mismatch: bool,
+        root_expiry: u64,
     }
     impl Exchange for Scripted {
         fn sample(&mut self) -> Result<Clock> {
@@ -1073,13 +1092,30 @@ mod tests {
             }
             .into())
         }
-        fn root_receipt(&mut self) -> Result<Value> {
-            let mut value = scripted_receipt();
-            if self.finish_fault == Some("root") {
-                value["outcome"] = json!("expired");
+        fn root_status(&mut self, receipt: bool) -> Result<Value> {
+            let mut value = scripted_status(receipt);
+            if self.finish_fault == Some("root") && receipt {
+                value["observation_receipt"]["outcome"] = json!("expired");
+            }
+            if self.root_lease_mismatch && !receipt {
+                value["observation_lease"]["nonce"] =
+                    json!("0000000000000009".to_owned() + &"b".repeat(16));
+            }
+            if !receipt {
+                value["observation_lease"]["expires_boottime_ms"] = json!(self.root_expiry);
             }
             Ok(value)
         }
+    }
+    fn scripted_status(receipt: bool) -> Value {
+        let mut status = json!({"schema_version":1,"operation_nonce":null,"phase":"deferred","reason":"cache_unavailable","policy_generation":"b".repeat(64),"cache_generation":"a".repeat(32),"successful_checked_at":"2026-01-01T00:00:00.123456Z","started_at":null,"finished_at":null,"attempt":null,"observation_lease":null,"observation_receipt":null});
+        if receipt {
+            status["observation_receipt"] = scripted_receipt();
+        } else {
+            status["observation_lease"] =
+                serde_json::from_slice::<Value>(&proposal()).unwrap()["offer"].clone();
+        }
+        status
     }
     fn scripted_receipt() -> Value {
         json!({"nonce":"0000000000000008bbbbbbbbbbbbbbbb","boot_id":BOOT,"cache_generation":"a".repeat(32),"policy_generation":"b".repeat(64),"lock_open_boottime_ms":1005,"expires_boottime_ms":10000,"lock_held_until_boottime_ms":1012,"released_boottime_ms":1012,"outcome":"released","installed_before_sha256":"c".repeat(64),"installed_after_sha256":"c".repeat(64)})
@@ -1103,6 +1139,8 @@ mod tests {
                 poison_on_data_final: None,
                 finish_reply: false,
                 finish_fault: None,
+                root_lease_mismatch: false,
+                root_expiry: 10000,
             },
             record,
         )
@@ -1296,8 +1334,8 @@ command(10,'await_receipt');response(10,'await_receipt','prepared',evidence=dict
             }
             .into())
         }
-        fn root_receipt(&mut self) -> Result<Value> {
-            Ok(scripted_receipt())
+        fn root_status(&mut self, receipt: bool) -> Result<Value> {
+            Ok(scripted_status(receipt))
         }
     }
 
@@ -1635,6 +1673,28 @@ command(10,'await_receipt');response(10,'await_receipt','prepared',evidence=dict
     }
 
     #[test]
+    fn fresh_root_lease_mismatch_never_admits_a_scan() {
+        let fixture = Fixture::new();
+        let negotiated = negotiated();
+        let mut journal = fixture.ready(&negotiated);
+        let intent = journal
+            .admit_native_collection(REPORT, 1, 1, &clock(1001), "bbbbbbbbbbbbbbbb", &negotiated)
+            .unwrap();
+        let (mut exchange, record) = scan_scripted(&fixture);
+        exchange.root_lease_mismatch = true;
+        let published = PinnedSession::admit(exchange, expected())
+            .unwrap()
+            .publish(&mut journal, intent, &negotiated)
+            .unwrap();
+        let before = saved(&fixture);
+        assert!(published.admit_scan(&mut journal, &negotiated).is_err());
+        assert!(!record.lock().unwrap().writes.iter().any(|raw| {
+            serde_json::from_slice::<Value>(raw).unwrap()["operation"] == "scan_admitted"
+        }));
+        unfinished(&fixture, &before);
+    }
+
+    #[test]
     fn fixed_reporter_tools_feed_the_existing_selected_normalizer_without_currency_claims() {
         let fixture = Fixture::new();
         let session = negotiated();
@@ -1914,9 +1974,10 @@ command(10,'await_receipt');response(10,'await_receipt','prepared',evidence=dict
                 let mut frame: Value = serde_json::from_slice(&proposal()).unwrap();
                 frame["offer"]["expires_boottime_ms"] = json!(121005);
                 exchange.frames[2] = format!("{frame}\n").into_bytes();
-                exchange.times[30] = clock(121002);
+                exchange.root_expiry = 121005;
+                exchange.times[32] = clock(121002);
             } else {
-                exchange.times[30] = clock(10000);
+                exchange.times[32] = clock(10000);
             }
             let scanning = data_scanning(&fixture, &mut journal, &session, exchange);
             let before = saved(&fixture);
@@ -2080,11 +2141,12 @@ command(10,'await_receipt');response(10,'await_receipt','prepared',evidence=dict
                 .unwrap();
             let before = saved(&fixture);
             let (mut exchange, record) = scan_scripted(&fixture);
-            exchange.times[13] = clock(expiry);
+            exchange.times[15] = clock(expiry);
             if expiry == 121002 {
                 let mut frame: Value = serde_json::from_slice(&proposal()).unwrap();
                 frame["offer"]["expires_boottime_ms"] = json!(121005);
                 exchange.frames[2] = format!("{frame}\n").into_bytes();
+                exchange.root_expiry = 121005;
             }
             let published = PinnedSession::admit(exchange, expected())
                 .unwrap()
@@ -2114,7 +2176,7 @@ command(10,'await_receipt');response(10,'await_receipt','prepared',evidence=dict
             .unwrap();
         let before = saved(&fixture);
         let (mut exchange, record) = scan_scripted(&fixture);
-        exchange.times[13] = clock(1011);
+        exchange.times[15] = clock(1011);
         let published = PinnedSession::admit(exchange, expected())
             .unwrap()
             .publish(&mut journal, intent, &session)
@@ -2180,7 +2242,7 @@ command(10,'await_receipt');response(10,'await_receipt','prepared',evidence=dict
             .unwrap();
         let before = saved(&fixture);
         let (mut exchange, record) = scan_scripted(&fixture);
-        exchange.times[17] = clock(10000);
+        exchange.times[19] = clock(10000);
         let published = PinnedSession::admit(exchange, expected())
             .unwrap()
             .publish(&mut journal, intent, &session)
@@ -2188,7 +2250,7 @@ command(10,'await_receipt');response(10,'await_receipt','prepared',evidence=dict
         assert!(published.admit_scan(&mut journal, &session).is_err());
         let record = record.lock().unwrap();
         assert_eq!(record.reads, 4);
-        assert_eq!(record.samples, 18);
+        assert_eq!(record.samples, 20);
         assert!(record.scan_seen);
         drop(record);
         drop(journal);

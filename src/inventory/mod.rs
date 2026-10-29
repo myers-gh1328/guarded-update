@@ -12,11 +12,39 @@ mod macos;
 mod process;
 #[cfg(test)]
 mod reporter_frame;
-#[cfg(test)]
+#[cfg(all(
+    test,
+    any(
+        target_os = "macos",
+        all(
+            target_os = "linux",
+            any(
+                target_arch = "arm",
+                target_arch = "aarch64",
+                target_arch = "x86",
+                target_arch = "x86_64"
+            )
+        )
+    )
+))]
 mod reporter_obs;
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 mod reporter_pipe;
-#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+#[cfg(all(
+    test,
+    any(
+        target_os = "macos",
+        all(
+            target_os = "linux",
+            any(
+                target_arch = "arm",
+                target_arch = "aarch64",
+                target_arch = "x86",
+                target_arch = "x86_64"
+            )
+        )
+    )
+))]
 mod reporter_status;
 #[cfg(test)]
 mod requests;

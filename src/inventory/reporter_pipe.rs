@@ -338,14 +338,16 @@ mod tests {
     #[test]
     fn held_open_partial_frame_times_out_and_poison_is_absorbing() {
         let mut child = Command::new("/usr/bin/python3")
-            .args(["-I", "-c", "import sys,time; sys.stdout.buffer.write(b'{'); sys.stdout.buffer.flush(); time.sleep(0.2)"])
+            .args(["-I", "-c", "import sys; sys.stdout.buffer.write(b'{}\\n{'); sys.stdout.buffer.flush(); sys.stdin.buffer.read()"])
             .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
         let mut pair = PipePair::new(
             child.stdin.take().unwrap(),
             child.stdout.take().unwrap(),
-            Instant::now() + Duration::from_millis(80),
+            Instant::now() + Duration::from_secs(3),
         )
         .unwrap();
+        assert_eq!(pair.read_frame().unwrap(), b"{}\n");
+        pair.deadline = Instant::now() + Duration::from_millis(80);
         assert!(pair.read_frame().is_err());
         assert!(pair.write_frame(b"{}\n").is_err());
         pair.close().unwrap();
@@ -459,15 +461,18 @@ mod tests {
 
     #[test]
     fn completion_rejects_held_open_output_at_deadline() {
-        let mut child=Command::new("/usr/bin/python3").args(["-I","-c","import sys,time; sys.stdout.buffer.write(b'{}\\n'); sys.stdout.buffer.flush(); time.sleep(0.2)"])
+        let mut child=Command::new("/usr/bin/python3").args(["-I","-c","import sys,time; time.sleep(0.1); sys.stdout.buffer.write(b'{}\\n'); sys.stdout.buffer.flush(); sys.stdin.buffer.read()"])
             .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
         let mut pair = PipePair::new(
             child.stdin.take().unwrap(),
             child.stdout.take().unwrap(),
-            Instant::now() + Duration::from_millis(80),
+            Instant::now() + Duration::from_secs(3),
         )
         .unwrap();
         assert_eq!(pair.read_frame().unwrap(), b"{}\n");
+        // Start the EOF-only deadline after the child has signalled readiness.
+        // The child keeps stdout open until this owner closes stdin.
+        pair.deadline = Instant::now() + Duration::from_millis(80);
         assert!(pair.require_eof().is_err());
         pair.close().unwrap();
         assert!(child.wait().unwrap().success());

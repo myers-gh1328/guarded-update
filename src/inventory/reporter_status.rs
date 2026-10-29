@@ -10,9 +10,15 @@ use std::time::Instant;
 unsafe extern "C" {
     fn openat(dirfd: i32, path: *const i8, flags: i32, ...) -> i32;
 }
-#[cfg(target_os = "linux")]
+// ARM uses its own UAPI bit assignments for AArch32 compatibility.
+// https://github.com/torvalds/linux/blob/master/arch/arm64/include/uapi/asm/fcntl.h
+#[cfg(all(target_os = "linux", any(target_arch = "arm", target_arch = "aarch64")))]
+const DIRECTORY: i32 = 0x4000;
+#[cfg(all(target_os = "linux", any(target_arch = "x86", target_arch = "x86_64")))]
 const DIRECTORY: i32 = 0x10000;
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", any(target_arch = "arm", target_arch = "aarch64")))]
+const NOFOLLOW: i32 = 0x8000;
+#[cfg(all(target_os = "linux", any(target_arch = "x86", target_arch = "x86_64")))]
 const NOFOLLOW: i32 = 0x20000;
 #[cfg(target_os = "linux")]
 const NONBLOCK: i32 = 0x800;
@@ -67,6 +73,260 @@ fn stable(info: &Metadata) -> (u64, u64, u32, u32, u32, u64, u64, i64, i64, i64,
 }
 fn valid_dir(info: &Metadata, owner: u32) -> bool {
     info.is_dir() && info.uid() == owner && info.mode() & 0o022 == 0
+}
+
+const SAFE: u64 = 9_007_199_254_740_991;
+fn fields<'a>(value: &'a Value, names: &[&str]) -> Result<&'a serde_json::Map<String, Value>> {
+    let object = value.as_object().ok_or(ERROR)?;
+    if object.len() != names.len() || names.iter().any(|name| !object.contains_key(*name)) {
+        return Err(ERROR);
+    }
+    Ok(object)
+}
+fn safe(value: &Value) -> Result<u64> {
+    value.as_u64().filter(|number| *number <= SAFE).ok_or(ERROR)
+}
+fn hex(value: &Value, size: usize) -> bool {
+    value.as_str().is_some_and(|text| {
+        text.len() == size
+            && text
+                .bytes()
+                .all(|v| v.is_ascii_digit() || (b'a'..=b'f').contains(&v))
+    })
+}
+fn nonce(value: &Value) -> Result<u64> {
+    if !hex(value, 32) {
+        return Err(ERROR);
+    }
+    let text = value.as_str().ok_or(ERROR)?;
+    let count = u64::from_str_radix(&text[..16], 16).map_err(|_| ERROR)?;
+    if count == 0 || count > SAFE {
+        Err(ERROR)
+    } else {
+        Ok(count)
+    }
+}
+fn boot(value: &Value) -> bool {
+    value.as_str().is_some_and(|text| {
+        text.len() == 36
+            && text.bytes().enumerate().all(|(i, v)| {
+                if [8, 13, 18, 23].contains(&i) {
+                    v == b'-'
+                } else {
+                    v.is_ascii_digit() || (b'a'..=b'f').contains(&v)
+                }
+            })
+    })
+}
+fn utc(value: &Value) -> bool {
+    value.as_str().is_some_and(super::reporter_obs::checked_at)
+}
+fn nullable(value: &Value, check: impl Fn(&Value) -> bool) -> bool {
+    value.is_null() || check(value)
+}
+fn observation(value: &Value, receipt: bool) -> Result<()> {
+    const LEASE: [&str; 6] = [
+        "nonce",
+        "boot_id",
+        "cache_generation",
+        "policy_generation",
+        "lock_open_boottime_ms",
+        "expires_boottime_ms",
+    ];
+    const RECEIPT: [&str; 11] = [
+        "nonce",
+        "boot_id",
+        "cache_generation",
+        "policy_generation",
+        "lock_open_boottime_ms",
+        "expires_boottime_ms",
+        "lock_held_until_boottime_ms",
+        "released_boottime_ms",
+        "outcome",
+        "installed_before_sha256",
+        "installed_after_sha256",
+    ];
+    fields(value, if receipt { &RECEIPT } else { &LEASE })?;
+    nonce(&value["nonce"])?;
+    if !boot(&value["boot_id"])
+        || !hex(&value["cache_generation"], 32)
+        || !hex(&value["policy_generation"], 64)
+    {
+        return Err(ERROR);
+    }
+    let opened = safe(&value["lock_open_boottime_ms"])?;
+    let expires = safe(&value["expires_boottime_ms"])?;
+    if expires.checked_sub(opened).is_none_or(|span| span > 120000) {
+        return Err(ERROR);
+    }
+    if receipt {
+        let held = safe(&value["lock_held_until_boottime_ms"])?;
+        let released = safe(&value["released_boottime_ms"])?;
+        let outcome = value["outcome"].as_str().ok_or(ERROR)?;
+        if held < opened
+            || released < held
+            || !matches!(outcome, "released" | "expired" | "unconfirmed")
+            || !hex(&value["installed_before_sha256"], 64)
+            || !hex(&value["installed_after_sha256"], 64)
+            || (outcome == "released"
+                && (released > expires
+                    || value["installed_before_sha256"] != value["installed_after_sha256"]))
+        {
+            return Err(ERROR);
+        }
+    }
+    Ok(())
+}
+pub(super) fn validate_status(value: &Value) -> Result<()> {
+    fields(
+        value,
+        &[
+            "schema_version",
+            "operation_nonce",
+            "phase",
+            "reason",
+            "policy_generation",
+            "cache_generation",
+            "successful_checked_at",
+            "started_at",
+            "finished_at",
+            "attempt",
+            "observation_lease",
+            "observation_receipt",
+        ],
+    )?;
+    if value["schema_version"].as_u64() != Some(1) {
+        return Err(ERROR);
+    }
+    let phase = value["phase"].as_str().ok_or(ERROR)?;
+    if !matches!(
+        phase,
+        "received" | "running" | "succeeded" | "deferred" | "failed" | "unconfirmed"
+    ) {
+        return Err(ERROR);
+    }
+    let reason = &value["reason"];
+    if matches!(phase, "received" | "running" | "succeeded") {
+        if !reason.is_null() {
+            return Err(ERROR);
+        }
+    } else if !reason.as_str().is_some_and(|r| {
+        matches!(
+            r,
+            "busy"
+                | "package_manager_busy"
+                | "executor_busy"
+                | "minimum_interval"
+                | "policy_unsupported"
+                | "policy_changed"
+                | "repository_failed"
+                | "timeout"
+                | "resource_limit"
+                | "cleanup_unconfirmed"
+                | "cache_unavailable"
+                | "state_inconsistent"
+                | "invalid_request"
+                | "lease_expired"
+                | "internal_error"
+        )
+    }) {
+        return Err(ERROR);
+    }
+    if !value["operation_nonce"].is_null() {
+        nonce(&value["operation_nonce"])?;
+    }
+    if !nullable(&value["policy_generation"], |v| hex(v, 64))
+        || !nullable(&value["cache_generation"], |v| hex(v, 32))
+        || !nullable(&value["successful_checked_at"], utc)
+        || !nullable(&value["started_at"], utc)
+        || !nullable(&value["finished_at"], utc)
+    {
+        return Err(ERROR);
+    }
+    if (!value["cache_generation"].is_null() || !value["successful_checked_at"].is_null())
+        && (value["cache_generation"].is_null()
+            || value["policy_generation"].is_null()
+            || value["successful_checked_at"].is_null())
+    {
+        return Err(ERROR);
+    }
+    let attempt = &value["attempt"];
+    if attempt.is_null() {
+        if !matches!(phase, "deferred" | "failed" | "unconfirmed")
+            || !value["operation_nonce"].is_null()
+            || !value["started_at"].is_null()
+            || !value["finished_at"].is_null()
+        {
+            return Err(ERROR);
+        }
+    } else {
+        fields(
+            attempt,
+            &[
+                "correlator",
+                "helper_sequence",
+                "boot_id",
+                "accepted_boottime_ms",
+                "started_boottime_ms",
+                "finished_boottime_ms",
+            ],
+        )?;
+        if nonce(&attempt["correlator"])? != safe(&attempt["helper_sequence"])?
+            || attempt["correlator"] != value["operation_nonce"]
+            || !boot(&attempt["boot_id"])
+        {
+            return Err(ERROR);
+        }
+        let accepted = safe(&attempt["accepted_boottime_ms"])?;
+        let started = if attempt["started_boottime_ms"].is_null() {
+            None
+        } else {
+            Some(safe(&attempt["started_boottime_ms"])?)
+        };
+        let finished = if attempt["finished_boottime_ms"].is_null() {
+            None
+        } else {
+            Some(safe(&attempt["finished_boottime_ms"])?)
+        };
+        if started.is_some_and(|n| n < accepted)
+            || finished.is_some_and(|n| n < started.unwrap_or(accepted))
+            || (phase == "received" && (started.is_some() || finished.is_some()))
+            || (phase == "deferred" && started.is_some())
+            || (phase == "running" && (started.is_none() || finished.is_some()))
+            || (phase == "succeeded"
+                && (started.is_none()
+                    || finished.is_none()
+                    || finished.unwrap_or(0) - started.unwrap_or(0) > 600000))
+            || (!value["started_at"].is_null() && started.is_none())
+            || (!value["finished_at"].is_null() && finished.is_none())
+        {
+            return Err(ERROR);
+        }
+    }
+    if phase == "succeeded"
+        && (value["cache_generation"].is_null()
+            || value["policy_generation"].is_null()
+            || value["successful_checked_at"].is_null())
+    {
+        return Err(ERROR);
+    }
+    let lease = &value["observation_lease"];
+    let receipt = &value["observation_receipt"];
+    if !lease.is_null() {
+        observation(lease, false)?;
+        if lease["cache_generation"] != value["cache_generation"]
+            || lease["policy_generation"] != value["policy_generation"]
+        {
+            return Err(ERROR);
+        }
+    }
+    if !receipt.is_null() {
+        observation(receipt, true)?;
+    }
+    if !lease.is_null() && !receipt.is_null() && lease["nonce"] == receipt["nonce"] {
+        return Err(ERROR);
+    }
+    Ok(())
 }
 
 struct StatusReader {
@@ -178,9 +438,159 @@ impl StatusReader {
 
 #[cfg(test)]
 mod tests {
-    use super::StatusReader;
+    use super::{StatusReader, validate_status};
+    use serde_json::{Value, json};
     use std::os::unix::fs::PermissionsExt;
     use std::time::{Duration, Instant};
+
+    fn status() -> Value {
+        json!({"schema_version":1,"operation_nonce":null,"phase":"deferred","reason":"cache_unavailable","policy_generation":"b".repeat(64),"cache_generation":"a".repeat(32),"successful_checked_at":"2026-01-01T00:00:00.123456Z","started_at":null,"finished_at":null,"attempt":null,"observation_lease":null,"observation_receipt":null})
+    }
+
+    #[test]
+    fn platform_open_flags_match_system_python() {
+        let output = super::super::process::SystemTools
+            .run_with_timeout(
+                "/usr/bin/python3",
+                &[
+                    "-I",
+                    "-B",
+                    "-c",
+                    "import os;print(os.O_DIRECTORY,os.O_NOFOLLOW,os.O_NONBLOCK,os.O_CLOEXEC)",
+                ],
+                &[],
+                256,
+                Duration::from_secs(5),
+            )
+            .unwrap();
+        let text = std::str::from_utf8(&output).unwrap();
+        let actual: Vec<i32> = text
+            .split_whitespace()
+            .map(|value| value.parse().unwrap())
+            .collect();
+        assert_eq!(
+            actual,
+            [
+                super::DIRECTORY,
+                super::NOFOLLOW,
+                super::NONBLOCK,
+                super::CLOEXEC
+            ]
+        );
+    }
+
+    #[test]
+    fn validates_public_status_fields_without_inventing_lease_authority() {
+        let mut value = status();
+        value["observation_lease"] = json!({"nonce":"0000000000000009".to_owned()+&"d".repeat(16),"boot_id":"00000000-0000-0000-0000-000000000000","cache_generation":"a".repeat(32),"policy_generation":"b".repeat(64),"lock_open_boottime_ms":10,"expires_boottime_ms":120010});
+        assert!(validate_status(&value).is_ok());
+        let mut invalid = value.clone();
+        invalid.as_object_mut().unwrap().remove("attempt");
+        assert!(validate_status(&invalid).is_err());
+        let mut invalid = value.clone();
+        invalid["observation_lease"]["lock_open_boottime_ms"] = json!(false);
+        assert!(validate_status(&invalid).is_err());
+        let mut invalid = value.clone();
+        invalid["observation_lease"]["cache_generation"] = json!("c".repeat(32));
+        assert!(validate_status(&invalid).is_err());
+        let mut invalid = value.clone();
+        invalid["reason"] = json!("invented");
+        assert!(validate_status(&invalid).is_err());
+        let mut invalid = value.clone();
+        invalid["successful_checked_at"] = json!("2026-02-30T00:00:00Z");
+        assert!(validate_status(&invalid).is_err());
+    }
+
+    #[test]
+    fn validates_attempt_and_timestamp_boundaries() {
+        let mut v = status();
+        let token = "0000000000000001".to_owned() + &"e".repeat(16);
+        v["phase"] = json!("succeeded");
+        v["reason"] = Value::Null;
+        v["operation_nonce"] = json!(token);
+        v["attempt"] = json!({"correlator":token,"helper_sequence":1,"boot_id":"00000000-0000-0000-0000-000000000000","accepted_boottime_ms":10,"started_boottime_ms":11,"finished_boottime_ms":600011});
+        for timestamp in [
+            "2024-02-29T23:59:59Z",
+            "2024-02-29T23:59:59.1Z",
+            "2024-02-29T23:59:59.123456Z",
+        ] {
+            v["successful_checked_at"] = json!(timestamp);
+            assert!(validate_status(&v).is_ok());
+        }
+        let mut invalid = v.clone();
+        invalid["attempt"]["finished_boottime_ms"] = json!(600012);
+        assert!(validate_status(&invalid).is_err());
+        let mut invalid = v.clone();
+        invalid["attempt"]["helper_sequence"] = json!(1.0);
+        assert!(validate_status(&invalid).is_err());
+        let mut invalid = v.clone();
+        invalid["attempt"]["correlator"] = json!("0000000000000000".to_owned() + &"e".repeat(16));
+        assert!(validate_status(&invalid).is_err());
+        let mut invalid = v.clone();
+        invalid["successful_checked_at"] = json!("2023-02-29T00:00:00Z");
+        assert!(validate_status(&invalid).is_err());
+        let mut invalid = v.clone();
+        invalid["successful_checked_at"] = json!("2024-02-29T00:00:00.1234567Z");
+        assert!(validate_status(&invalid).is_err());
+        let mut invalid = v.clone();
+        invalid["attempt"]["started_boottime_ms"] = Value::Null;
+        assert!(validate_status(&invalid).is_err());
+    }
+
+    #[test]
+    fn prior_expired_receipt_is_valid_but_never_a_released_receipt() {
+        let mut v = status();
+        v["observation_receipt"] = json!({"nonce":"0000000000000008".to_owned()+&"d".repeat(16),"boot_id":"00000000-0000-0000-0000-000000000000","cache_generation":"c".repeat(32),"policy_generation":"d".repeat(64),"lock_open_boottime_ms":10,"expires_boottime_ms":20,"lock_held_until_boottime_ms":21,"released_boottime_ms":22,"outcome":"expired","installed_before_sha256":"e".repeat(64),"installed_after_sha256":"f".repeat(64)});
+        assert!(validate_status(&v).is_ok());
+        v["observation_receipt"]["outcome"] = json!("released");
+        assert!(validate_status(&v).is_err());
+        v["observation_receipt"]["outcome"] = json!("unconfirmed");
+        assert!(validate_status(&v).is_ok());
+        v["observation_receipt"]["lock_held_until_boottime_ms"] = json!(9);
+        assert!(validate_status(&v).is_err());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn typed_status_matches_python_public_status_vectors() {
+        let valid = status();
+        let mut vectors = vec![valid.clone()];
+        let mut missing = valid.clone();
+        missing.as_object_mut().unwrap().remove("attempt");
+        vectors.push(missing);
+        let mut boolean = valid.clone();
+        boolean["schema_version"] = json!(true);
+        vectors.push(boolean);
+        let mut bad_date = valid.clone();
+        bad_date["successful_checked_at"] = json!("2026-02-29T00:00:00Z");
+        vectors.push(bad_date);
+        let mut reason = valid.clone();
+        reason["reason"] = json!("invented");
+        vectors.push(reason);
+        let mut old = valid.clone();
+        old["observation_receipt"] = json!({"nonce":"0000000000000008".to_owned()+&"d".repeat(16),"boot_id":"00000000-0000-0000-0000-000000000000","cache_generation":"c".repeat(32),"policy_generation":"d".repeat(64),"lock_open_boottime_ms":10,"expires_boottime_ms":20,"lock_held_until_boottime_ms":21,"released_boottime_ms":22,"outcome":"expired","installed_before_sha256":"e".repeat(64),"installed_after_sha256":"f".repeat(64)});
+        vectors.push(old.clone());
+        old["observation_receipt"]["outcome"] = json!("released");
+        vectors.push(old);
+        let raw = serde_json::to_vec(&vectors).unwrap();
+        let scripts = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts");
+        let source = "import sys,json; sys.path.insert(0,sys.argv[1]); from inventory_refresh_status import PublicStatus\ndef valid(v):\n try: PublicStatus.create(v); return True\n except Exception: return False\nprint(json.dumps([valid(v) for v in json.load(sys.stdin)]))";
+        let output = super::super::process::SystemTools
+            .run_with_timeout(
+                "/usr/bin/python3",
+                &["-I", "-B", "-c", source, scripts.to_str().unwrap()],
+                &raw,
+                1024,
+                Duration::from_secs(5),
+            )
+            .unwrap();
+        let expected: Vec<bool> = serde_json::from_slice(&output).unwrap();
+        let actual: Vec<bool> = vectors
+            .iter()
+            .map(|value| validate_status(value).is_ok())
+            .collect();
+        assert_eq!(actual, expected);
+    }
 
     #[test]
     fn reads_only_a_protected_duplicate_free_status_object() {
