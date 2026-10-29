@@ -55,3 +55,27 @@ class CgroupWitnessTests(unittest.TestCase):
         def uncertain(fd):actual(fd);raise OSError('unknown close')
         with patch.object(witness.os,'close',side_effect=uncertain):
             with self.assertRaises(ValueError):self.observe()
+
+    def test_singleton_process_sample_rejects_extra_pid_and_child_group(self):
+        processes=self.root/'unit'/'cgroup.procs';processes.write_bytes(b'123\n')
+        witness.observe_single_process(self.parent,'unit',self.group,123,time.monotonic()+1)
+        for raw in (b'',b'123\n456\n',b'0123\n',b'123\n123\n',b'123',b'123\ninvalid\n'):
+            processes.write_bytes(raw)
+            with self.assertRaises(ValueError):witness.observe_single_process(self.parent,'unit',self.group,123,time.monotonic()+1)
+        processes.write_bytes(b'123\n');(self.root/'unit'/'nested').mkdir()
+        with self.assertRaises(ValueError):witness.observe_single_process(self.parent,'unit',self.group,123,time.monotonic()+1)
+
+    def test_singleton_process_detects_mutation_and_uncertain_close(self):
+        processes=self.root/'unit'/'cgroup.procs';processes.write_bytes(b'123\n')
+        actual=os.read;calls=[]
+        def mutate(fd,size):
+            raw=actual(fd,size);calls.append(True)
+            if len(calls)==1:processes.write_bytes(b'456\n')
+            return raw
+        with patch.object(witness.os,'read',side_effect=mutate):
+            with self.assertRaises(ValueError):witness.observe_single_process(self.parent,'unit',self.group,123,time.monotonic()+1)
+        processes.write_bytes(b'123\n');actual_close=os.close;closed=[]
+        def uncertain(fd):closed.append(fd);actual_close(fd);raise OSError('uncertain close')
+        with patch.object(witness.os,'close',side_effect=uncertain):
+            with self.assertRaises(ValueError):witness.observe_single_process(self.parent,'unit',self.group,123,time.monotonic()+1)
+        self.assertEqual(len(closed),1)
