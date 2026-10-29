@@ -72,7 +72,7 @@ class ProcessSnapshotTests(unittest.TestCase):
                 owner=ProcessProbe._from_directory(fd,123,(0,27),time.monotonic()+2,owner=os.getuid())
                 with patch('inventory_refresh_process_snapshot.os.geteuid',return_value=0),patch.dict(os.environ,{'GITHUB_ACTIONS':'true'}),contextlib.redirect_stderr(output):
                     with self.assertRaises(ValueError):owner.sample()
-                self.assertEqual(output.getvalue(),'Native fixture process probe stage=profile_mount_writable\n')
+                self.assertEqual(output.getvalue(),'Native fixture process probe stage=profile_mount_writable_root\n')
                 owner.close()
             finally:os.close(fd)
 
@@ -117,6 +117,12 @@ class ProcessSnapshotTests(unittest.TestCase):
             setattr(self,name,previous)
         with self.assertRaises(ValueError):validate_snapshot(self.pid,self.stat,self.status,self.cgroup,self.mounts,(0,28))
         with self.assertRaises(ValueError):validate_snapshot(True,self.stat,self.status,self.cgroup,self.mounts,(0,27))
+
+    def test_writable_mount_category_distinguishes_root_and_other(self):
+        for mount,label in ((self.mounts.replace(b' ro,nosuid',b' rw,nosuid'),'profile_mount_writable_root'),
+            (self.mounts+b'43 1 0:27 / /other rw - cgroup2 cgroup rw\n','profile_mount_writable_other')):
+            with self.assertRaisesRegex(ValueError,label):
+                validate_snapshot(self.pid,self.stat,self.status,self.cgroup,mount,(0,27))
 
     def test_writable_or_ambiguous_cgroup_mount_is_rejected(self):
         for replacement in (self.mounts.replace(b' ro,nosuid',b' rw,nosuid'),
