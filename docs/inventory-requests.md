@@ -255,3 +255,27 @@ Any malformed, truncated, extra or reordered response poisons the session.
 Generating a final frame is local encoding completion, not delivery
 acknowledgement. This codec performs no I/O, phase execution, timing validation
 or Root effect; the managed dispatcher and coordinator gates remain unfinished.
+
+The staged pipe transport duplicates already nonblocking, directional FIFO
+descriptors. It preserves borrowed descriptors and never changes their flags.
+Callers must retain their identities and shared nonblocking flags and perform
+no concurrent I/O: duplicates share open file descriptions. Checks before and
+after I/O detect changes but do not isolate adversarial flag races. Linux pipe
+inodes must differ between the incoming and outgoing channel.
+
+Frames are bounded to 256KiB, with at most one overflow byte retained while
+checking the first newline; coalesced tails are preserved. Partial writes and
+full pipes use the same absolute native boot-time deadline, capped at 120 seconds
+from admission and only eligible for tightening. Clock checks bracket polling,
+I/O and returns, including buffered reads. Expiry, reboot, rewind, unsafe
+descriptors, truncated EOF or uncertain close consume the channel. A write can
+fail after bytes reached its peer; it is never an acknowledgement or permission
+to replay.
+
+The admitted clock/liveness owner must survive the final frame write. The current
+environment closes its parent clock, so a future dispatcher must explicitly
+retain or split that late-closing owner instead of using cached time. Transport
+and clock still close before exit. EOF, exit status, producer quiescence and all
+parent cleanup must be verified separately before any completion witness. Real
+pipe tests establish I/O mechanics only; this layer is not wired into production
+or the native Root proof source closure.
