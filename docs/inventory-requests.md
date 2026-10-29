@@ -239,3 +239,19 @@ Cleanup consumes the session, status reader, reverse ancestry owners and parent,
 attempting every close once. The extra native fixture checks this read-only
 composition under its synthetic C parent; source bootstrap, runtime wiring and
 physical cleanup/publication gates remain separate.
+
+The staged private framing codec accepts only fixed command field sets and
+consecutive command IDs. It rejects duplicate keys, nonfinite numbers, numeric
+aliases, unknown fields and frames over 256KiB before parsing. Data responses use
+numbered chunks of at most 16K codepoints/64KiB UTF-8, with exact final byte and
+chunk totals, per-operation limits and a shared 64MiB session budget. A maximum
+16MiB ASCII policy response uses 1024 data chunks instead of one large escaped
+JSON allocation.
+
+Sender reservation occurs before returning an iterator. An abandoned response
+cannot restart or refund its ID, operation or byte budget. Receivers expose no
+partial text and retain ownership until a valid final frame is consumed once.
+Any malformed, truncated, extra or reordered response poisons the session.
+Generating a final frame is local encoding completion, not delivery
+acknowledgement. This codec performs no I/O, phase execution, timing validation
+or Root effect; the managed dispatcher and coordinator gates remain unfinished.
