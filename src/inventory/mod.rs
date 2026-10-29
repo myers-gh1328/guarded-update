@@ -11,6 +11,8 @@ mod linux;
 mod macos;
 mod process;
 #[cfg(test)]
+mod reporter_frame;
+#[cfg(test)]
 mod requests;
 mod state;
 mod transport;
