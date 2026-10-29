@@ -69,6 +69,11 @@ pub(super) fn parse_frame(raw: &[u8]) -> Result<Value, &'static str> {
     {
         return Err(ERROR);
     }
+    parse_object(raw)
+}
+
+pub(super) fn parse_object(raw: &[u8]) -> Result<Value, &'static str> {
+    const ERROR: &str = "Invalid private reporter object";
     let Unique(value) = serde_json::from_slice::<Unique>(raw).map_err(|_| ERROR)?;
     if !value.is_object() {
         return Err(ERROR);
