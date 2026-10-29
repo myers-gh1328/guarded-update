@@ -10,6 +10,8 @@ mod linux;
 #[cfg(any(target_os = "macos", test))]
 mod macos;
 mod process;
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+mod reporter_barrier;
 #[cfg(test)]
 mod reporter_frame;
 #[cfg(all(
