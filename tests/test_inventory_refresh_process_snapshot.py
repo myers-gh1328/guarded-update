@@ -46,6 +46,24 @@ class ProcessSnapshotTests(unittest.TestCase):
                 owner.close()
             finally:os.close(fd)
 
+    def test_probe_file_close_failure_poison_and_cleanup_closes_both(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp);proc=root/'123';proc.mkdir()
+            for name,raw in (('stat',self.stat),('status',self.status),('cgroup',self.cgroup),('mountinfo',self.mounts)):(proc/name).write_bytes(raw)
+            fd=os.open(root,os.O_RDONLY|os.O_DIRECTORY);actual=os.close;calls=[]
+            try:
+                owner=ProcessProbe._from_directory(fd,123,(0,27),time.monotonic()+2,owner=os.getuid())
+                def uncertain(number):calls.append(number);actual(number);raise OSError('uncertain close')
+                with patch('inventory_refresh_process_snapshot.os.close',side_effect=uncertain):
+                    with self.assertRaises(ValueError):owner.sample()
+                with self.assertRaises(ValueError):owner.sample()
+                calls.clear()
+                with patch('inventory_refresh_process_snapshot.os.close',side_effect=uncertain):
+                    with self.assertRaises(ValueError):owner.close()
+                self.assertEqual(len(calls),2)
+                with self.assertRaises(ValueError):owner.close()
+            finally:actual(fd)
+
     def test_exact_restricted_fixture(self):self.assertEqual(self.validate(),98765)
     def test_wrong_process_or_privileges_are_rejected(self):
         for replacement in (self.status.replace(b'Pid:\t123',b'Pid:\t124',1),self.status.replace(b'NoNewPrivs:\t1',b'NoNewPrivs:\t0'),

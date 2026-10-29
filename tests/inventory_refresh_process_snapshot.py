@@ -21,3 +21,118 @@ def validate_snapshot(pid,stat,status,cgroup,mountinfo,device):
         assert not any(row['path'].startswith('/sys/fs/cgroup/') for row in rows)
         return start
     except BaseException:raise ValueError('Process profile unavailable') from None
+
+
+import math
+import os
+import stat as filetype
+import time
+
+
+class ProcessProbe:
+    """Borrowed-input sampled fixture; caller must pin PID/unit and cgroup device."""
+    @classmethod
+    def fixed(cls,pid,device,deadline):
+        from inventory_refresh_resources import _Chain,_mount_id,_proc
+        from inventory_refresh_writer_exclusion import proc_mount
+        assert os.geteuid()==0 and os.environ.get('GITHUB_ACTIONS')=='true'
+        chain=_Chain(('proc',));value=None
+        try:
+            info=os.fstat(chain.fds[-1]);proc_mount(_proc('mountinfo',1024*1024),mount_id=_mount_id(chain.fds[-1]),
+                device=(os.major(info.st_dev),os.minor(info.st_dev)))
+            mount_id=_mount_id(chain.fds[-1]);proc_device=(os.major(info.st_dev),os.minor(info.st_dev))
+            value=cls._from_directory(chain.fds[-1],pid,device,deadline,owner=60002)
+            value._chain=chain;chain=None
+            def verify_mount():
+                assert _mount_id(value._chain.fds[-1])==mount_id
+                proc_mount(_proc('mountinfo',1024*1024),mount_id=mount_id,device=proc_device)
+            value._proc_verify=verify_mount;value._check();return value
+        except BaseException:
+            if value is not None:value.close()
+            raise ValueError('Process profile unavailable') from None
+        finally:
+            if chain is not None:chain.close()
+
+    @classmethod
+    def _from_directory(cls,parent,pid,device,deadline,*,owner):
+        value=cls();value._parent=None;value._process=None;value._chain=None;value._closed=False;value._failed=False
+        value._close_failed=False;value._start=None;value._proc_verify=None
+        try:
+            assert type(pid) is int and 0<pid<=2147483647 and type(owner) is int and owner>=0
+            assert type(deadline) in (int,float) and math.isfinite(deadline) and time.monotonic()<deadline
+            value._pid=pid;value._device=device;value._deadline=deadline;value._owner=owner
+            value._parent=os.dup(parent);parent_info=os.fstat(value._parent)
+            assert filetype.S_ISDIR(parent_info.st_mode)
+            value._parent_id=(parent_info.st_dev,parent_info.st_ino)
+            value._process=os.open(str(pid),os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW|os.O_NONBLOCK,dir_fd=value._parent)
+            info=os.fstat(value._process)
+            assert filetype.S_ISDIR(info.st_mode) and info.st_uid in (0,owner) and not info.st_mode&0o022 and info.st_dev==parent_info.st_dev
+            value._id=(info.st_dev,info.st_ino);value._check();return value
+        except BaseException:
+            try:value.close()
+            except BaseException:pass
+            raise ValueError('Process profile unavailable') from None
+
+    def _check(self):
+        assert not self._closed and not self._failed and time.monotonic()<self._deadline
+        parent=os.fstat(self._parent);held=os.fstat(self._process)
+        named=os.stat(str(self._pid),dir_fd=self._parent,follow_symlinks=False)
+        assert filetype.S_ISDIR(parent.st_mode) and (parent.st_dev,parent.st_ino)==self._parent_id
+        assert filetype.S_ISDIR(held.st_mode) and filetype.S_ISDIR(named.st_mode)
+        assert (held.st_dev,held.st_ino)==(named.st_dev,named.st_ino)==self._id
+        assert held.st_uid in (0,self._owner) and named.st_uid==held.st_uid and not held.st_mode&0o022 and not named.st_mode&0o022
+        if self._chain is not None:self._chain.verify()
+        if self._proc_verify is not None:self._proc_verify()
+        assert time.monotonic()<self._deadline
+
+    def _read(self,name,limit):
+        assert name in ('stat','status','cgroup','mountinfo');self._check();fd=None;failed=False;raw=bytearray()
+        try:
+            fd=os.open(name,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK,dir_fd=self._process)
+            before=os.fstat(fd)
+            assert filetype.S_ISREG(before.st_mode) and before.st_uid in (0,self._owner) and not before.st_mode&0o022 and before.st_dev==self._id[0]
+            while True:
+                assert time.monotonic()<self._deadline
+                try:chunk=os.read(fd,min(65536,limit+1-len(raw)))
+                except InterruptedError:continue
+                assert time.monotonic()<self._deadline
+                if not chunk:break
+                raw.extend(chunk);assert len(raw)<=limit
+            named=os.stat(name,dir_fd=self._process,follow_symlinks=False);after=os.fstat(fd)
+            identity=lambda info:(info.st_dev,info.st_ino,info.st_mode,info.st_uid,info.st_gid)
+            assert identity(before)==identity(named)==identity(after)
+        except BaseException:failed=True
+        finally:
+            if fd is not None:
+                try:os.close(fd)
+                except BaseException:failed=True
+        if failed or time.monotonic()>=self._deadline:raise ValueError('Process profile unavailable')
+        self._check();return bytes(raw)
+
+    def sample(self):
+        try:
+            self._check();first=self._read('stat',8192)
+            status=self._read('status',65536);group=self._read('cgroup',4096);mount=self._read('mountinfo',1024*1024)
+            start=validate_snapshot(self._pid,first,status,group,mount,self._device)
+            assert process_start_ticks(self._read('stat',8192),self._pid)==start
+            assert self._start is None or self._start==start
+            self._start=start;self._check();return start
+        except BaseException:
+            self._failed=True;raise ValueError('Process profile unavailable') from None
+
+    def close(self):
+        if self._closed:
+            if self._close_failed:raise ValueError('Process profile cleanup unavailable')
+            return
+        self._closed=True;failed=False
+        for name in ('_process','_parent'):
+            fd=getattr(self,name);setattr(self,name,None)
+            if fd is not None:
+                try:os.close(fd)
+                except BaseException:failed=True
+        chain,self._chain=self._chain,None
+        if chain is not None:
+            try:chain.close()
+            except BaseException:failed=True
+        if failed:
+            self._close_failed=True;raise ValueError('Process profile cleanup unavailable')
