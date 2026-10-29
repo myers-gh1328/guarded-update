@@ -83,6 +83,26 @@ class ReaderSessionTests(unittest.TestCase):
         self.assertEqual(evidence['scan_finished_boottime_ms'],130)
         with self.assertRaises(ValueError):session.frozen_scan_bounds()
 
+    def test_pinned_context_stays_frozen_when_root_current_advances(self):
+        session=self.pin();first=session.pinned_context()
+        expected={'cache_generation':GEN,'policy_generation':POLICY,'successful_checked_at':CHECKED,
+            'boot_id':BOOT,'pinned_boottime_ms':100}
+        self.assertEqual(first,expected);first['cache_generation']='f'*32
+        self.publish('d'*32,'e'*32);self.now=110
+        self.assertEqual(session.pinned_context(),expected)
+        self.assertFalse(self.store.retire(GEN))
+        session.close();self.assertTrue(self.store.retire(GEN))
+        with self.assertRaises(ValueError):session.pinned_context()
+
+    def test_pinned_context_rejects_wrong_stage_reboot_and_clock_rewind(self):
+        for failure in ('stage','reboot','rewind'):
+            self.now=100;session=self.pin()
+            if failure=='stage':self.start(session)
+            elif failure=='reboot':session._clock=lambda:('22222222-2222-4222-8222-222222222222',110)
+            else:self.now=99
+            with self.subTest(failure=failure),self.assertRaises(ValueError):session.pinned_context()
+            with self.assertRaises(ValueError):session.pinned_context()
+
     def test_scan_bounds_are_unavailable_before_freeze_or_after_clock_uncertainty(self):
         for phase in ('pinned','scanning','expired','rewound','reboot'):
             self.now=100;session=self.pin()

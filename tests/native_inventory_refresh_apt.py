@@ -1226,6 +1226,34 @@ print(json.dumps({'phase':'complete','evidence':{'parent_origin_mechanics':True,
     return prefix+'\nSOURCES='+repr(tuple((name,name+'.py') for name in modules))+'\n'+body
 
 
+def environment_mechanics_program():
+    # Fixed readonly composition proof, not a production runtime or Root scope.
+    prefix=(ROOT/'scripts/inventory_refresh_root_entry.py').read_text().split('\ndef main():',1)[0]
+    modules=('inventory_refresh_protocol','inventory_refresh_receipt','inventory_refresh_state','inventory_refresh_storage',
+        'inventory_refresh_status','inventory_refresh_observation','inventory_refresh_resources','inventory_refresh_reporter_resources',
+        'inventory_refresh_reporter_parent','inventory_refresh_reader_tools','inventory_refresh_reader_session',
+        'inventory_refresh_reporter_io','inventory_refresh_reporter_environment')
+    body=r'''
+import json
+assert len(sys.argv)==1
+sources=None;owner=None
+try:
+ sources=RootSources.fixed();loaded=sources.execute();closing,sources=sources,None;closing.close()
+ owner=loaded['inventory_refresh_reporter_environment'].ReporterEnvironment.fixed()
+ pinned=owner.pin_current();owner.verify();boot,now=owner.clock()
+ assert pinned==owner.pinned_context() and pinned['boot_id']==boot
+finally:
+ failed=False
+ for value in (owner,sources):
+  if value is not None:
+   try:value.close()
+   except BaseException:failed=True
+ if failed:raise ValueError('Environment mechanics cleanup unconfirmed')
+print(json.dumps({'phase':'complete','evidence':{'environment_pin_mechanics':True,'boot_id':boot,'boottime_ms':now,'pinned_context':pinned}}),flush=True)
+'''
+    return prefix+'\nSOURCES='+repr(tuple((name,name+'.py') for name in modules))+'\n'+body
+
+
 def publish_parent_fixture_file(fixture,directory,name,raw,mode):
     assert (name,mode) in (('command-center-inventory',0o555),('reporter-parent-proof.py',0o444))
     assert type(raw) is bytes and 0<len(raw)<=1024*1024
@@ -1264,7 +1292,7 @@ def retire_parent_fixture(fixture,confirmed_empty):
     assert not failed,'Synthetic parent fixture cleanup unconfirmed'
 
 
-def install_parent_fixture():
+def install_parent_fixture(program):
     from inventory_refresh_resources import _Chain
     assert sys.platform=='linux' and os.geteuid()==0 and os.environ.get('GITHUB_ACTIONS')=='true'
     fixture={'files':[],'directories':[]}
@@ -1296,14 +1324,14 @@ int main(void) {
             command(['/usr/bin/cc','-Wall','-Wextra','-Werror','-o',str(root/'parent'),str(root/'parent.c')],timeout=15)
             with (root/'parent').open('rb') as compiled:raw=compiled.read(1024*1024+1)
             publish_parent_fixture_file(fixture,binary.fds[-1],'command-center-inventory',raw,0o555)
-        publish_parent_fixture_file(fixture,library.fds[-1],'reporter-parent-proof.py',parent_mechanics_program().encode(),0o444)
+        publish_parent_fixture_file(fixture,library.fds[-1],'reporter-parent-proof.py',program.encode(),0o444)
         return fixture
     except BaseException:
         retire_parent_fixture(fixture,True)  # This installer never starts Parent.
         raise
 
 
-def prove_reporter_parent_mechanics():
+def run_reporter_parent_fixture(program):
     from inventory_refresh_unit_status import PROPERTIES
     for name in ('inventory_refresh_reporter_parent',):
         target=LIB_ROOT/(name+'.py');shutil.copyfile(ROOT/'scripts'/(name+'.py'),target);target.chmod(0o444)
@@ -1330,7 +1358,7 @@ def prove_reporter_parent_mechanics():
         finally:os.close(group)
         return True
     assert properties()['LoadState']=='not-found'
-    fixture=install_parent_fixture();process=None
+    fixture=install_parent_fixture(program);process=None
     try:
         args=['/usr/bin/systemd-run','--quiet','--wait','--collect','--pipe','--unit='+unit,'--slice='+PARENT_SLICE,'--description='+description]
         for item in ('User=60002','Group=60002','Type=exec','Restart=no','RemainAfterExit=no','KillMode=control-group',
@@ -1343,10 +1371,10 @@ def prove_reporter_parent_mechanics():
         deadline=time.monotonic()+25
         evidence=read_reporter_phase(process.stdout,'complete',deadline)['evidence']
         finish_reporter_output(process,deadline)
-        assert set(evidence)=={'parent_origin_mechanics','boot_id','boottime_ms'} and evidence['parent_origin_mechanics'] is True
         assert evidence['boot_id']==Path('/proc/sys/kernel/random/boot_id').read_text().strip()
         assert type(evidence['boottime_ms']) is int and 0<=evidence['boottime_ms']<=time.clock_gettime_ns(time.CLOCK_BOOTTIME)//1000000
         assert empty()
+        return evidence
     finally:
         confirmed=False
         try:
@@ -1356,6 +1384,22 @@ def prove_reporter_parent_mechanics():
             try:retire_parent_fixture(fixture,confirmed)
             finally:
                 if process is not None:process.stdout.close()
+
+
+def prove_reporter_parent_mechanics():
+    evidence=run_reporter_parent_fixture(parent_mechanics_program())
+    assert set(evidence)=={'parent_origin_mechanics','boot_id','boottime_ms'} and evidence['parent_origin_mechanics'] is True
+
+
+def prove_reporter_environment_mechanics(public):
+    target=LIB_ROOT/'inventory_refresh_reporter_environment.py'
+    shutil.copyfile(ROOT/'scripts/inventory_refresh_reporter_environment.py',target);target.chmod(0o444)
+    before=public();evidence=run_reporter_parent_fixture(environment_mechanics_program())
+    assert set(evidence)=={'environment_pin_mechanics','boot_id','boottime_ms','pinned_context'} and evidence['environment_pin_mechanics'] is True
+    pinned=evidence['pinned_context']
+    assert set(pinned)=={'cache_generation','policy_generation','successful_checked_at','boot_id','pinned_boottime_ms'}
+    assert all(pinned[key]==before[key] for key in ('cache_generation','policy_generation','successful_checked_at'))
+    assert pinned['boot_id']==evidence['boot_id'] and type(pinned['pinned_boottime_ms']) is int and 0<=pinned['pinned_boottime_ms']<=evidence['boottime_ms']
 
 
 def prove_reporter_library_roundtrip(actor,public):
@@ -1569,6 +1613,7 @@ def prove_actual_coordinator_entry_loop():
         assert match_projected_reader_receipt(offer,reader_proof,receipt)
         receipt=prove_reporter_library_roundtrip(actor,public)
         prove_reporter_parent_mechanics()
+        prove_reporter_environment_mechanics(public)
         invalidate_policy()
         assert launcher.wait(timeout=35)==74
         final=confirm_inert();assert final['ExecMainCode']=='1' and final['ExecMainStatus']=='74' and final['Result']=='exit-code'
@@ -1594,6 +1639,7 @@ def prove_actual_coordinator_entry_loop():
         'restricted_reporter_session_root_status_roundtrip_verified':True,
         'restricted_reporter_current_readonly_resource_admission_verified':True,
         'restricted_reporter_parent_origin_clock_mechanics_verified':True,
+        'restricted_reporter_protected_environment_pin_mechanics_verified':True,
         'restricted_reporter_request_writer_roundtrip_verified':True}
 
 def is_live_worker(raw,*,parent=None):

@@ -159,6 +159,17 @@ class ReaderSession:
             self.close()
             raise
 
+    def pinned_context(self):
+        """Frozen pin metadata only; no Root lease, scan or freshness authority."""
+        try:
+            _require(not self._closed and self._phase=='pinned')
+            self._time()
+            return {'cache_generation':self._generation,'policy_generation':self._policy,
+                'successful_checked_at':self._checked,'boot_id':self._boot,'pinned_boottime_ms':self._pinned_at}
+        except BaseException:
+            self.close()
+            raise
+
     def installed(self):
         return self._fixed_data('installed')
 

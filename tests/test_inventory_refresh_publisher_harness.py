@@ -31,6 +31,24 @@ class PublisherHarnessTests(unittest.TestCase):
         coordinator=next(node for node in tree.body if isinstance(node,ast.FunctionDef) and node.name=='prove_actual_coordinator_entry_loop')
         self.assertIn('prove_reporter_parent_mechanics()',ast.unparse(coordinator))
 
+    def test_environment_mechanics_program_pins_without_writer_or_os_queries(self):
+        tree=ast.parse((Path(__file__).parent/'native_inventory_refresh_apt.py').read_bytes())
+        factory=next(node for node in tree.body if isinstance(node,ast.FunctionDef) and node.name=='environment_mechanics_program')
+        scope={'ROOT':Path(__file__).resolve().parents[1]}
+        exec(compile(ast.Module(body=[factory],type_ignores=[]),'<environment-factory>','exec'),scope)
+        code=scope['environment_mechanics_program']();compile(code,'<environment-mechanics>','exec')
+        self.assertIn("owner=loaded['inventory_refresh_reporter_environment'].ReporterEnvironment.fixed()",code)
+        self.assertIn('pinned=owner.pin_current()',code)
+        body=ast.parse(code)
+        assignments=[node.value for node in body.body if isinstance(node,ast.Assign) and any(isinstance(target,ast.Name) and target.id=='SOURCES' for target in node.targets)]
+        modules={name for name,_ in ast.literal_eval(assignments[-1])}
+        self.assertEqual(len(modules),13)
+        for forbidden in ('inventory_refresh_io','inventory_refresh_policy','inventory_refresh_guardian'):
+            self.assertNotIn(forbidden,modules)
+        self.assertNotIn('session.policy(',code)
+        coordinator=next(node for node in tree.body if isinstance(node,ast.FunctionDef) and node.name=='prove_actual_coordinator_entry_loop')
+        self.assertIn('prove_reporter_environment_mechanics(public)',ast.unparse(coordinator))
+
     def parent_file_helpers(self):
         tree=ast.parse((Path(__file__).parent/'native_inventory_refresh_apt.py').read_bytes())
         helpers=[node for node in tree.body if isinstance(node,ast.FunctionDef) and node.name in ('publish_parent_fixture_file','retire_parent_fixture')]

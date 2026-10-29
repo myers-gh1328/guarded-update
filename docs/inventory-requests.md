@@ -222,3 +222,20 @@ completion authority. Same UID remains a trusted-code boundary. It does not
 establish initial host namespace, selected release/code-hash origin or fit.
 Native verification uses an explicitly synthetic fixed-path C parent to check
 these admission mechanics; it does not establish the Rust coordinator lifecycle.
+
+The staged environment composes that parent owner with fixed Root-owned runtime,
+status, cache, dpkg and library ancestry capabilities. It exposes protected status
+reads and one read-only cache pin, with no caller path, UID, policy or generation
+selection. Missing status or the narrowly typed atomic-publication race can
+return no status only after parent/ancestry revalidation; every other unsafe
+failure consumes the environment. A pin attempt is latched before reading status
+or acquiring a lease. Even transient absence during that attempt closes the
+environment; a caller can wait through separate status reads beforehand.
+
+Pinned context is detached metadata for the original generation and native pin
+time. A newer Root head does not replace that held pin or relabel its policy.
+The metadata grants no freshness, observation or coherent-report authority.
+Cleanup consumes the session, status reader, reverse ancestry owners and parent,
+attempting every close once. The extra native fixture checks this read-only
+composition under its synthetic C parent; source bootstrap, runtime wiring and
+physical cleanup/publication gates remain separate.
