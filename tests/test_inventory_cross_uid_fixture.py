@@ -20,6 +20,30 @@ from inventory_refresh_io import Inbox
 
 
 class BindingTest(unittest.TestCase):
+    def test_unit_reference_is_one_shot_and_close_failures_are_absorbing(self):
+        class Ops:
+            def __init__(self, fail=None): self.calls=[]; self.fail=fail
+            def ref(self, deadline): self.calls.append('ref'); return self.fail != 'ref'
+            def alive(self): self.calls.append('alive'); return self.fail != 'alive'
+            def unref(self, deadline): self.calls.append('unref'); return self.fail != 'unref'
+            def close(self): self.calls.append('close'); return self.fail != 'close'
+        deadline = time.monotonic() + 5
+        good = Ops()
+        reference = MODULE.UnitReference.acquire(good, deadline)
+        reference.verify()
+        reference.close()
+        self.assertEqual(good.calls, ['ref', 'alive', 'alive', 'unref', 'close'])
+        for fault in ('ref', 'alive', 'unref', 'close'):
+            with self.subTest(fault=fault):
+                ops = Ops(fault)
+                if fault in ('ref', 'alive'):
+                    with self.assertRaises(ValueError): MODULE.UnitReference.acquire(ops, deadline)
+                else:
+                    reference = MODULE.UnitReference.acquire(ops, deadline)
+                    with self.assertRaises(ValueError): reference.close()
+                    with self.assertRaises(ValueError): reference.close()
+                self.assertEqual(ops.calls.count('close'), 1)
+
     def test_unit_pin_distinguishes_exit_and_wrong_cgroup_without_raw_values(self):
         status = {'LoadState': 'loaded', 'ActiveState': 'active', 'Description':'test', 'InvocationID': 'a' * 32, 'ControlGroup': '/expected'}
         self.assertEqual(MODULE.unit_pin_decision(status, None, '/expected', 'test', time.monotonic() + 5), 'ready')

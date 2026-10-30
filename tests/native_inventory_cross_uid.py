@@ -37,6 +37,52 @@ class PinError(ValueError):
         super().__init__(ERROR)
 
 
+class UnitReference:
+    """Own one fixture bus reference; never conveys process or cgroup authority."""
+    def __init__(self, ops, deadline):
+        self._ops, self._deadline = ops, deadline
+        self._referenced = False
+        self._closed = False
+        self._failed = False
+
+    @classmethod
+    def acquire(cls, ops, deadline):
+        reference = cls(ops, deadline)
+        try:
+            if time.monotonic() >= deadline or not ops.ref(deadline): raise ValueError(ERROR)
+            reference._referenced = True
+            reference.verify()
+            return reference
+        except BaseException:
+            reference._failed = True
+            try: reference.close()
+            except BaseException: pass
+            raise ValueError(ERROR) from None
+
+    def verify(self):
+        try:
+            if self._closed or self._failed or time.monotonic() >= self._deadline or not self._ops.alive():
+                raise ValueError(ERROR)
+        except BaseException:
+            self._failed = True
+            raise ValueError(ERROR) from None
+
+    def close(self):
+        if self._closed:
+            if self._failed: raise ValueError(ERROR)
+            return
+        self._closed = True
+        if self._referenced:
+            try:
+                if not self._ops.unref(self._deadline): self._failed = True
+            except BaseException: self._failed = True
+        try:
+            if not self._ops.close(): self._failed = True
+        except BaseException: self._failed = True
+        if time.monotonic() >= self._deadline: self._failed = True
+        if self._failed: raise ValueError(ERROR)
+
+
 def unit_pin_decision(status, exit_code, expected_group, description, deadline, invocation=None):
     if time.monotonic() >= deadline: raise PinError('unit_pin_deadline')
     if exit_code is not None: raise PinError('unit_pin_exited')
@@ -473,11 +519,12 @@ def run(archive):
     from inventory_refresh_resources import _Chain
     from inventory_refresh_process_snapshot import ProcessProbe
     from inventory_refresh_cgroup_witness import observe_single_process
+    from inventory_cross_uid_bus import NativeBus
     from inventory_refresh_state import Journal
     from inventory_refresh_io import Inbox
 
     deadline = time.monotonic() + 60
-    parent_chain = group_chain = fixture = artifact = binary = journal = inbox = probe = launcher = None
+    parent_chain = group_chain = fixture = artifact = binary = journal = inbox = probe = launcher = reference = bus = None
     failed = False
     completed = False
     stage = 'unit_status'
@@ -564,6 +611,18 @@ def run(archive):
             except PinError as error:
                 stage = error.reason
                 raise
+            stage = 'unit_ref_connection'
+            bus = NativeBus.fixed(deadline)
+            stage = 'unit_ref_before'
+            before_ref = unit_status(min(deadline, time.monotonic() + 3))
+            validate_live_identity(before_ref, description, expected_group, invocation, pid)
+            owned_bus, bus = bus, None
+            stage = 'unit_ref_call'
+            reference = UnitReference.acquire(owned_bus, deadline)
+            reference.verify()
+            stage = 'unit_ref_after'
+            after_ref = unit_status(min(deadline, time.monotonic() + 3))
+            validate_live_identity(after_ref, description, expected_group, invocation, pid)
             stage = 'group_pin'
             group_chain = _Chain(('sys', 'fs', 'cgroup', 'command.slice', 'command-center.slice',
                 'command-center-inventory.slice', UNIT))
@@ -576,6 +635,7 @@ def run(archive):
             start = probe.sample()
             observe_single_process(group_chain.fds[-2], UNIT, group_chain.fds[-1], pid, deadline)
             fixture.verify(); parent_chain.verify(); group_chain.verify()
+            reference.verify()
             stage = 'cas'
             accept_after_marker(marker, fixture, journal, inbox)
             stage = 'process_recheck'
@@ -584,6 +644,7 @@ def run(archive):
             again = unit_status(min(deadline, time.monotonic() + 3))
             validate_live_identity(again, description, expected_group, invocation, pid)
             fixture.verify(); parent_chain.verify(); group_chain.verify()
+            reference.verify()
             probe.close(); probe = None
             stage = 'ack'
             write_ack(launcher.stdin.fileno(), deadline, lambda: verify_endpoints(verified_endpoints))
@@ -595,15 +656,18 @@ def run(archive):
             if remaining <= 0 or launcher.wait(timeout=remaining) != 0: raise ValueError(ERROR)
             validate_test_output(output)
             stage = 'unit_final'
+            reference.verify()
             final = unit_status(min(deadline, time.monotonic() + 3))
             try: validate_final_identity(final, description, invocation)
             except PinError as error:
                 stage = error.reason
                 raise
             stage = 'group_empty'
+            reference.verify()
             group_chain.verify()
             empty_group(group_chain.fds[-2], UNIT, group_chain.fds[-1], deadline)
             fixture.verify(); parent_chain.verify(); artifact.verify(); binary.verify_published()
+            reference.verify()
             completed = True
     except BaseException:
         failed = True
@@ -614,7 +678,11 @@ def run(archive):
                 if stream is not None:
                     try: stream.close()
                     except BaseException: failed = True
-        for owned in (probe, inbox, group_chain, fixture, parent_chain, binary, artifact):
+        if bus is not None:
+            try:
+                if not bus.close(): failed = True
+            except BaseException: failed = True
+        for owned in (reference, probe, inbox, group_chain, fixture, parent_chain, binary, artifact):
             if owned is not None:
                 try: owned.close()
                 except BaseException: failed = True

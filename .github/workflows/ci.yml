@@ -178,7 +178,7 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
       - name: Test cross-UID fixture gates
-        run: python3 -B -m unittest discover -s tests -p 'test_inventory_cross_uid_fixture.py' -v
+        run: python3 -B -m unittest discover -s tests -p 'test_inventory_cross_uid*.py' -v
       - name: Build separate inactive inventory metadata helper archive
         run: python3 -I -B -S scripts/package-inventory-helper.py "$RUNNER_TEMP/inventory-helper-source"
       - name: Build isolated unprivileged Rust parent fixture
