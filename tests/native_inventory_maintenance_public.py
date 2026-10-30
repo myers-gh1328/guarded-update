@@ -46,7 +46,7 @@ else:sys.exit(93)
 
 def command(mode,root):
     if mode not in ('absent','deny','create','present') or type(root) is not bool or root!=(mode=='create'):raise ValueError(ERROR)
-    command=[] if root else ['/usr/bin/setpriv','--reuid=60002','--regid=60002','--clear-groups','--inh-caps=-all','--bounding-set=-all','--no-new-privs']
+    command=[] if root else ['/usr/bin/setpriv','--reuid=60002','--regid=60002','--clear-groups','--inh-caps=-all','--bounding-set=-all','--ambient-caps=-all','--no-new-privs','--']
     return command+['/usr/bin/python3','-I','-B','-S','-c',PROGRAM,mode]
 
 
