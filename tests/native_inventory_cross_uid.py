@@ -129,7 +129,11 @@ def validate_live_identity(status, description, group, invocation=None, pid=None
 
 def validate_final_identity(status, description, invocation):
     try:
-        if status['Description'] != description: raise PinError('unit_final_description')
+        if status['Description'] != description:
+            category = 'notfound' if status.get('LoadState') == 'not-found' else 'loaded' if status.get('LoadState') == 'loaded' else 'other'
+            if not status['Description']:
+                raise PinError('unit_final_description_missing_' + category)
+            raise PinError('unit_final_description_different_' + category)
         if status['InvocationID'] != invocation: raise PinError('unit_final_invocation')
         active = status['ActiveState']
         if active not in ('inactive', 'failed'):

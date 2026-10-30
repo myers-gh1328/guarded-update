@@ -298,6 +298,12 @@ class BindingTest(unittest.TestCase):
         status = {'Description':'test', 'InvocationID':'a' * 32, 'ActiveState':'inactive',
                   'Result':'success', 'ExecMainCode':'1', 'ExecMainStatus':'0'}
         MODULE.validate_final_identity(status, 'test', 'a' * 32)
+        with self.assertRaises(MODULE.PinError) as missing:
+            MODULE.validate_final_identity(dict(status, Description='', LoadState='not-found'), 'test', 'a' * 32)
+        self.assertEqual(missing.exception.reason, 'unit_final_description_missing_notfound')
+        with self.assertRaises(MODULE.PinError) as different:
+            MODULE.validate_final_identity(dict(status, Description='other', LoadState='not-found'), 'test', 'a' * 32)
+        self.assertEqual(different.exception.reason, 'unit_final_description_different_notfound')
         for field, value, reason in [('ActiveState','deactivating','unit_final_active_deactivating'),
                 ('InvocationID','b' * 32,'unit_final_invocation'), ('Result','exit-code','unit_final_result'),
                 ('ExecMainCode','0','unit_final_code'), ('ExecMainStatus','1','unit_final_status')]:
