@@ -27,6 +27,8 @@ class RuntimeTests(unittest.TestCase):
         self.resource_factory=add('inventory_refresh_runtime.RuntimeResources.fixed',side_effect=lambda:(self.events.append('resources_open'),self.resources)[1])
         self.policy_factory=add('inventory_refresh_runtime.PolicyGuard.fixed',side_effect=lambda:(self.events.append('policy_open'),f.policy)[1])
         add('inventory_refresh_runtime._state',return_value=self.state)
+        actual_maintenance_present=module.maintenance_present
+        add('inventory_refresh_runtime.maintenance_present',side_effect=lambda fd,owner,verify:actual_maintenance_present(fd,os.getuid(),verify))
         add('inventory_refresh_runtime._accounts',return_value=self.accounts)
         add('inventory_refresh_runtime.Journal',return_value=f.journal)
         add('inventory_refresh_runtime.Store',return_value=f.store)
@@ -55,6 +57,34 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(self.runtime.step()['state'],'ready')
         self.assertIs(self.runtime._dispatcher._journal,self.f.journal)
         self.assertEqual(self.f.status()['cache_generation'],'c'*32)
+
+    def test_existing_maintenance_marker_rejects_without_journal_write(self):
+        marker=self.f.root/'state'/'maintenance.pending';marker.write_bytes(b'partial')
+        state_before={p.name:p.read_bytes() for p in (self.f.root/'state').iterdir() if p.is_file()}
+        self.f.journal.fence_external=Mock()
+        with self.assertRaises(ValueError):module.FixedRuntime.fixed()
+        self.f.journal.fence_external.assert_not_called()
+        state_after={p.name:p.read_bytes() for p in (self.f.root/'state').iterdir() if p.is_file()}
+        self.assertEqual(state_after,state_before)
+        module.WriterExclusion.fixed.assert_not_called()
+        module.Inbox.fixed.assert_not_called()
+        for inbox in self.inboxes.values():inbox.read.assert_not_called()
+
+    def test_dangling_marker_and_marker_io_error_reject_without_journal_write(self):
+        marker=self.f.root/'state'/'maintenance.pending';marker.symlink_to('missing')
+        state_before={p.name:p.read_bytes() for p in (self.f.root/'state').iterdir() if p.is_file()}
+        self.f.journal.fence_external=Mock()
+        with self.assertRaises(ValueError):module.FixedRuntime.fixed()
+        self.assertTrue(marker.is_symlink())
+        marker.unlink()
+        with patch.object(module,'maintenance_present',side_effect=OSError('uncertain')):
+            with self.assertRaises(ValueError):module.FixedRuntime.fixed()
+        self.f.journal.fence_external.assert_not_called()
+        state_after={p.name:p.read_bytes() for p in (self.f.root/'state').iterdir() if p.is_file()}
+        self.assertEqual(state_after,state_before)
+        module.WriterExclusion.fixed.assert_not_called()
+        module.Inbox.fixed.assert_not_called()
+        for inbox in self.inboxes.values():inbox.read.assert_not_called()
 
     def test_runtime_drain_latches_without_releasing_root_lock(self):
         self.runtime=module.FixedRuntime.fixed()

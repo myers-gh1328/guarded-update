@@ -24,7 +24,7 @@ SOURCES=tuple((name,'guardian.py' if name=='inventory_refresh_guardian' else nam
     'inventory_refresh_policy_admission','inventory_refresh_materialized_policy','inventory_refresh_worker_service',
     'inventory_refresh_resources','inventory_refresh_materializer','inventory_refresh_writer_exclusion',
     'inventory_refresh_io','inventory_refresh_coordinator','inventory_refresh_contention','inventory_refresh_transaction',
-    'inventory_refresh_observation_transaction','inventory_refresh_dispatch','inventory_refresh_runtime'))
+    'inventory_refresh_observation_transaction','inventory_refresh_dispatch','inventory_refresh_maintenance_fence','inventory_refresh_runtime'))
 
 
 def _require(condition):

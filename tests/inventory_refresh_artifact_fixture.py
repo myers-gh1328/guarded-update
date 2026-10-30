@@ -29,7 +29,7 @@ ROOT_MODULES=('inventory_refresh_protocol','inventory_refresh_receipt','inventor
     'inventory_refresh_policy_admission','inventory_refresh_materialized_policy','inventory_refresh_worker_service',
     'inventory_refresh_resources','inventory_refresh_materializer','inventory_refresh_writer_exclusion',
     'inventory_refresh_io','inventory_refresh_coordinator','inventory_refresh_contention','inventory_refresh_transaction',
-    'inventory_refresh_observation_transaction','inventory_refresh_dispatch','inventory_refresh_runtime')
+    'inventory_refresh_observation_transaction','inventory_refresh_dispatch','inventory_refresh_maintenance_fence','inventory_refresh_runtime')
 REPORTER_MODULES=('inventory_refresh_protocol','inventory_refresh_receipt','inventory_refresh_state','inventory_refresh_storage',
     'inventory_refresh_status','inventory_refresh_observation','inventory_refresh_resources','inventory_refresh_reporter_resources',
     'inventory_refresh_reporter_parent','inventory_refresh_reader_tools','inventory_refresh_reader_session',

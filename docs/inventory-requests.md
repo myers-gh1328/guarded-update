@@ -140,6 +140,11 @@ lock release, or maintenance
 ownership. Valid unstarted requests can still remain in the inboxes; a future
 maintenance owner must fence producers and reconcile those files before
 switching modes. Those remain separate requirements before publishing a binding.
+Coordinator startup rejects any `maintenance.pending` entry, or an uncertain
+read of that entry, before constructing action-capable components. This
+sampled check does not stop reporter starts or prevent concurrent publication.
+The marker has no automatic removal; startup requires explicit reconciliation
+when it is present. Its absence does not resolve an uncertain prior write.
 
 ### Enrollment and Root epoch binding
 
@@ -447,7 +452,7 @@ fixtures, not an activated executable or native completion proof.
 
 A build-only generator now composes a fixed reporter entry from the existing
 Root source loader's exact helper/class segments and a reporter-specific
-template. It preserves the Root coordinator and its27-module closure. The
+template. It preserves the Root coordinator and its 28-module closure. The
 reporter closure has18 fixed dependency-ordered modules, admitted and compiled
 as one batch before any project execution. Generation rejects unexpected AST
 shapes, helper/closure shadowing and duplicate markers, and records input,

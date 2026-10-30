@@ -1072,7 +1072,7 @@ directly compares bounded nofollow worktree bytes with those blobs before and
 after generation. Index hints cannot hide relevant dirt; unrelated worktree
 changes are excluded.
 
-Strict AST checks select the unchanged27-module Root mapping and fixed18-module
+Strict AST checks select the 28-module Root mapping and fixed 18-module
 reporter mapping. Only the selected trusted build-time generator is executed;
 it parses/extracts/compiles runtime source without running that runtime code.
 This is a trusted build boundary, not an arbitrary-Python sandbox. A private

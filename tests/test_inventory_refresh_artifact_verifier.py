@@ -40,7 +40,7 @@ class FixtureArchiveTests(unittest.TestCase):
     def test_exact_pipeline_shape_reconstructs_without_runtime_or_generator_execution(self):
         result=verifier.verify_archive(self.fixture.repo,self.archive)
         self.assertEqual(result['source_commit'],self.fixture.git('rev-parse','HEAD').decode().strip())
-        self.assertEqual(len(result['files']),44)
+        self.assertEqual(len(result['files']),45)
         self.assertEqual(len(result['reporter_modules']),18)
         self.assertIn('libexec/command-center-inventory-refresh/reporter.py',result['files'])
 

@@ -11,6 +11,7 @@ import sys
 from inventory_refresh_channel import ObservationChannel
 from inventory_refresh_dispatch import RootDispatcher
 from inventory_refresh_io import Inbox,StatusPublisher
+from inventory_refresh_maintenance_fence import present as maintenance_present
 from inventory_refresh_observation import _Ancestry
 from inventory_refresh_observation_transaction import ObservationTransaction
 from inventory_refresh_observer import kernel_clock
@@ -66,6 +67,7 @@ class FixedRuntime:
         value._owned=[];value._state=None;value._lock=None;value._held=False
         value._journal=None;value._closed=False;value._failed=False;value._dispatcher=None
         value._maintenance=maintenance
+        marker_check=False
         try:
             # Admission precedes all private policy/cache contents/account lookup.
             value._resources=RuntimeResources.fixed();value._own(value._resources)
@@ -74,6 +76,10 @@ class FixedRuntime:
             worker,reporter=accounts
             value._state=_state();value._journal=Journal(value._state.fds[-1])
             value._lock=value._journal.exclusive();value._lock.__enter__();value._held=True
+            marker_check=True
+            if maintenance_present(value._state.fds[-1],0,value._state.verify):
+                raise ValueError('Inventory runtime maintenance pending')
+            marker_check=False
             if value._journal.startup_ready() is not True:
                 raise ValueError('Inventory runtime requires reconciled durable state')
             value._writers=WriterExclusion.fixed(worker.pw_uid);value._own(value._writers)
@@ -94,7 +100,7 @@ class FixedRuntime:
             value._refresh._current(kernel_clock()[0])
             return value
         except BaseException:
-            value._fence()
+            if not marker_check:value._fence()
             try:value.close()
             except BaseException:pass
             raise ValueError('Inventory runtime admission unconfirmed') from None
