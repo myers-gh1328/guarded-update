@@ -87,6 +87,43 @@ epoch and separate refresh, observation and release counters when no operation
 is active or globally unconfirmed. The projection is not published to the agent,
 does not reserve a nonce, and cannot initialize or authenticate an enrollment.
 
+### Counter allocation integration boundary
+
+The Root coordinator owns its durable counters and holds its journal lock for
+the runtime lifetime. The inventory agent separately owns its request journal
+under the inventory lock. A counter snapshot is immediately stale once other
+Root operations can run, and an existing Root `received` record can be replaced
+by a later higher nonce. Neither is an exclusive reservation for an agent.
+Holding the service lock excludes other lock holders; it does not stop the same
+dispatcher from processing a conflicting inbox while an exchange is in progress.
+
+A future allocation exchange must authenticate the requesting agent and bind
+its enrollment to the Root epoch. It must also define a single global lock order,
+retain bounded service availability, and establish the shared nonce rules for
+observation and release. A candidate flow is:
+
+1. Root proposes a nonce under its journal's current counter state. The proposal
+   does not authorize a process launch or establish a reservation.
+2. The agent persists its exact intent under its own journal lock before sending
+   an acknowledgement. It retains an uncertainty fence if the exchange fails.
+3. Root durably admits the exact nonce before acknowledging admission. The agent
+   cannot treat a missing acknowledgement as proof that admission failed.
+4. Before a process effect, the agent durably persists its own submitted state;
+   uncertain persistence authorizes no effect. Root revalidates the exact admitted
+   record and persists its start under its journal lock. The two journal commits
+   are not atomic. A later higher nonce may have superseded the earlier received
+   record; an old acknowledgement is insufficient.
+
+This flow is not implemented. A Root service waiting for an agent could starve
+its dispatcher or deadlock against the agent lock. A viable implementation needs
+fixed authenticated single-flight nonblocking transport, a separately supervised
+bounded BOOTTIME deadline, and confirmed owned cleanup. Timeout alone proves no
+cleanup or lock release. Transport ownership, epoch binding, lock order and
+dispatcher fairness remain unresolved.
+Crashes before or after either durable write, lost replies, reboot, duplicate
+clients and supersession must retain uncertainty rather than retry a launch.
+No journal seeding or runtime activation follows from this proposed flow.
+
 Linux sync inspects an existing request journal under its inventory lock before
 starting a daily collection. A pending journal replacement, invalid or unreadable
 journal, or retained manual or collection work defers that collection and
