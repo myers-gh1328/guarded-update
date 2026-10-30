@@ -20,6 +20,16 @@ from inventory_refresh_io import Inbox
 
 
 class BindingTest(unittest.TestCase):
+    def test_unit_pin_distinguishes_exit_and_wrong_cgroup_without_raw_values(self):
+        status = {'LoadState': 'loaded', 'InvocationID': 'a' * 32, 'ControlGroup': '/expected'}
+        self.assertEqual(MODULE.unit_pin_decision(status, None, '/expected', time.monotonic() + 5), 'ready')
+        with self.assertRaises(MODULE.PinError) as wrong:
+            MODULE.unit_pin_decision(dict(status, ControlGroup='/private-detail'), None, '/expected', time.monotonic() + 5)
+        self.assertEqual(wrong.exception.reason, 'unit_pin_cgroup')
+        with self.assertRaises(MODULE.PinError) as exited:
+            MODULE.unit_pin_decision({'LoadState': 'not-found', 'InvocationID': '', 'ControlGroup': ''}, 1, '/expected', time.monotonic() + 5)
+        self.assertEqual(exited.exception.reason, 'unit_pin_exited')
+
     def test_libexec_creation_is_exclusive_and_preserves_uncertain_paths(self):
         with tempfile.TemporaryDirectory() as temporary:
             parent = os.open(temporary, os.O_RDONLY | os.O_DIRECTORY)

@@ -31,6 +31,23 @@ UNIT = 'command-center-inventory.service'
 ENV = {'PATH': '/usr/sbin:/usr/bin:/sbin:/bin', 'LC_ALL': 'C', 'PYTHONDONTWRITEBYTECODE': '1'}
 
 
+class PinError(ValueError):
+    def __init__(self, reason):
+        self.reason = reason
+        super().__init__(ERROR)
+
+
+def unit_pin_decision(status, exit_code, expected_group, deadline):
+    if time.monotonic() >= deadline: raise PinError('unit_pin_deadline')
+    if status['LoadState'] not in ('not-found', 'loaded'): raise PinError('unit_pin_load')
+    group = status['ControlGroup']
+    if group and group != expected_group: raise PinError('unit_pin_cgroup')
+    if status['LoadState'] == 'loaded' and status['InvocationID'] and group == expected_group:
+        return 'ready'
+    if exit_code is not None: raise PinError('unit_pin_exited')
+    return 'wait'
+
+
 def account_command(kind, deadline):
     commands = {
         'group': ['/usr/sbin/groupadd', '--system', '--gid', '60002', 'ccinventory'],
@@ -492,14 +509,16 @@ def run(archive):
             for stream, _ in endpoints: os.set_blocking(stream.fileno(), False)
             verified_endpoints = tuple((stream, direction, identity) for (stream, direction), identity in zip(endpoints, identities))
             verify_endpoints(verified_endpoints)
-            stage = 'unit_pin'
+            stage = 'unit_pin_query'
             while True:
                 status = unit_status(min(deadline, time.monotonic() + 3))
-                if status['LoadState'] == 'loaded' and status['InvocationID'] and status['ControlGroup'] == expected_group:
-                    break
-                if status['LoadState'] not in ('not-found', 'loaded') or launcher.poll() is not None or time.monotonic() >= deadline:
-                    raise ValueError(ERROR)
+                try: decision = unit_pin_decision(status, launcher.poll(), expected_group, deadline)
+                except PinError as error:
+                    stage = error.reason
+                    raise
+                if decision == 'ready': break
                 time.sleep(.02)
+            stage = 'unit_pin_identity'
             invocation, pid = validate_live_identity(status, description, expected_group)
             stage = 'group_pin'
             group_chain = _Chain(('sys', 'fs', 'cgroup', 'command.slice', 'command-center.slice',
