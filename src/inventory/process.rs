@@ -129,6 +129,35 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     #[ignore]
+    #[allow(clippy::disallowed_methods)] // Dedicated fixture control pipe, not a log.
+    fn hosted_fd_reporter_parent_admission() {
+        assert_eq!(
+            std::env::var("GUARDED_UPDATE_NATIVE_EXEC_PARENT_PROOF")
+                .ok()
+                .as_deref(),
+            Some("1")
+        );
+        let program = "import sys\nsys.path.insert(0,'/usr/local/libexec/command-center-inventory-refresh')\nfrom inventory_refresh_reporter_parent import ReporterParent\nowner=ReporterParent.fixed()\ntry:\n owner.verify();owner.clock();owner.verify()\nfinally:owner.close()\nsys.stdout.buffer.write(b'PARENT_OK\\n')";
+        let result = SystemTools
+            .run_with_timeout(
+                "/usr/bin/python3",
+                &["-I", "-B", "-S", "-c", program],
+                &[],
+                64,
+                Duration::from_secs(10),
+            )
+            .unwrap();
+        assert_eq!(result, b"PARENT_OK\n");
+        super::super::reporter_barrier::handshake(
+            &std::io::stdin(),
+            &std::io::stderr(),
+            Instant::now() + Duration::from_secs(10),
+        )
+        .unwrap();
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore]
     fn held_fd_exec_child() {
         use std::os::unix::fs::MetadataExt;
         let value = std::env::var("EXEC_IDENTITY").unwrap();

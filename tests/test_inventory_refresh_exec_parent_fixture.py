@@ -12,6 +12,6 @@ class ExecParentFixtureTests(unittest.TestCase):
         self.assertEqual(command[:4],['/usr/bin/python3','-I','-B','-S'])
         self.assertNotIn('/bin/sh',command)
         compile(fixture.PROGRAM,'fixed-wrapper','exec')
-        self.assertIn('inventory::reporter_obs::tests::hosted_real_reporter_rust_journal_sample',fixture.PROGRAM)
+        self.assertIn('inventory::process::tests::hosted_fd_reporter_parent_admission',fixture.PROGRAM)
         for arguments in ((0,2,3,'a'*64,4,5),(1,2,3,'x'*64,4,5),(True,2,3,'a'*64,4,5),(2**64,2,3,'a'*64,4,5)):
             with self.assertRaises(ValueError):fixture.wrapper_command(*arguments)

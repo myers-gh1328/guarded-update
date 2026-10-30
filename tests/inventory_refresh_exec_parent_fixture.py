@@ -75,8 +75,8 @@ while len(ack)<9:
  ack+=data
 if ack!=b'EXEC-ACK\n':sys.exit(74)
 source_check()
-env={'PATH':'/usr/bin:/bin','LC_ALL':'C','LANG':'C','GITHUB_ACTIONS':'true','GUARDED_UPDATE_NATIVE_RUST_PROOF':'1','GUARDED_UPDATE_NATIVE_BARRIER_PROOF':'1'}
-os.execve(source,['/usr/local/libexec/command-center-inventory','--exact','inventory::reporter_obs::tests::hosted_real_reporter_rust_journal_sample','--ignored','--test-threads=1','--nocapture'],env)
+env={'PATH':'/usr/bin:/bin','LC_ALL':'C','LANG':'C','GITHUB_ACTIONS':'true','GUARDED_UPDATE_NATIVE_EXEC_PARENT_PROOF':'1'}
+os.execve(source,['/usr/local/libexec/command-center-inventory','--exact','inventory::process::tests::hosted_fd_reporter_parent_admission','--ignored','--test-threads=1','--nocapture'],env)
 '''
 
 
