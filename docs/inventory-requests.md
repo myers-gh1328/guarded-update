@@ -128,6 +128,17 @@ Crashes before or after either durable write, lost replies, reboot, duplicate
 clients and supersession must retain uncertainty rather than retry a launch.
 No journal seeding or runtime activation follows from this proposed flow.
 
+The internal Root dispatcher has a one-way drain mode for an eventual
+maintenance owner. It stops admitting new refresh and observation requests,
+but can finish the matching release of an already owned observation. Its
+`drained` result requires no active or unconfirmed journal entries, no owned
+observation scope or pin, valid inbox reads, and revalidated policy and resource
+context. It is not wired to a stop
+request and does not prove process-set emptiness, lock release, or maintenance
+ownership. Valid unstarted requests can still remain in the inboxes; a future
+maintenance owner must fence producers and reconcile those files before
+switching modes. Those remain separate requirements before publishing a binding.
+
 ### Enrollment and Root epoch binding
 
 The current Linux provisioning workflow generates the reporting key on the
