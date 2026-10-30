@@ -28,6 +28,8 @@ UNIT_PROPERTIES = ('LoadState', 'ActiveState', 'Description', 'InvocationID', 'C
                    'MainPID', 'Result', 'ExecMainCode', 'ExecMainStatus', 'Delegate',
                    'ProtectControlGroups', 'MemoryPressureWatch')
 UNIT = 'command-center-inventory.service'
+SLICE = 'command-center-inventory.slice'
+SLICE_PROPERTIES = ('LoadState', 'ActiveState', 'Description', 'InvocationID', 'ControlGroup', 'Delegate')
 ENV = {'PATH': '/usr/sbin:/usr/bin:/sbin:/bin', 'LC_ALL': 'C', 'PYTHONDONTWRITEBYTECODE': '1'}
 
 
@@ -83,6 +85,83 @@ class UnitReference:
         if self._failed: raise ValueError(ERROR)
 
 
+class SliceFile:
+    """Exclusively published test slice; files are never retired here."""
+    NAME = 'command-center-inventory.slice'
+
+    @classmethod
+    def create(cls, parent, owner, description, deadline):
+        value = cls()
+        value._fds = []
+        value._closed = False
+        value._failed = False
+        try:
+            if (type(owner) is not int or owner != os.geteuid() or
+                type(description) is not str or not re.fullmatch(r'Synthetic inventory slice [0-9a-f]{32}', description) or
+                type(deadline) not in (float, int) or not math.isfinite(deadline) or time.monotonic() >= deadline):
+                raise ValueError(ERROR)
+            value._owner, value._deadline = owner, deadline
+            value._parent = os.dup(parent); value._fds.append(value._parent)
+            parent_info = os.fstat(value._parent)
+            if not stat.S_ISDIR(parent_info.st_mode) or parent_info.st_uid != owner or parent_info.st_mode & 0o022:
+                raise ValueError(ERROR)
+            value._parent_identity = (parent_info.st_dev, parent_info.st_ino, parent_info.st_mode, parent_info.st_uid, parent_info.st_gid)
+            value._bytes = ('[Unit]\nDescription=' + description + '\n[Slice]\n').encode('ascii')
+            value._file = os.open(cls.NAME, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600, dir_fd=value._parent)
+            value._fds.append(value._file)
+            offset = 0
+            while offset < len(value._bytes):
+                if time.monotonic() >= deadline: raise ValueError(ERROR)
+                count = os.write(value._file, value._bytes[offset:])
+                if count <= 0: raise ValueError(ERROR)
+                offset += count
+            os.fchmod(value._file, 0o644)
+            os.fsync(value._file)
+            value._metadata = Fixture._metadata(os.fstat(value._file))
+            os.fsync(value._parent)
+            value.verify()
+            return value
+        except BaseException:
+            try: value.close()
+            except BaseException: pass
+            raise ValueError(ERROR) from None
+
+    def verify(self):
+        if self._closed or time.monotonic() >= self._deadline: raise ValueError(ERROR)
+        parent = os.fstat(self._parent)
+        if (parent.st_dev, parent.st_ino, parent.st_mode, parent.st_uid, parent.st_gid) != self._parent_identity:
+            raise ValueError(ERROR)
+        held = os.fstat(self._file)
+        named = os.stat(self.NAME, dir_fd=self._parent, follow_symlinks=False)
+        if (not stat.S_ISREG(held.st_mode) or held.st_uid != self._owner or held.st_gid != os.getegid() or held.st_nlink != 1 or
+            stat.S_IMODE(held.st_mode) != 0o644 or held.st_size != len(self._bytes) or held.st_dev != parent.st_dev or
+            Fixture._metadata(held) != self._metadata or Fixture._metadata(named) != self._metadata):
+            raise ValueError(ERROR)
+        os.lseek(self._file, 0, os.SEEK_SET)
+        raw = bytearray()
+        while len(raw) <= len(self._bytes):
+            data = os.read(self._file, len(self._bytes) + 1 - len(raw))
+            if not data: break
+            raw.extend(data)
+        after_parent = os.fstat(self._parent)
+        if (bytes(raw) != self._bytes or Fixture._metadata(os.fstat(self._file)) != self._metadata or
+            Fixture._metadata(os.stat(self.NAME, dir_fd=self._parent, follow_symlinks=False)) != self._metadata or
+            (after_parent.st_dev, after_parent.st_ino, after_parent.st_mode, after_parent.st_uid, after_parent.st_gid) != self._parent_identity or
+            time.monotonic() >= self._deadline): raise ValueError(ERROR)
+
+    def close(self):
+        if self._closed:
+            if self._failed: raise ValueError(ERROR)
+            return
+        self._closed = True
+        for fd in reversed(self._fds):
+            try: os.close(fd)
+            except OSError: self._failed = True
+        self._fds = []
+        if hasattr(self, '_deadline') and time.monotonic() >= self._deadline: self._failed = True
+        if self._failed: raise ValueError(ERROR)
+
+
 def unit_pin_decision(status, exit_code, expected_group, description, deadline, invocation=None):
     if time.monotonic() >= deadline: raise PinError('unit_pin_deadline')
     if exit_code is not None: raise PinError('unit_pin_exited')
@@ -134,18 +213,88 @@ def create_account(deadline):
     if (account.pw_uid, account.pw_gid, group.gr_gid) != (60002, 60002, 60002): raise ValueError(ERROR)
 
 
-def parse_unit_status(raw):
+def manager_command(kind, deadline):
+    commands = {'reload': ['/bin/systemctl', 'daemon-reload'], 'start': ['/bin/systemctl', 'start', SLICE]}
+    if kind not in commands or time.monotonic() >= deadline: raise ValueError(ERROR)
+    child = subprocess.Popen(commands[kind], env=ENV, stdin=subprocess.DEVNULL,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0 or child.wait(timeout=remaining) != 0 or time.monotonic() >= deadline: raise ValueError(ERROR)
+    except BaseException:
+        raise ValueError(ERROR) from None
+
+
+def parse_status(raw, properties):
     if type(raw) is not bytes or len(raw) > 4096: raise ValueError(ERROR)
     try:
         result = {}
         for line in raw.decode('ascii').splitlines():
             name, separator, value = line.partition('=')
-            if not separator or name not in UNIT_PROPERTIES or name in result: raise ValueError(ERROR)
+            if not separator or name not in properties or name in result: raise ValueError(ERROR)
             result[name] = value
-        if set(result) != set(UNIT_PROPERTIES): raise ValueError(ERROR)
+        if set(result) != set(properties): raise ValueError(ERROR)
         return result
     except (UnicodeDecodeError, ValueError):
         raise ValueError(ERROR) from None
+
+
+def parse_unit_status(raw): return parse_status(raw, UNIT_PROPERTIES)
+
+
+def validate_slice_identity(status, description, group, invocation=None):
+    try:
+        current = status['InvocationID']
+        if (status['LoadState'] != 'loaded' or status['ActiveState'] != 'active' or
+            status['Description'] != description or status['ControlGroup'] != group or status['Delegate'] != 'no' or
+            not re.fullmatch('[0-9a-f]{32}', current) or current == '0' * 32 or (invocation is not None and current != invocation)):
+            raise ValueError(ERROR)
+        return current
+    except (KeyError, TypeError, ValueError):
+        raise ValueError(ERROR) from None
+
+
+def require_slice_absent(status, cgroup_root, owner, deadline):
+    """Under caller-pinned trusted ancestry, reject an existing slice or cgroup."""
+    fds = []
+    refs = []
+    failed = False
+    try:
+        if (time.monotonic() >= deadline or status['LoadState'] != 'not-found' or
+            status['ActiveState'] != 'inactive' or status['InvocationID'] or status['ControlGroup']):
+            raise ValueError(ERROR)
+        base = os.fstat(cgroup_root)
+        if not stat.S_ISDIR(base.st_mode) or base.st_uid != owner or base.st_mode & 0o022: raise ValueError(ERROR)
+        parent = cgroup_root
+        absent = False
+        for name in ('command.slice', 'command-center.slice'):
+            try: child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
+            except FileNotFoundError:
+                absent = True
+                break
+            fds.append(child)
+            held = os.fstat(child); named = os.stat(name, dir_fd=parent, follow_symlinks=False)
+            identity = (held.st_dev, held.st_ino, held.st_mode, held.st_uid, held.st_gid)
+            if (not stat.S_ISDIR(held.st_mode) or held.st_uid != owner or held.st_mode & 0o022 or
+                identity != (named.st_dev, named.st_ino, named.st_mode, named.st_uid, named.st_gid)):
+                raise ValueError(ERROR)
+            refs.append((parent, name, child, identity)); parent = child
+        if not absent:
+            try: os.stat(SLICE, dir_fd=parent, follow_symlinks=False)
+            except FileNotFoundError: pass
+            else: raise ValueError(ERROR)
+        for old_parent, name, child, identity in refs:
+            held = os.fstat(child); named = os.stat(name, dir_fd=old_parent, follow_symlinks=False)
+            if identity != (held.st_dev, held.st_ino, held.st_mode, held.st_uid, held.st_gid) or identity != (named.st_dev, named.st_ino, named.st_mode, named.st_uid, named.st_gid):
+                raise ValueError(ERROR)
+        if time.monotonic() >= deadline: raise ValueError(ERROR)
+    except BaseException:
+        failed = True
+    finally:
+        for fd in reversed(fds):
+            try: os.close(fd)
+            except OSError: failed = True
+    if failed or time.monotonic() >= deadline: raise ValueError(ERROR)
 
 
 def validate_live_identity(status, description, group, invocation=None, pid=None):
@@ -305,13 +454,22 @@ def read_completion(stdout, stderr, deadline, verify=lambda: None):
 
 
 def unit_status(deadline):
+    return _fixed_status(deadline, UNIT, UNIT_PROPERTIES)
+
+
+def slice_status(deadline):
+    return _fixed_status(deadline, SLICE, SLICE_PROPERTIES)
+
+
+def _fixed_status(deadline, unit, properties):
     """Bounded fixed systemctl query; timeout never signals its Root child."""
+    if (unit, properties) not in ((UNIT, UNIT_PROPERTIES), (SLICE, SLICE_PROPERTIES)): raise ValueError(ERROR)
     child = None
     failed = False
     raw = bytearray()
     try:
         if time.monotonic() >= deadline: raise ValueError(ERROR)
-        child = subprocess.Popen(['/bin/systemctl', 'show', '--property=' + ','.join(UNIT_PROPERTIES), UNIT],
+        child = subprocess.Popen(['/bin/systemctl', 'show', '--property=' + ','.join(properties), unit],
             env=ENV, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
         fd = child.stdout.fileno()
         os.set_blocking(fd, False)
@@ -335,7 +493,7 @@ def unit_status(deadline):
             try: child.stdout.close()
             except BaseException: failed = True
     if failed or time.monotonic() >= deadline: raise ValueError(ERROR)
-    return parse_unit_status(bytes(raw))
+    return parse_status(bytes(raw), properties)
 
 
 def accept_after_marker(marker, fixture, journal, inbox):
@@ -538,12 +696,36 @@ def run(archive):
     from inventory_refresh_io import Inbox
 
     deadline = time.monotonic() + 60
-    parent_chain = group_chain = fixture = artifact = binary = journal = inbox = probe = launcher = reference = bus = None
+    parent_chain = group_chain = slice_chain = unit_file_chain = cgroup_base = slice_file = None
+    fixture = artifact = binary = journal = inbox = probe = launcher = reference = bus = None
     failed = False
     completed = False
     stage = 'unit_status'
     try:
         if unit_status(min(deadline, time.monotonic() + 3))['LoadState'] != 'not-found': raise ValueError(ERROR)
+        stage = 'slice_preflight'
+        cgroup_base = _Chain(('sys', 'fs', 'cgroup'))
+        cgroup_base.verify()
+        require_slice_absent(slice_status(min(deadline, time.monotonic() + 3)), cgroup_base.fds[-1], 0, deadline)
+        cgroup_base.verify()
+        unit_file_chain = _Chain(('run', 'systemd', 'system'))
+        unit_file_chain.verify()
+        slice_description = 'Synthetic inventory slice ' + secrets.token_hex(16)
+        slice_file = SliceFile.create(unit_file_chain.fds[-1], 0, slice_description, deadline)
+        slice_file.verify(); unit_file_chain.verify()
+        stage = 'slice_reload'
+        manager_command('reload', deadline)
+        slice_file.verify(); unit_file_chain.verify(); cgroup_base.verify()
+        stage = 'slice_start'
+        manager_command('start', deadline)
+        slice_file.verify(); unit_file_chain.verify(); cgroup_base.verify()
+        slice_group = '/command.slice/command-center.slice/' + SLICE
+        slice_invocation = validate_slice_identity(slice_status(min(deadline, time.monotonic() + 3)),
+                                                   slice_description, slice_group)
+        slice_chain = _Chain(('sys', 'fs', 'cgroup', 'command.slice', 'command-center.slice', SLICE))
+        slice_chain.verify()
+        observe_empty(slice_chain.fds[-2], SLICE, slice_chain.fds[-1], deadline)
+        slice_chain.verify(); slice_file.verify(); unit_file_chain.verify()
         stage = 'account'
         create_account(deadline)
         stage = 'archive'
@@ -641,6 +823,9 @@ def run(archive):
             group_chain = _Chain(('sys', 'fs', 'cgroup', 'command.slice', 'command-center.slice',
                 'command-center-inventory.slice', UNIT))
             group_chain.verify()
+            slice_chain.verify()
+            actual_parent, pinned_parent = os.fstat(group_chain.fds[-2]), os.fstat(slice_chain.fds[-1])
+            if (actual_parent.st_dev, actual_parent.st_ino) != (pinned_parent.st_dev, pinned_parent.st_ino): raise ValueError(ERROR)
             held = os.fstat(group_chain.fds[-1])
             probe = ProcessProbe.fixed(pid, (os.major(held.st_dev), os.minor(held.st_dev)), deadline)
             stage = 'marker'
@@ -648,7 +833,7 @@ def run(archive):
             stage = 'process_sample'
             start = probe.sample()
             observe_single_process(group_chain.fds[-2], UNIT, group_chain.fds[-1], pid, deadline)
-            fixture.verify(); parent_chain.verify(); group_chain.verify()
+            fixture.verify(); parent_chain.verify(); group_chain.verify(); slice_chain.verify()
             reference.verify()
             stage = 'cas'
             accept_after_marker(marker, fixture, journal, inbox)
@@ -657,7 +842,7 @@ def run(archive):
             observe_single_process(group_chain.fds[-2], UNIT, group_chain.fds[-1], pid, deadline)
             again = unit_status(min(deadline, time.monotonic() + 3))
             validate_live_identity(again, description, expected_group, invocation, pid)
-            fixture.verify(); parent_chain.verify(); group_chain.verify()
+            fixture.verify(); parent_chain.verify(); group_chain.verify(); slice_chain.verify()
             reference.verify()
             probe.close(); probe = None
             stage = 'ack'
@@ -676,14 +861,13 @@ def run(archive):
             except PinError as error:
                 stage = error.reason
                 raise
-            stage = 'group_empty'
+            stage = 'slice_empty'
             reference.verify()
-            try: group_chain.verify()
-            except BaseException:
-                stage = 'group_chain_' + group_category(group_chain.fds[-2], UNIT, group_chain.fds[-1], deadline)
-                raise
-            stage = 'group_observation'
-            empty_group(group_chain.fds[-2], UNIT, group_chain.fds[-1], deadline)
+            validate_slice_identity(slice_status(min(deadline, time.monotonic() + 3)), slice_description, slice_group, slice_invocation)
+            slice_chain.verify(); slice_file.verify(); unit_file_chain.verify(); cgroup_base.verify()
+            observe_empty(slice_chain.fds[-2], SLICE, slice_chain.fds[-1], deadline)
+            slice_chain.verify()
+            validate_slice_identity(slice_status(min(deadline, time.monotonic() + 3)), slice_description, slice_group, slice_invocation)
             stage = 'postcheck'
             fixture.verify(); parent_chain.verify(); artifact.verify(); binary.verify_published()
             reference.verify()
@@ -701,7 +885,8 @@ def run(archive):
             try:
                 if not bus.close(): failed = True
             except BaseException: failed = True
-        for owned in (reference, probe, inbox, group_chain, fixture, parent_chain, binary, artifact):
+        for owned in (reference, probe, inbox, group_chain, slice_chain, slice_file, unit_file_chain,
+                      cgroup_base, fixture, parent_chain, binary, artifact):
             if owned is not None:
                 try: owned.close()
                 except BaseException: failed = True

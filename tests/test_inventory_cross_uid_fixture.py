@@ -20,6 +20,87 @@ from inventory_refresh_io import Inbox
 
 
 class BindingTest(unittest.TestCase):
+    def test_slice_preflight_rejects_loaded_unit_and_existing_cgroup(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = os.open(temporary, os.O_RDONLY | os.O_DIRECTORY)
+            empty = {'LoadState':'not-found', 'ActiveState':'inactive', 'InvocationID':'', 'ControlGroup':''}
+            try:
+                MODULE.require_slice_absent(empty, root, os.geteuid(), time.monotonic() + 5)
+                with self.assertRaises(ValueError):
+                    MODULE.require_slice_absent(dict(empty, LoadState='loaded'), root, os.geteuid(), time.monotonic() + 5)
+                (Path(temporary) / 'command.slice' / 'command-center.slice' / MODULE.SLICE).mkdir(parents=True)
+                with self.assertRaises(ValueError):
+                    MODULE.require_slice_absent(empty, root, os.geteuid(), time.monotonic() + 5)
+            finally: os.close(root)
+
+    def test_slice_identity_and_manager_timeout_fail_closed(self):
+        status = {'LoadState':'loaded', 'ActiveState':'active', 'Description':'fixture',
+                  'InvocationID':'a' * 32, 'ControlGroup':'/slice', 'Delegate':'no'}
+        self.assertEqual(MODULE.validate_slice_identity(status, 'fixture', '/slice'), 'a' * 32)
+        for field, value in [('InvocationID','b' * 32), ('ControlGroup','/other'),
+                             ('ActiveState','inactive'), ('Delegate','yes')]:
+            changed = dict(status); changed[field] = value
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                MODULE.validate_slice_identity(changed, 'fixture', '/slice', 'a' * 32)
+        child = Mock()
+        child.wait.side_effect = subprocess.TimeoutExpired('systemctl', 1)
+        with patch.object(MODULE.subprocess, 'Popen', return_value=child):
+            with self.assertRaises(ValueError): MODULE.manager_command('start', time.monotonic() + 5)
+        child.kill.assert_not_called(); child.terminate.assert_not_called()
+        with self.assertRaises(ValueError): MODULE.manager_command('arbitrary', time.monotonic() + 5)
+
+    def test_slice_file_is_exclusive_and_detects_changes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            parent = os.open(temporary, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                desc = 'Synthetic inventory slice ' + 'a' * 32
+                owner = MODULE.SliceFile.create(parent, os.geteuid(), desc, time.monotonic() + 5)
+                owner.verify()
+                with self.assertRaises(ValueError): MODULE.SliceFile.create(parent, os.geteuid(), desc, time.monotonic() + 5)
+                (Path(temporary) / MODULE.SliceFile.NAME).write_bytes(b'foreign')
+                with self.assertRaises(ValueError): owner.verify()
+                owner.close()
+                self.assertEqual((Path(temporary) / MODULE.SliceFile.NAME).read_bytes(), b'foreign')
+            finally: os.close(parent)
+
+    def test_slice_sync_or_close_failure_never_removes_or_relabels_state(self):
+        for fault in ('sync', 'close'):
+            with self.subTest(fault=fault), tempfile.TemporaryDirectory() as temporary:
+                parent = os.open(temporary, os.O_RDONLY | os.O_DIRECTORY)
+                real_close = os.close
+                try:
+                    desc = 'Synthetic inventory slice ' + 'a' * 32
+                    if fault == 'sync':
+                        with patch.object(MODULE.os, 'fsync', side_effect=OSError('injected')):
+                            with self.assertRaises(ValueError): MODULE.SliceFile.create(parent, os.geteuid(), desc, time.monotonic() + 5)
+                    else:
+                        owner = MODULE.SliceFile.create(parent, os.geteuid(), desc, time.monotonic() + 5)
+                        calls = []
+                        def close_then_fail(fd):
+                            calls.append(fd); real_close(fd)
+                            if len(calls) == 1: raise OSError('injected')
+                        with patch.object(MODULE.os, 'close', side_effect=close_then_fail):
+                            with self.assertRaises(ValueError): owner.close()
+                            with self.assertRaises(ValueError): owner.close()
+                        self.assertEqual(len(calls), 2)
+                    self.assertTrue((Path(temporary) / MODULE.SliceFile.NAME).exists())
+                finally: real_close(parent)
+
+    def test_slice_named_replacement_is_not_adopted(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            parent = os.open(temporary, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                desc = 'Synthetic inventory slice ' + 'a' * 32
+                owner = MODULE.SliceFile.create(parent, os.geteuid(), desc, time.monotonic() + 5)
+                path = Path(temporary) / MODULE.SliceFile.NAME
+                path.rename(Path(temporary) / 'old-slice')
+                path.write_bytes(b'foreign')
+                with self.assertRaises(ValueError): owner.verify()
+                owner.close()
+                self.assertEqual(path.read_bytes(), b'foreign')
+                self.assertTrue((Path(temporary) / 'old-slice').exists())
+            finally: os.close(parent)
+
     def test_unit_reference_is_one_shot_and_close_failures_are_absorbing(self):
         class Ops:
             def __init__(self, fail=None): self.calls=[]; self.fail=fail
