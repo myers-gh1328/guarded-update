@@ -1,6 +1,6 @@
 """Pure hosted fixture decoding; byte input is untrusted, never a PID witness."""
 from inventory_refresh_cgroup_witness import process_start_ticks
-from inventory_refresh_mount_resolver import classify as classify_mounts
+from inventory_refresh_mount_resolver import classify_detail as classify_mounts
 from inventory_refresh_resources import _mount_id
 from inventory_refresh_reporter_parent import validate_process_view
 from inventory_refresh_resources import mount_rows
@@ -178,15 +178,16 @@ class ProcessProbe:
             ident=lambda info:(info.st_dev,info.st_ino,info.st_mode)
             stage='identity';namespace_id=ident(os.fstat(namespace));root_id=ident(os.fstat(root))
             assert namespace_id==ident(os.stat('mnt',dir_fd=ns,follow_symlinks=True))
-            stage='classify';candidate=classify_mounts(root,list(mount_rows(mountinfo).values()),self._deadline,_mount_id)
-            assert candidate in ('matching','different','unavailable')
+            stage='classify';candidate,detail=classify_mounts(root,list(mount_rows(mountinfo).values()),self._deadline,_mount_id)
+            assert candidate in ('matching','different','unavailable') and detail in ('ok','rows','candidates','resolve',
+                'validation','root','open_missing','open_denied','open_other','identity','mount_id','recheck','close')
             stage='recheck';self._check();assert process_start_ticks(self._read('stat',8192),self._pid)==start
             assert os.readlink('root',dir_fd=self._process)=='/' and os.readlink('mnt',dir_fd=ns)==namespace_link
             assert namespace_id==ident(os.fstat(namespace))==ident(os.stat('mnt',dir_fd=ns,follow_symlinks=True))
             check=os.open('root',os.O_RDONLY|os.O_DIRECTORY|os.O_NONBLOCK,dir_fd=self._process);owned.append(check)
             assert root_id==ident(os.fstat(root))==ident(os.fstat(check))
             self._check();assert time.monotonic()<self._deadline
-            result=candidate;stage='classify' if candidate=='unavailable' else 'done'
+            result=candidate;stage='classify_'+detail if candidate=='unavailable' else 'done'
         except BaseException:failed=True
         finally:
             for fd in reversed(owned):
@@ -230,8 +231,11 @@ class ProcessProbe:
             finally:self._failed=True
             if comparison is not None:
                 print('Native fixture mount comparison='+comparison,file=sys.stderr)
-                if comparison=='unavailable' and self._mount_detail in ('check','root_link','namespace_dir','namespace_link','namespace_open','root_open','identity','classify','recheck','close'):
-                    print('Native fixture mount detail='+self._mount_detail,file=sys.stderr)
+                detail=self._mount_detail
+                allowed=('check','root_link','namespace_dir','namespace_link','namespace_open','root_open','identity','classify','recheck','close')
+                resolver=('ok','rows','candidates','resolve','validation','root','open_missing','open_denied','open_other','identity','mount_id','recheck','close')
+                if comparison=='unavailable' and (detail in allowed or detail.startswith('classify_') and detail.removeprefix('classify_') in resolver):
+                    print('Native fixture mount detail='+detail,file=sys.stderr)
             safe=permitted(stage)
             if os.geteuid()==0 and os.environ.get('GITHUB_ACTIONS')=='true' and safe:
                 print('Native fixture process probe stage='+stage,file=sys.stderr)

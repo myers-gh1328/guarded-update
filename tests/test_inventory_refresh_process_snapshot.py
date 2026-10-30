@@ -100,18 +100,18 @@ class ProcessSnapshotTests(unittest.TestCase):
             fd=os.open(root,os.O_RDONLY|os.O_DIRECTORY)
             try:
                 owner=ProcessProbe._from_directory(fd,123,(0,27),time.monotonic()+2,owner=os.getuid())
-                with patch('inventory_refresh_process_snapshot.classify_mounts',return_value='matching'):
+                with patch('inventory_refresh_process_snapshot.classify_mounts',return_value=('matching','ok')):
                     self.assertEqual(owner.mount_diagnostic(self.stat,self.mounts),'matching')
                 actual_close=os.close;closed=[];classified=[]
                 def uncertain(number):
                     actual_close(number)
                     if classified:closed.append(number);raise OSError('uncertain')
-                def compare(*args):classified.append(True);return 'matching'
+                def compare(*args):classified.append(True);return ('matching','ok')
                 with patch('inventory_refresh_process_snapshot.classify_mounts',side_effect=compare),patch('inventory_refresh_process_snapshot.os.close',side_effect=uncertain):
                     self.assertEqual(owner.mount_diagnostic(self.stat,self.mounts),'unavailable')
                 self.assertGreaterEqual(len(closed),4)
                 (proc/'root').unlink();(proc/'root').symlink_to('/tmp',target_is_directory=True)
-                with patch('inventory_refresh_process_snapshot.classify_mounts',return_value='matching'):
+                with patch('inventory_refresh_process_snapshot.classify_mounts',return_value=('matching','ok')):
                     self.assertEqual(owner.mount_diagnostic(self.stat,self.mounts),'unavailable')
                 self.assertEqual(owner._mount_detail,'root_link')
                 owner.close()

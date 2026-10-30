@@ -23,6 +23,18 @@ class MountResolverTests(unittest.TestCase):
         (self.root/'link').symlink_to('a',target_is_directory=True)
         for path in ('a/b','/a/../b','/a//b','/link/b','/a/b/',('/x'*33),'/'+'x'*256):
             with self.assertRaises(ValueError):self.sample(path)
+    def test_safe_linux_component_characters_and_encoded_byte_limits(self):
+        for name in ('unit@123',r'unit\x2dname','with space','item:1'):
+            (self.root/name).mkdir()
+            self.assertEqual(self.sample('/'+name),7)
+        name=os.fsdecode(b'bad-\xff')
+        self.assertEqual(os.fsencode(name),b'bad-\xff')
+        if sys.platform=='linux':
+            os.mkdir(os.fsencode(self.root)+b'/bad-\xff')
+            self.assertEqual(self.sample('/'+name),7)
+        with self.assertRaises(ValueError):self.sample('/'+('é'*128))
+        with self.assertRaises(ValueError):self.sample('/bad\x00name')
+
     def test_replacement_and_mount_id_change_fail(self):
         calls=[]
         def replaced(fd):
@@ -49,6 +61,13 @@ class MountResolverTests(unittest.TestCase):
         target=os.open('/sys',os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
         try:self.assertEqual(resolver.resolve(root,'/sys',time.monotonic()+3,_mount_id),_mount_id(target))
         finally:os.close(target);os.close(root)
+
+    def test_unavailable_comparison_exposes_only_fixed_failure_category(self):
+        row={'id':7,'path':'/secret-name','fs':b'cgroup2','options':{b'rw'}}
+        result,detail=resolver.classify_detail(self.fd,[row],time.monotonic()+1,lambda fd:7)
+        self.assertEqual((result,detail),('unavailable','open_missing'))
+        row['path']='/../unsafe'
+        self.assertEqual(resolver.classify_detail(self.fd,[row],time.monotonic()+1,lambda fd:7),('unavailable','validation'))
 
     def test_writable_row_classification_is_diagnostic_and_ambiguity_absorbs(self):
         def row(identifier,path='/a/b',options=None):
