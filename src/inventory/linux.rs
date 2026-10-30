@@ -269,6 +269,7 @@ pub fn collect(tools: &impl Tools, report_id: &str, now: &str) -> Result<Value, 
         MetadataSource::HostCached,
         oldest_index,
         || desktop_evidence(std::path::Path::new("/usr/share/applications")),
+        (read_os_release, completion_time),
     )
 }
 
@@ -287,6 +288,33 @@ pub(super) fn collect_selected_generation(
         MetadataSource::SelectedGeneration,
         oldest_index,
         || desktop_evidence(std::path::Path::new("/usr/share/applications")),
+        (read_os_release, completion_time),
+    )
+}
+
+pub(super) fn read_os_release() -> String {
+    system_text(std::path::Path::new("/etc/os-release"), 16384).unwrap_or_default()
+}
+pub(super) fn completion_time() -> String {
+    crate::timefmt::rfc3339(crate::timefmt::now_secs())
+}
+
+#[cfg(all(test, target_os = "linux"))]
+pub(super) fn collect_selected_observed(
+    tools: &impl Tools,
+    report_id: &str,
+    now: &str,
+    read_os: impl FnOnce() -> String,
+    finish: impl FnOnce() -> String,
+) -> Result<Value, String> {
+    collect_in_context(
+        tools,
+        report_id,
+        now,
+        MetadataSource::SelectedGeneration,
+        oldest_index,
+        || desktop_evidence(std::path::Path::new("/usr/share/applications")),
+        (read_os, finish),
     )
 }
 
@@ -297,6 +325,7 @@ fn collect_in_context(
     source: MetadataSource,
     read_index_age: impl FnOnce() -> Option<String>,
     read_desktops: impl FnOnce() -> (std::collections::BTreeSet<String>, bool),
+    (read_os, finish): (impl FnOnce() -> String, impl FnOnce() -> String),
 ) -> Result<Value, String> {
     let host_cached = matches!(source, MetadataSource::HostCached);
     let hostname = tools.text("/bin/hostname", &[], 4096)?.trim().to_owned();
@@ -304,9 +333,7 @@ fn collect_in_context(
         .text("/usr/bin/uname", &["-m"], 4096)?
         .trim()
         .to_owned();
-    let (platform, version) = os_release(
-        &system_text(std::path::Path::new("/etc/os-release"), 16384).unwrap_or_default(),
-    );
+    let (platform, version) = os_release(&read_os());
     let index_age = if host_cached { read_index_age() } else { None };
     let policy_coverage = if host_cached {
         "APT indexes are never refreshed; cached candidates and holds are observations, not verified repository refresh evidence. Update status remains Unknown."
@@ -324,7 +351,7 @@ fn collect_in_context(
         scan["errors"] = json!([
             "Installed dpkg inventory unavailable or malformed; previous complete inventory must be retained."
         ]);
-        scan["completedAt"] = json!(crate::timefmt::rfc3339(crate::timefmt::now_secs()));
+        scan["completedAt"] = json!(finish());
         return Ok(scan);
     };
     scan["inventoryComplete"] = json!(true);
@@ -454,7 +481,7 @@ fn collect_in_context(
     } else {
         "partial"
     });
-    scan["completedAt"] = json!(crate::timefmt::rfc3339(crate::timefmt::now_secs()));
+    scan["completedAt"] = json!(finish());
     Ok(scan)
 }
 
@@ -542,6 +569,7 @@ mod tests {
             MetadataSource::SelectedGeneration,
             || panic!("Host APT lists read in selected-generation scan"),
             || panic!("Optional desktop files read in selected-generation scan"),
+            (read_os_release, completion_time),
         )
         .unwrap();
         assert_eq!(scan["aptIndexOldestAt"], Value::Null);
@@ -581,6 +609,7 @@ mod tests {
                     true,
                 )
             },
+            (read_os_release, completion_time),
         )
         .unwrap();
         assert_eq!(scan["aptIndexOldestAt"], "2025-12-30T00:00:00Z");

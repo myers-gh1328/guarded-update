@@ -762,6 +762,263 @@ mod tests {
     const BOOT: &str = "00000000-0000-4000-8000-000000000001";
     const REPORT: &str = "00000000-0000-4000-8000-000000000002";
     const REQUEST: &str = "00000000-0000-4000-8000-000000000003";
+    struct InputEvent {
+        program: String,
+        args: Vec<String>,
+        limit: usize,
+        output: String,
+    }
+    #[cfg(target_os = "linux")]
+    const INPUT_MAX: usize = 32 * 1024 * 1024;
+    #[cfg(target_os = "linux")]
+    struct InputCapture<'a, T> {
+        inner: &'a T,
+        events: Mutex<(usize, Vec<InputEvent>)>,
+        failed: AtomicBool,
+    }
+    #[cfg(target_os = "linux")]
+    impl<'a, T> InputCapture<'a, T> {
+        fn new(inner: &'a T) -> Self {
+            Self {
+                inner,
+                events: Mutex::new((0, Vec::new())),
+                failed: AtomicBool::new(false),
+            }
+        }
+        fn finish(self) -> Result<Vec<InputEvent>> {
+            require(!self.failed.load(Ordering::SeqCst))?;
+            Ok(self.events.into_inner().map_err(|_| ERROR.to_owned())?.1)
+        }
+    }
+    #[cfg(target_os = "linux")]
+    impl<T: Tools> Tools for InputCapture<'_, T> {
+        fn text(&self, program: &str, args: &[&str], limit: usize) -> Result<String> {
+            let result = (|| {
+                let output = self.inner.text(program, args, limit)?;
+                let mut events = self.events.lock().map_err(|_| ERROR.to_owned())?;
+                let size = args
+                    .iter()
+                    .try_fold(program.len(), |n, arg| n.checked_add(arg.len()))
+                    .and_then(|n| n.checked_add(output.len()))
+                    .ok_or(ERROR)?;
+                let total = events.0.checked_add(size).ok_or(ERROR)?;
+                require(
+                    events.1.len() < 512
+                        && args.len() <= 305
+                        && output.len() <= limit
+                        && total <= INPUT_MAX,
+                )?;
+                events.1.push(InputEvent {
+                    program: program.into(),
+                    args: args.iter().map(|s| (*s).into()).collect(),
+                    limit,
+                    output: output.clone(),
+                });
+                events.0 = total;
+                Ok(output)
+            })();
+            if result.is_err() {
+                self.failed.store(true, Ordering::SeqCst);
+            }
+            result
+        }
+        fn sha256(&self, _: &[u8]) -> Result<String> {
+            self.failed.store(true, Ordering::SeqCst);
+            Err(ERROR.into())
+        }
+    }
+    struct InputReplay {
+        remaining: Mutex<VecDeque<InputEvent>>,
+        failed: AtomicBool,
+    }
+    impl InputReplay {
+        fn new(events: Vec<InputEvent>) -> Self {
+            Self {
+                remaining: Mutex::new(events.into()),
+                failed: AtomicBool::new(false),
+            }
+        }
+        fn finish(&self) -> Result<()> {
+            require(
+                !self.failed.load(Ordering::SeqCst)
+                    && self
+                        .remaining
+                        .lock()
+                        .map_err(|_| ERROR.to_owned())?
+                        .is_empty(),
+            )
+        }
+    }
+    impl Tools for InputReplay {
+        fn text(&self, program: &str, args: &[&str], limit: usize) -> Result<String> {
+            let result = (|| {
+                let event = self
+                    .remaining
+                    .lock()
+                    .map_err(|_| ERROR.to_owned())?
+                    .pop_front()
+                    .ok_or(ERROR)?;
+                require(
+                    event.program == program
+                        && event
+                            .args
+                            .iter()
+                            .map(String::as_str)
+                            .eq(args.iter().copied())
+                        && event.limit == limit,
+                )?;
+                Ok(event.output)
+            })();
+            if result.is_err() {
+                self.failed.store(true, Ordering::SeqCst);
+            }
+            result
+        }
+        fn sha256(&self, _: &[u8]) -> Result<String> {
+            self.failed.store(true, Ordering::SeqCst);
+            Err(ERROR.into())
+        }
+    }
+    #[cfg(target_os = "linux")]
+    fn collect_observed<E: Exchange + Send>(
+        scanning: ScanningSession<E>,
+        now: &str,
+    ) -> Result<(NormalizedSession<E>, Value)> {
+        require(checked_at(now))?;
+        let report = scanning.proof.scan.as_ref().ok_or(ERROR)?.report_id.clone();
+        let tools = FixedTools::new(scanning);
+        let capture = InputCapture::new(&tools);
+        let mut os_release = None;
+        let mut completed = None;
+        let scan = super::super::linux::collect_selected_observed(
+            &capture,
+            &report,
+            now,
+            || {
+                let value = super::super::linux::read_os_release();
+                os_release = Some(value.clone());
+                value
+            },
+            || {
+                let value = super::super::linux::completion_time();
+                completed = Some(value.clone());
+                value
+            },
+        )
+        .map_err(|_| ERROR.to_owned())?;
+        let events = capture.finish()?;
+        let mut scanning = tools.into_scanning()?;
+        let os_release = os_release.ok_or(ERROR)?;
+        let completed = completed.ok_or(ERROR)?;
+        require(os_release.len() <= 16384 && checked_at(&completed))?;
+        let replay = InputReplay::new(events);
+        let repeated = super::super::linux::collect_selected_observed(
+            &replay,
+            &report,
+            now,
+            || os_release,
+            || completed,
+        )
+        .map_err(|_| ERROR.to_owned())?;
+        replay.finish()?;
+        require(
+            scan == repeated
+                && scan["inventoryComplete"] == true
+                && matches!(scan["status"].as_str(), Some("complete" | "partial")),
+        )?;
+        scanning.session.check()?;
+        Ok((NormalizedSession { scanning, scan }, repeated))
+    }
+    #[test]
+    fn replay_requires_exact_order_and_consumes_every_input() {
+        let event = InputEvent {
+            program: "/bin/hostname".into(),
+            args: vec![],
+            limit: 4096,
+            output: "host".into(),
+        };
+        let replay = InputReplay::new(vec![event]);
+        assert!(replay.text("/usr/bin/uname", &["-m"], 4096).is_err());
+        assert!(replay.finish().is_err());
+    }
+    #[test]
+    fn replay_rejects_missing_extra_and_changed_arguments() {
+        let event = || InputEvent {
+            program: "/usr/bin/uname".into(),
+            args: vec!["-m".into()],
+            limit: 4096,
+            output: "arm64".into(),
+        };
+        let missing = InputReplay::new(vec![event()]);
+        assert!(missing.finish().is_err());
+        let extra = InputReplay::new(vec![event()]);
+        assert_eq!(
+            extra.text("/usr/bin/uname", &["-m"], 4096).unwrap(),
+            "arm64"
+        );
+        assert!(extra.text("/usr/bin/uname", &["-m"], 4096).is_err());
+        assert!(extra.finish().is_err());
+        let changed = InputReplay::new(vec![event()]);
+        assert!(changed.text("/usr/bin/uname", &["-a"], 4096).is_err());
+        assert!(changed.finish().is_err());
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn capture_rejects_excess_input_and_latches_failure() {
+        struct Big;
+        impl Tools for Big {
+            fn text(&self, _: &str, _: &[&str], _: usize) -> Result<String> {
+                Ok("x".repeat(INPUT_MAX + 1))
+            }
+            fn sha256(&self, _: &[u8]) -> Result<String> {
+                Err(ERROR.into())
+            }
+        }
+        let capture = InputCapture::new(&Big);
+        assert!(capture.text("fixed", &[], INPUT_MAX + 1).is_err());
+        assert!(capture.finish().is_err());
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn changed_recorded_input_changes_the_replayed_scan() {
+        struct Fixed;
+        impl Tools for Fixed {
+            fn text(&self, program: &str, _: &[&str], _: usize) -> Result<String> {
+                Ok(match program {
+                    "/bin/hostname" => "host".into(),
+                    "/usr/bin/uname" | "/usr/bin/dpkg" => "arm64".into(),
+                    "/usr/bin/dpkg-query" => "installed\tcups\t1\tarm64\n".into(),
+                    "/usr/bin/apt-mark" | "/usr/bin/apt-cache" => String::new(),
+                    _ => return Err(ERROR.into()),
+                })
+            }
+            fn sha256(&self, _: &[u8]) -> Result<String> {
+                Err(ERROR.into())
+            }
+        }
+        let capture = InputCapture::new(&Fixed);
+        let scan = super::super::linux::collect_selected_observed(
+            &capture,
+            REPORT,
+            "2026-01-01T00:00:00Z",
+            || "ID=debian".into(),
+            || "2026-01-01T00:00:01Z".into(),
+        )
+        .unwrap();
+        let mut events = capture.finish().unwrap();
+        events[0].output = "changed".into();
+        let replay = InputReplay::new(events);
+        let repeated = super::super::linux::collect_selected_observed(
+            &replay,
+            REPORT,
+            "2026-01-01T00:00:00Z",
+            || "ID=debian".into(),
+            || "2026-01-01T00:00:01Z".into(),
+        )
+        .unwrap();
+        replay.finish().unwrap();
+        assert_ne!(scan, repeated);
+    }
     fn clock(time: u64) -> Clock {
         Clock {
             boot_id: BOOT.into(),
@@ -1557,11 +1814,14 @@ command(10,'await_receipt');response(10,'await_receipt','prepared',evidence=dict
                 && Instant::now() < deadline,
         )?;
         let exchange = NativeExchange::spawn(status, deadline, hostname, architecture)?;
-        let mut prepared = PinnedSession::admit(exchange, expected)?
+        let scanning = PinnedSession::admit(exchange, expected)?
             .publish(&mut journal, intent, &negotiated)?
-            .admit_scan(&mut journal, &negotiated)?
-            .collect_selected(&crate::timefmt::rfc3339(crate::timefmt::now_secs()))?
-            .prepare(&mut journal)?;
+            .admit_scan(&mut journal, &negotiated)?;
+        let (normalized, replayed) = collect_observed(
+            scanning,
+            &crate::timefmt::rfc3339(crate::timefmt::now_secs()),
+        )?;
+        let mut prepared = normalized.prepare(&mut journal)?;
         require(
             prepared.scan["inventoryComplete"] == true
                 && prepared.scan["packages"]
@@ -1588,6 +1848,14 @@ command(10,'await_receipt');response(10,'await_receipt','prepared',evidence=dict
             prepared.scan.clone(),
         )
         .map_err(|_| ERROR.to_owned())?;
+        let replay_body = super::super::lifecycle::encode_collection_report(
+            "00000000-0000-4000-8000-000000000004",
+            &prepared.scanning.request_id,
+            proof_scan,
+            replayed,
+        )
+        .map_err(|_| ERROR.to_owned())?;
+        require(body == replay_body)?;
         let decoded: serde_json::Value =
             serde_json::from_slice(&body).map_err(|_| ERROR.to_owned())?;
         require(
