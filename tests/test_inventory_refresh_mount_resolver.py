@@ -1,5 +1,6 @@
 """Private rooted-path samples; never production mount-admission evidence."""
 import os
+import errno
 from pathlib import Path
 import sys
 import tempfile
@@ -80,6 +81,19 @@ class MountResolverTests(unittest.TestCase):
             self.assertEqual(resolver.resolve(root,'/sys',time.monotonic()+3,_mount_id),_mount_id(target))
             self.assertEqual(resolver.resolve(root,'/sys/fs/cgroup/cgroup.procs',time.monotonic()+3,_mount_id),_mount_id(cgroup_file))
         finally:os.close(cgroup_file);os.close(target);os.close(root)
+
+    def test_passive_metadata_is_fixed_and_acl_uncertainty_is_explicit(self):
+        target=self.root/'a'/'cgroup.procs';target.write_bytes(b'unchanged');target.chmod(0o640)
+        row={'id':7,'path':'/a/cgroup.procs','fs':b'cgroup2','options':{b'rw'}}
+        with patch.object(resolver.sys,'platform','linux'),patch.object(resolver.os,'getxattr',side_effect=OSError(errno.ENODATA,'absent'),create=True):
+            self.assertEqual(resolver.classify_metadata(self.fd,[row],time.monotonic()+1,lambda fd:7,os.getuid(),os.getgid()),
+                ('sample','self','self','yes','no','no','absent'))
+        with patch.object(resolver.os,'getxattr',side_effect=OSError(errno.ENOTSUP,'unsupported'),create=True):
+            self.assertEqual(resolver.classify_metadata(self.fd,[row],time.monotonic()+1,lambda fd:7,os.getuid(),os.getgid())[-1],'unknown')
+        for values in ([b'one',b'two'],[b'x'*65537]):
+            with patch.object(resolver.os,'getxattr',side_effect=values,create=True):
+                self.assertEqual(resolver.classify_metadata(self.fd,[row],time.monotonic()+1,lambda fd:7,os.getuid(),os.getgid()),('unavailable',))
+        self.assertEqual(target.read_bytes(),b'unchanged')
 
     def test_matching_mount_reports_only_fixed_object_category(self):
         (self.root/'a'/'cgroup.procs').write_bytes(b'')

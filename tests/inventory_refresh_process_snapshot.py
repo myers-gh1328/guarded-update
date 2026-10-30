@@ -1,6 +1,6 @@
 """Pure hosted fixture decoding; byte input is untrusted, never a PID witness."""
 from inventory_refresh_cgroup_witness import process_start_ticks
-from inventory_refresh_mount_resolver import classify_detail as classify_mounts
+from inventory_refresh_mount_resolver import classify_detail as classify_mounts, classify_metadata
 from inventory_refresh_resources import _mount_id
 from inventory_refresh_reporter_parent import validate_process_view
 from inventory_refresh_resources import mount_rows
@@ -165,7 +165,7 @@ class ProcessProbe:
 
     def mount_diagnostic(self,initial_stat,mountinfo):
         """Point comparison only; trusts procfs/kernel and is not an atomic witness."""
-        owned=[];failed=False;result='unavailable';stage='check'
+        owned=[];failed=False;result='unavailable';stage='check';self._mount_metadata=('unavailable',)
         try:
             self._check();start=process_start_ticks(initial_stat,self._pid)
             assert process_start_ticks(self._read('stat',8192),self._pid)==start
@@ -182,6 +182,8 @@ class ProcessProbe:
             assert candidate in ('matching','different','unavailable') and detail in ('ok','rows','candidates','resolve',
                 'validation','root','open_missing','open_denied','open_other','identity','mount_id','recheck','close',
                 'file_procs','file_threads','file_subtree','file_other','directory_procs','directory_threads','directory_subtree','directory_other','multiple')
+            if candidate=='matching':
+                self._mount_metadata=classify_metadata(root,list(mount_rows(mountinfo).values()),self._deadline,_mount_id,60002,60002)
             stage='recheck';self._check();assert process_start_ticks(self._read('stat',8192),self._pid)==start
             assert os.readlink('root',dir_fd=self._process)=='/' and os.readlink('mnt',dir_fd=ns)==namespace_link
             assert namespace_id==ident(os.fstat(namespace))==ident(os.stat('mnt',dir_fd=ns,follow_symlinks=True))
@@ -234,6 +236,12 @@ class ProcessProbe:
                 print('Native fixture mount comparison='+comparison,file=sys.stderr)
                 if comparison=='matching' and self._mount_detail in ('file_procs','file_threads','file_subtree','file_other','directory_procs','directory_threads','directory_subtree','directory_other','multiple'):
                     print('Native fixture mount object='+self._mount_detail,file=sys.stderr)
+                    metadata=getattr(self,'_mount_metadata',('unavailable',))
+                    if (type(metadata) is tuple and len(metadata)==7 and metadata[0]=='sample' and
+                        metadata[1] in ('self','root','other') and metadata[2] in ('self','other') and
+                        all(item in ('yes','no') for item in metadata[3:6]) and metadata[6] in ('present','absent','unknown')):
+                        print('Native fixture mount metadata='+','.join(metadata[1:]),file=sys.stderr)
+                    else:print('Native fixture mount metadata=unknown',file=sys.stderr)
                 detail=self._mount_detail
                 allowed=('check','root_link','namespace_dir','namespace_link','namespace_open','root_open','identity','classify','recheck','close')
                 resolver=('ok','rows','candidates','resolve','validation','root','open_missing','open_denied','open_other','identity','mount_id','recheck','close')

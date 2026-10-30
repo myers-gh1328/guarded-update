@@ -7,6 +7,7 @@ import math
 import errno
 import os
 import stat
+import sys
 import time
 
 
@@ -14,7 +15,7 @@ class ResolutionError(ValueError):
     pass
 
 
-def _resolve(root,path,deadline,mount_id):
+def _resolve(root,path,deadline,mount_id,metadata_identity=None):
     owned=[];refs=[];failed=False;result=None;stage='validation'
     try:
         assert type(path) is str and path.startswith('/') and len(os.fsencode(path))<=1024
@@ -36,13 +37,32 @@ def _resolve(root,path,deadline,mount_id):
             assert stat.S_ISDIR(info.st_mode) or last and stat.S_ISREG(info.st_mode)
             refs.append((parent,part,child,identity(info)))
         stage='mount_id';first=mount_id(owned[-1]);assert type(first) is int and 0<first<2**64 and time.monotonic()<deadline
+        metadata=None;acl_first=None
+        if metadata_identity is not None:
+            assert type(metadata_identity) is tuple and len(metadata_identity)==2 and all(type(value) is int and value>=0 for value in metadata_identity)
+            def acl():
+                try:
+                    data=os.getxattr(owned[-1],'system.posix_acl_access')
+                    assert len(data)<=65536
+                    return 'present',data
+                except OSError as error:
+                    return ('absent' if sys.platform=='linux' and error.errno==errno.ENODATA else 'unknown'),None
+            acl_first=acl();metadata=identity(os.fstat(owned[-1]))
         stage='recheck';assert identity(os.fstat(root))==identity(root_info)==identity(os.fstat(owned[0]))
         for parent,part,child,expected in refs:
             assert time.monotonic()<deadline
             assert identity(os.fstat(child))==expected==identity(os.stat(part,dir_fd=parent,follow_symlinks=False))
         assert mount_id(owned[-1])==first and time.monotonic()<deadline
-        kind='file' if stat.S_ISREG(os.fstat(owned[-1]).st_mode) else 'directory'
-        result=(first,kind)
+        final=os.fstat(owned[-1]);kind='file' if stat.S_ISREG(final.st_mode) else 'directory'
+        detail=None
+        if metadata_identity is not None:
+            acl_second=acl()
+            assert metadata==identity(final)==identity(os.fstat(owned[-1])) and acl_first==acl_second and time.monotonic()<deadline
+            uid,gid=metadata_identity
+            owner='self' if final.st_uid==uid else 'root' if final.st_uid==0 else 'other'
+            group='self' if final.st_gid==gid else 'other'
+            detail=(owner,group,*('yes' if final.st_mode&bit else 'no' for bit in (stat.S_IWUSR,stat.S_IWGRP,stat.S_IWOTH)),acl_first[0])
+        result=(first,kind,detail)
     except OSError as error:
         failed=True
         if stage=='open':stage='open_missing' if error.errno==errno.ENOENT else 'open_denied' if error.errno in (errno.EACCES,errno.EPERM) else 'open_other'
@@ -75,7 +95,7 @@ def classify_detail(root,rows,deadline,mount_id):
         stage='candidates';assert 0<len(candidates)<=64
         matches=[]
         for identifier,path in candidates:
-            stage='resolve';actual,kind=_resolve(root,path,deadline,mount_id)
+            stage='resolve';actual,kind,_=_resolve(root,path,deadline,mount_id)
             if actual==identifier:
                 name=path.rsplit('/',1)[-1]
                 category={'cgroup.procs':'procs','cgroup.threads':'threads','cgroup.subtree_control':'subtree'}.get(name,'other')
@@ -89,3 +109,22 @@ def classify_detail(root,rows,deadline,mount_id):
 
 def classify(root,rows,deadline,mount_id):
     return classify_detail(root,rows,deadline,mount_id)[0]
+
+
+def classify_metadata(root,rows,deadline,mount_id,uid,gid):
+    """Sample fixed metadata categories only; never infer actor access."""
+    try:
+        assert type(rows) is list and 0<len(rows)<=512 and type(uid) is int and type(gid) is int and uid>=0 and gid>=0
+        seen=set();matched=[];count=0
+        for row in rows:
+            assert type(row) is dict and type(row.get('id')) is int and 0<row['id']<2**64 and row['id'] not in seen
+            seen.add(row['id']);options=row.get('options');path=row.get('path');filesystem=row.get('fs')
+            assert type(path) is str and type(filesystem) is bytes and type(options) is set and all(type(item) is bytes for item in options)
+            assert (b'ro' in options)!=(b'rw' in options) and time.monotonic()<deadline
+            if filesystem==b'cgroup2' and b'rw' in options:
+                count+=1;assert count<=64
+                actual,_,detail=_resolve(root,path,deadline,mount_id,(uid,gid))
+                if actual==row['id']:matched.append(detail)
+        assert count and len(matched)==1 and time.monotonic()<deadline
+        return ('sample',*matched[0])
+    except BaseException:return ('unavailable',)
