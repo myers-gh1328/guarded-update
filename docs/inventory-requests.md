@@ -82,6 +82,16 @@ Manual support remains unavailable until actual helper/observation integration i
 verified. No arbitrary commands, paths, packages, policies or installation grants
 are accepted from a request.
 
+Linux sync inspects an existing request journal under its inventory lock before
+starting a daily collection. A pending journal replacement, invalid or unreadable
+journal, or any retained manual or collection request defers that collection and
+reports an error on check-in; retained uploads and check-ins continue. The fence
+does not change the journal or initialize missing counters. A genuinely absent
+journal and pending file retain the existing scheduling behavior. This is a
+conservative transition: even a completed retained request prevents another daily
+collection until a later reconciliation implementation can safely retire it. The
+fence does not prove processes have stopped or enable device requests.
+
 ## Collection lifecycle implementation
 
 The staged coordinator opens the journal under the existing process lock. It
