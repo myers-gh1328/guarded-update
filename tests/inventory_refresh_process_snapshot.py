@@ -165,33 +165,34 @@ class ProcessProbe:
 
     def mount_diagnostic(self,initial_stat,mountinfo):
         """Point comparison only; trusts procfs/kernel and is not an atomic witness."""
-        owned=[];failed=False;result='unavailable'
+        owned=[];failed=False;result='unavailable';stage='check'
         try:
             self._check();start=process_start_ticks(initial_stat,self._pid)
             assert process_start_ticks(self._read('stat',8192),self._pid)==start
-            assert os.readlink('root',dir_fd=self._process)=='/'
-            ns=os.open('ns',os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW|os.O_NONBLOCK,dir_fd=self._process);owned.append(ns)
-            namespace_link=os.readlink('mnt',dir_fd=ns)
+            stage='root_link';assert os.readlink('root',dir_fd=self._process)=='/'
+            stage='namespace_dir';ns=os.open('ns',os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW|os.O_NONBLOCK,dir_fd=self._process);owned.append(ns)
+            stage='namespace_link';namespace_link=os.readlink('mnt',dir_fd=ns)
             assert re.fullmatch(r'mnt:\[[1-9][0-9]{0,19}\]',namespace_link)
-            namespace=os.open('mnt',os.O_RDONLY|os.O_NONBLOCK,dir_fd=ns);owned.append(namespace)
-            root=os.open('root',os.O_RDONLY|os.O_DIRECTORY|os.O_NONBLOCK,dir_fd=self._process);owned.append(root)
+            stage='namespace_open';namespace=os.open('mnt',os.O_RDONLY|os.O_NONBLOCK,dir_fd=ns);owned.append(namespace)
+            stage='root_open';root=os.open('root',os.O_RDONLY|os.O_DIRECTORY|os.O_NONBLOCK,dir_fd=self._process);owned.append(root)
             ident=lambda info:(info.st_dev,info.st_ino,info.st_mode)
-            namespace_id=ident(os.fstat(namespace));root_id=ident(os.fstat(root))
+            stage='identity';namespace_id=ident(os.fstat(namespace));root_id=ident(os.fstat(root))
             assert namespace_id==ident(os.stat('mnt',dir_fd=ns,follow_symlinks=True))
-            candidate=classify_mounts(root,list(mount_rows(mountinfo).values()),self._deadline,_mount_id)
+            stage='classify';candidate=classify_mounts(root,list(mount_rows(mountinfo).values()),self._deadline,_mount_id)
             assert candidate in ('matching','different','unavailable')
-            self._check();assert process_start_ticks(self._read('stat',8192),self._pid)==start
+            stage='recheck';self._check();assert process_start_ticks(self._read('stat',8192),self._pid)==start
             assert os.readlink('root',dir_fd=self._process)=='/' and os.readlink('mnt',dir_fd=ns)==namespace_link
             assert namespace_id==ident(os.fstat(namespace))==ident(os.stat('mnt',dir_fd=ns,follow_symlinks=True))
             check=os.open('root',os.O_RDONLY|os.O_DIRECTORY|os.O_NONBLOCK,dir_fd=self._process);owned.append(check)
             assert root_id==ident(os.fstat(root))==ident(os.fstat(check))
             self._check();assert time.monotonic()<self._deadline
-            result=candidate
+            result=candidate;stage='classify' if candidate=='unavailable' else 'done'
         except BaseException:failed=True
         finally:
             for fd in reversed(owned):
                 try:os.close(fd)
-                except BaseException:failed=True
+                except BaseException:failed=True;stage='close'
+        self._mount_detail=stage
         if failed or time.monotonic()>=self._deadline:return 'unavailable'
         return result
 
@@ -227,7 +228,10 @@ class ProcessProbe:
                 if stage.startswith('profile_mount_writable_') and os.geteuid()==0 and os.environ.get('GITHUB_ACTIONS')=='true':
                     comparison=self.mount_diagnostic(first,mount)
             finally:self._failed=True
-            if comparison is not None:print('Native fixture mount comparison='+comparison,file=sys.stderr)
+            if comparison is not None:
+                print('Native fixture mount comparison='+comparison,file=sys.stderr)
+                if comparison=='unavailable' and self._mount_detail in ('check','root_link','namespace_dir','namespace_link','namespace_open','root_open','identity','classify','recheck','close'):
+                    print('Native fixture mount detail='+self._mount_detail,file=sys.stderr)
             safe=permitted(stage)
             if os.geteuid()==0 and os.environ.get('GITHUB_ACTIONS')=='true' and safe:
                 print('Native fixture process probe stage='+stage,file=sys.stderr)

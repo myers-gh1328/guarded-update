@@ -73,7 +73,7 @@ class ProcessSnapshotTests(unittest.TestCase):
                 owner=ProcessProbe._from_directory(fd,123,(0,27),time.monotonic()+2,owner=os.getuid())
                 with patch('inventory_refresh_process_snapshot.os.geteuid',return_value=0),patch.dict(os.environ,{'GITHUB_ACTIONS':'true'}),contextlib.redirect_stderr(output):
                     with self.assertRaises(ValueError):owner.sample()
-                self.assertEqual(output.getvalue(),'Native fixture mount comparison=unavailable\nNative fixture process probe stage=profile_mount_writable_nested_descendant_one_other_root_single\n')
+                self.assertEqual(output.getvalue(),'Native fixture mount comparison=unavailable\nNative fixture mount detail=root_link\nNative fixture process probe stage=profile_mount_writable_nested_descendant_one_other_root_single\n')
                 owner.close()
             finally:os.close(fd)
 
@@ -87,7 +87,7 @@ class ProcessSnapshotTests(unittest.TestCase):
                 owner=ProcessProbe._from_directory(fd,123,(0,27),time.monotonic()+2,owner=os.getuid())
                 with patch('inventory_refresh_process_snapshot.os.geteuid',return_value=0),patch.dict(os.environ,{'GITHUB_ACTIONS':'true'}),contextlib.redirect_stderr(output):
                     with self.assertRaises(ValueError):owner.sample()
-                self.assertEqual(output.getvalue(),'Native fixture mount comparison=unavailable\nNative fixture process probe stage=profile_mount_writable_root\n')
+                self.assertEqual(output.getvalue(),'Native fixture mount comparison=unavailable\nNative fixture mount detail=root_link\nNative fixture process probe stage=profile_mount_writable_root\n')
                 owner.close()
             finally:os.close(fd)
 
@@ -113,6 +113,7 @@ class ProcessSnapshotTests(unittest.TestCase):
                 (proc/'root').unlink();(proc/'root').symlink_to('/tmp',target_is_directory=True)
                 with patch('inventory_refresh_process_snapshot.classify_mounts',return_value='matching'):
                     self.assertEqual(owner.mount_diagnostic(self.stat,self.mounts),'unavailable')
+                self.assertEqual(owner._mount_detail,'root_link')
                 owner.close()
             finally:os.close(fd)
 
