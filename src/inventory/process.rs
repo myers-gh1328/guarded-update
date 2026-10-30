@@ -214,10 +214,26 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    fn held_fd_stage(raw: &[u8]) -> &'static str {
+        match raw {
+            b"Synthetic held-fd exec stage=setup\n" => "setup",
+            b"Synthetic held-fd exec stage=ancestry\n" => "ancestry",
+            b"Synthetic held-fd exec stage=source\n" => "source",
+            b"Synthetic held-fd exec stage=lock\n" => "lock",
+            b"Synthetic held-fd exec stage=exec\n" => "exec",
+            _ => "child_or_unknown",
+        }
+    }
+
+    #[cfg(target_os = "linux")]
     #[test]
     fn held_fd_exec_requires_one_named_test() {
         assert!(!held_fd_test_output(b"running 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s\n"));
         assert!(held_fd_test_output(b"running 1 test\ntest inventory::process::tests::held_fd_exec_child ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s\n"));
+        assert_eq!(
+            held_fd_stage(b"token=synthetic-secret\n"),
+            "child_or_unknown"
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -241,14 +257,20 @@ mod tests {
             .arg(std::env::current_exe().unwrap())
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .spawn()
             .unwrap();
         let stdout = child.stdout.take().unwrap();
+        let stderr = child.stderr.take().unwrap();
         let reader = std::thread::spawn(move || {
             use std::io::Read;
             let mut data = Vec::new();
             stdout.take(2049).read_to_end(&mut data).map(|_| data)
+        });
+        let errors = std::thread::spawn(move || {
+            use std::io::Read;
+            let mut data = Vec::new();
+            stderr.take(513).read_to_end(&mut data).map(|_| data)
         });
         let deadline = Instant::now() + Duration::from_secs(20);
         let mut status = None;
@@ -258,10 +280,19 @@ mod tests {
             }
             if let Some(status) = status
                 && reader.is_finished()
+                && errors.is_finished()
             {
-                assert!(status.success());
                 let output = reader.join().unwrap().unwrap();
-                assert!(output.len() <= 2048 && held_fd_test_output(&output));
+                let error_output = errors.join().unwrap().unwrap();
+                if !status.success() {
+                    panic!(
+                        "Synthetic held-fd exec stage={}",
+                        held_fd_stage(&error_output)
+                    );
+                }
+                assert!(
+                    error_output.is_empty() && output.len() <= 2048 && held_fd_test_output(&output)
+                );
                 break;
             }
             assert!(Instant::now() < deadline, "fixture child exit unknown");

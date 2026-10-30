@@ -9,6 +9,7 @@ import tempfile
 
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'scripts'))
 from inventory_refresh_maintenance_lock import MaintenanceAdmission
+STAGE='setup'
 
 
 def ticks():
@@ -18,12 +19,13 @@ def ticks():
 
 
 def main(binary):
+    global STAGE
     if os.execve not in os.supports_fd:raise ValueError('fd exec unavailable')
     path=Path(binary)
     if not path.is_absolute() or any(x in ('.','..') for x in path.parts):raise ValueError('invalid executable')
     # Caller-owned directory ancestry is trusted and checked, but cannot be
     # proven immutable between samples.
-    chain=[];links=[];fd=os.open('/',os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW);chain.append(fd)
+    STAGE='ancestry';chain=[];links=[];fd=os.open('/',os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW);chain.append(fd)
     try:
         for component in path.parts[1:-1]:
             next_fd=os.open(component,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW,dir_fd=fd)
@@ -32,7 +34,7 @@ def main(binary):
                 held.st_uid not in (0,os.getuid()) or held.st_mode&0o022):raise ValueError('unsafe ancestry')
             links.append((fd,component,next_fd,(held.st_dev,held.st_ino,held.st_mode,held.st_uid,held.st_gid)))
             chain.append(next_fd);fd=next_fd
-        source=os.open(path.name,os.O_RDONLY|os.O_NOFOLLOW,dir_fd=fd)
+        STAGE='source';source=os.open(path.name,os.O_RDONLY|os.O_NOFOLLOW,dir_fd=fd)
         info=os.fstat(source);named=os.stat(path.name,dir_fd=fd,follow_symlinks=False)
         if (not stat.S_ISREG(info.st_mode) or info.st_uid!=os.getuid() or info.st_nlink!=1 or
             info.st_mode&0o022 or not info.st_mode&0o111 or not 0<info.st_size<=128*1024*1024 or
@@ -49,7 +51,7 @@ def main(binary):
         before=(info.st_dev,info.st_ino,info.st_size,info.st_mtime_ns,info.st_ctime_ns)
         def same(value):return (value.st_dev,value.st_ino,value.st_size,value.st_mtime_ns,value.st_ctime_ns)==before
         if not same(os.fstat(source)) or not same(os.stat(path.name,dir_fd=fd,follow_symlinks=False)):raise ValueError('executable changed')
-        fixture=Path(tempfile.mkdtemp(prefix='inventory-exec-identity-'))
+        STAGE='lock';fixture=Path(tempfile.mkdtemp(prefix='inventory-exec-identity-'))
         for name in ('maintenance.lock','admission.lock'):
             (fixture/name).write_bytes(b'');(fixture/name).chmod(0o644)
         directory=os.open(fixture,os.O_RDONLY|os.O_DIRECTORY)
@@ -74,10 +76,14 @@ def main(binary):
         if not same(os.fstat(source)) or not same(os.stat(path.name,dir_fd=fd,follow_symlinks=False)):raise ValueError('executable changed')
         env={'PATH':'/usr/bin:/bin','LC_ALL':'C','EXEC_IDENTITY':','.join(map(str,(os.getpid(),ticks(),info.st_dev,info.st_ino,inherited,lockinfo.st_dev,lockinfo.st_ino))),
              'EXEC_LOCK_PATH':str(fixture/'maintenance.lock')}
-        os.execve(source,[binary,'--exact','inventory::process::tests::held_fd_exec_child','--ignored','--test-threads=1'],env)
+        STAGE='exec';os.execve(source,[binary,'--exact','inventory::process::tests::held_fd_exec_child','--ignored','--test-threads=1'],env)
     finally:
         # Only reached on error; the fixture retains unknown state.
         for item in reversed(chain):os.close(item)
 
 
-if __name__=='__main__':main(sys.argv[1])
+if __name__=='__main__':
+    try:main(sys.argv[1])
+    except BaseException:
+        print('Synthetic held-fd exec stage='+STAGE,file=sys.stderr)
+        sys.exit(74)
