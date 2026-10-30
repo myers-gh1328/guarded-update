@@ -294,6 +294,18 @@ class BindingTest(unittest.TestCase):
             MODULE.validate_live_identity(dict(status, MainPID='0'), 'test', '/fixture')
         self.assertEqual(pid.exception.reason, 'unit_identity_pid')
 
+    def test_final_unit_identity_reports_fixed_failure_categories(self):
+        status = {'Description':'test', 'InvocationID':'a' * 32, 'ActiveState':'inactive',
+                  'Result':'success', 'ExecMainCode':'1', 'ExecMainStatus':'0'}
+        MODULE.validate_final_identity(status, 'test', 'a' * 32)
+        for field, value, reason in [('ActiveState','deactivating','unit_final_active_deactivating'),
+                ('InvocationID','b' * 32,'unit_final_invocation'), ('Result','exit-code','unit_final_result'),
+                ('ExecMainCode','0','unit_final_code'), ('ExecMainStatus','1','unit_final_status')]:
+            changed = dict(status); changed[field] = value
+            with self.subTest(field=field), self.assertRaises(MODULE.PinError) as error:
+                MODULE.validate_final_identity(changed, 'test', 'a' * 32)
+            self.assertEqual(error.exception.reason, reason)
+
     def test_exact_fixture_binding_only(self):
         good = b'{"schema_version":1,"epoch":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","enrollment":"00000000-0000-4000-8000-000000000001","nonce":"0000000000000008dddddddddddddddd","policy":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}'
         self.assertEqual(MODULE.parse_binding(good)['nonce'], '0000000000000008dddddddddddddddd')

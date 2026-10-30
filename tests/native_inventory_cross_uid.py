@@ -127,6 +127,23 @@ def validate_live_identity(status, description, group, invocation=None, pid=None
         raise PinError('unit_identity_fields') from None
 
 
+def validate_final_identity(status, description, invocation):
+    try:
+        if status['Description'] != description: raise PinError('unit_final_description')
+        if status['InvocationID'] != invocation: raise PinError('unit_final_invocation')
+        active = status['ActiveState']
+        if active not in ('inactive', 'failed'):
+            category = active if active in ('active', 'activating', 'deactivating') else 'other'
+            raise PinError('unit_final_active_' + category)
+        if status['Result'] != 'success': raise PinError('unit_final_result')
+        if status['ExecMainCode'] != '1': raise PinError('unit_final_code')
+        if status['ExecMainStatus'] != '0': raise PinError('unit_final_status')
+    except PinError:
+        raise
+    except (KeyError, TypeError):
+        raise PinError('unit_final_fields') from None
+
+
 def validate_test_output(raw):
     if type(raw) is not bytes or len(raw) > 8192: raise ValueError(ERROR)
     try:
@@ -575,9 +592,10 @@ def run(archive):
             validate_test_output(output)
             stage = 'unit_final'
             final = unit_status(min(deadline, time.monotonic() + 3))
-            if (final['Description'] != description or final['InvocationID'] != invocation or
-                final['ActiveState'] not in ('inactive', 'failed') or final['Result'] != 'success' or
-                final['ExecMainCode'] != '1' or final['ExecMainStatus'] != '0'): raise ValueError(ERROR)
+            try: validate_final_identity(final, description, invocation)
+            except PinError as error:
+                stage = error.reason
+                raise
             stage = 'group_empty'
             group_chain.verify()
             empty_group(group_chain.fds[-2], UNIT, group_chain.fds[-1], deadline)
