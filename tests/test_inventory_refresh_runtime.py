@@ -64,6 +64,69 @@ class RuntimeTests(unittest.TestCase):
         self.assertNotIn('lock_exit',self.events)
         self.assertFalse(self.f.journal.snapshot()['unconfirmed'])
 
+    def test_maintenance_guard_is_held_through_runtime_close(self):
+        import subprocess
+        from inventory_refresh_maintenance_lock import MaintenanceLock
+        path=self.f.root/'maintenance';path.mkdir(mode=0o700)
+        (path/'maintenance.lock').write_bytes(b'');(path/'maintenance.lock').chmod(0o644)
+        directory=os.open(path,os.O_RDONLY|os.O_DIRECTORY)
+        guard=MaintenanceLock.from_directory(directory,'participant',os.getuid(),os.getgid())
+        program="import fcntl,os,sys\nfd=os.open(sys.argv[1],os.O_RDONLY)\ntry:\n fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)\nexcept BlockingIOError: sys.exit(42)\nfinally: os.close(fd)"
+        def contender():
+            child=subprocess.Popen([sys.executable,'-I','-B','-S','-c',program,str(path/'maintenance.lock')],
+                stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+            return child.wait(timeout=5)
+        original_close=self.state.close.side_effect
+        def state_close():
+            self.assertEqual(contender(),42)
+            original_close()
+        self.state.close.side_effect=state_close
+        try:
+            self.runtime=module.FixedRuntime._with_maintenance_for_test(guard)
+            self.assertEqual(contender(),42)
+            self.runtime.close();self.runtime.close()
+            self.assertEqual(contender(),0)
+        finally:
+            os.close(directory)
+
+    def test_failed_runtime_close_does_not_release_maintenance_guard(self):
+        guard=Mock();self.runtime=module.FixedRuntime._with_maintenance_for_test(guard)
+        self.state.close.side_effect=ValueError('uncertain')
+        with self.assertRaises(ValueError):self.runtime.close()
+        with self.assertRaises(ValueError):self.runtime.close()
+        guard.close.assert_not_called()
+
+    def test_changed_maintenance_guard_fences_runtime_and_is_retained(self):
+        guard=Mock();self.runtime=module.FixedRuntime._with_maintenance_for_test(guard)
+        guard.verify.side_effect=ValueError('changed')
+        with self.assertRaises(ValueError):self.runtime.step()
+        self.assertTrue(self.f.journal.snapshot()['unconfirmed'])
+        guard.close.assert_not_called()
+
+    def test_maintenance_guard_close_failure_remains_absorbing(self):
+        guard=Mock();guard.close.side_effect=ValueError('uncertain')
+        self.runtime=module.FixedRuntime._with_maintenance_for_test(guard)
+        with self.assertRaises(ValueError):self.runtime.close()
+        with self.assertRaises(ValueError):self.runtime.close()
+        guard.close.assert_called_once()
+
+    def test_maintenance_is_retained_on_runtime_construction_failure(self):
+        for target in ('resources','policy','journal'):
+            with self.subTest(target=target):
+                guard=Mock()
+                factory={'resources':self.resource_factory,'policy':self.policy_factory,
+                         'journal':self.f.journal.startup_ready}[target]
+                # startup_ready is normally a bound method rather than a mock.
+                if target=='journal':
+                    with patch.object(self.f.journal,'startup_ready',return_value=False):
+                        with self.assertRaises(ValueError):module.FixedRuntime._with_maintenance_for_test(guard)
+                else:
+                    old=factory.side_effect;factory.side_effect=ValueError('uncertain')
+                    try:
+                        with self.assertRaises(ValueError):module.FixedRuntime._with_maintenance_for_test(guard)
+                    finally:factory.side_effect=old
+                guard.close.assert_not_called()
+
     def test_runtime_drain_keeps_active_request_and_fences_context_failure(self):
         self.runtime=module.FixedRuntime.fixed()
         self.runtime._observation._clock=self.f.clock
