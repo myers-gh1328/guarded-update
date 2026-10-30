@@ -5,6 +5,7 @@ from pathlib import Path
 import socket
 import array
 import subprocess
+import struct
 import sys
 import time
 import unittest
@@ -28,6 +29,24 @@ class SeqpacketTests(unittest.TestCase):
         with patch.object(packet.os,'close',side_effect=close):
             with self.assertRaises(ValueError):packet.OneMessage._discard([(socket.SOL_SOCKET,socket.SCM_RIGHTS,raw)])
         self.assertEqual(calls,[41,42])
+
+    def test_message_credentials_are_exact_and_caller_supplied(self):
+        credential=struct.pack('3i',17,0,0)
+        record=(socket.SOL_SOCKET,getattr(socket,'SCM_CREDENTIALS',2),credential)
+        self.assertEqual(packet.decode_credentials(b'DRAIN-1',[record],0,(17,0,0)),(17,0,0))
+        for raw,records,flags,expected in ((b'', [record],0,(17,0,0)),
+            (b'DRAIN-1',[record,record],0,(17,0,0)),
+            (b'DRAIN-1',[record],socket.MSG_CTRUNC,(17,0,0)),
+            (b'DRAIN-1',[record],0,(18,0,0)),
+            (b'DRAIN-1',[(socket.SOL_SOCKET,getattr(socket,'SCM_CREDENTIALS',2),b'bad')],0,(17,0,0))):
+            with self.assertRaises(ValueError):packet.decode_credentials(raw,records,flags,expected)
+        rights=(socket.SOL_SOCKET,socket.SCM_RIGHTS,array.array('i',[41,42]).tobytes())
+        with patch.object(packet.os,'close') as close:
+            with self.assertRaises(ValueError):packet.decode_credentials(b'DRAIN-1',[record,rights],0,(17,0,0))
+        self.assertEqual([call.args[0] for call in close.call_args_list],[41,42])
+        with patch.object(packet.os,'close') as close:
+            with self.assertRaises(ValueError):packet.decode_credentials(b'DRAIN-1',[('malformed',),rights],0,(17,0,0))
+        self.assertEqual([call.args[0] for call in close.call_args_list],[41,42])
 
     @unittest.skipUnless(sys.platform=='linux','Linux Unix-stream fixture')
     def test_actual_child_packet_and_eof(self):

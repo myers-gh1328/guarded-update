@@ -61,8 +61,13 @@ class OneMessage:
     @staticmethod
     def _discard(ancillary):
         failed=False;seen=set()
-        for level,kind,data in ancillary:
+        for record in ancillary:
+            if type(record) is not tuple or len(record)!=3:
+                failed=True;continue
+            level,kind,data=record
             if level==socket.SOL_SOCKET and kind==socket.SCM_RIGHTS:
+                if type(data) is not bytes:
+                    failed=True;continue
                 size=array.array('i').itemsize;usable=len(data)-(len(data)%size)
                 descriptors=array.array('i');descriptors.frombytes(data[:usable])
                 if usable!=len(data):failed=True
@@ -115,3 +120,20 @@ class OneMessage:
                 fd=self.sock.detach();os.close(fd)
             except BaseException:self.failed=True
         if self.failed:raise ValueError(ERROR)
+
+
+def decode_credentials(raw,ancillary,flags,expected):
+    """Compare supplied message credentials; not a live-peer or socket proof."""
+    try:
+        OneMessage._discard(ancillary)
+        credential_type=getattr(socket,'SCM_CREDENTIALS',2)
+        if (type(raw) is not bytes or not raw or type(ancillary) is not list or type(flags) is not int or
+            flags&(socket.MSG_TRUNC|socket.MSG_CTRUNC) or type(expected) is not tuple or len(expected)!=3 or
+            any(type(item) is not int for item in expected) or not 1<expected[0]<2**31 or
+            any(not 0<=item<2**32-1 for item in expected[1:]) or len(ancillary)!=1):raise ValueError(ERROR)
+        level,kind,data=ancillary[0]
+        if level!=socket.SOL_SOCKET or kind!=credential_type or type(data) is not bytes or len(data)!=struct.calcsize('iII'):raise ValueError(ERROR)
+        actual=struct.unpack('iII',data)
+        if actual!=expected:raise ValueError(ERROR)
+        return actual
+    except BaseException:raise ValueError(ERROR) from None
