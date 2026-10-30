@@ -68,9 +68,11 @@ class PublicMarkerNativeTests(unittest.TestCase):
               patch.object(native.os,'getresuid',return_value=(0,0,0),create=True),
               patch.object(native.os,'getresgid',return_value=(0,0,0),create=True),
               patch.dict(os.environ,{'GITHUB_ACTIONS':'true'}),
-              patch.object(native.os,'mkdir',side_effect=FileExistsError),patch.object(native,'invoke') as invoke):
+              patch.object(native.os,'mkdir',side_effect=FileExistsError),patch.object(native,'invoke') as invoke,
+              patch('builtins.print') as diagnostic):
             with self.assertRaises(ValueError):native.run('synthetic')
         invoke.assert_not_called();self.assertEqual(chain.close.call_count,2)
+        self.assertEqual(diagnostic.call_args.args,('Synthetic public marker stage=libexec',))
 
     def test_changed_parent_stops_before_invocation(self):
         local=Mock();local.fds=[123];local.verify.side_effect=[None,ValueError('replaced')]

@@ -89,19 +89,22 @@ def run(archive):
     from inventory_refresh_resources import _Chain
     from inventory_refresh_reporter_fixture_files import FixtureSources
     from native_inventory_cross_uid import create_account,ensure_libexec
-    deadline=time.monotonic()+45;owned=[];failed=False;complete=False
+    deadline=time.monotonic()+45;owned=[];failed=False;complete=False;stage='account'
     try:
-        create_account(deadline);verified=verify_archive(repo,archive)
+        create_account(deadline);stage='archive';verified=verify_archive(repo,archive)
+        stage='libexec'
         local=_Chain(('usr','local'));owned.append(local);local.verify();ensure_libexec(local.fds[-1],0,deadline);local.verify()
         libexec=_Chain(('usr','local','libexec'));owned.append(libexec);libexec.verify()
         os.mkdir('command-center-inventory-refresh',0o755,dir_fd=libexec.fds[-1]);os.fsync(libexec.fds[-1]);libexec.verify()
-        sources=FixtureSources.fixed(verified,include_entry=True);owned.append(sources);sources.publish();sources.verify()
+        stage='sources';sources=FixtureSources.fixed(verified,include_entry=True);owned.append(sources);sources.publish();sources.verify()
+        stage='public_directory'
         varlib=_Chain(('var','lib'));owned.append(varlib);varlib.verify()
         os.mkdir('command-center-inventory-maintenance',0o755,dir_fd=varlib.fds[-1]);os.fsync(varlib.fds[-1]);varlib.verify()
         public=_Chain(('var','lib','command-center-inventory-maintenance'));owned.append(public);public.verify()
         info=os.fstat(public.fds[-1])
         if (info.st_uid,info.st_gid,stat.S_IMODE(info.st_mode))!=(0,0,0o755):raise ValueError(ERROR)
         for mode in ('absent','deny','absent','create','present'):
+            stage='invoke_'+mode
             sources.verify();public.verify();varlib.verify();invoke(mode,deadline)
             sources.verify();public.verify();varlib.verify()
         complete=True
@@ -110,7 +113,9 @@ def run(archive):
         for item in reversed(owned):
             try:item.close()
             except BaseException:failed=True
-    if failed or not complete or time.monotonic()>=deadline:raise ValueError(ERROR)
+    if failed or not complete or time.monotonic()>=deadline:
+        print('Synthetic public marker stage='+stage,file=sys.stderr)
+        raise ValueError(ERROR)
     return {'synthetic_public_marker_cross_uid':True,'production_authority':False,'cleanup_proven':False}
 
 
