@@ -233,6 +233,32 @@ class RuntimeTests(unittest.TestCase):
             except ValueError:pass
             os.close(directory)
 
+    def test_maintenance_control_drains_actual_runtime_before_lifetime(self):
+        import threading,time
+        from inventory_refresh_maintenance_lock import MaintenanceAdmission
+        import inventory_refresh_maintenance_control as control
+        path=self.f.root/'maintenance';path.mkdir(mode=0o700)
+        for name in ('maintenance.lock','admission.lock'):
+            (path/name).write_bytes(b'');(path/name).chmod(0o644)
+        directory=os.open(path,os.O_RDONLY|os.O_DIRECTORY)
+        self.f.lock.__exit__(None,None,None);self.f.journal.exclusive=self.original_exclusive
+        guard=MaintenanceAdmission.participant(directory,os.getuid(),os.getgid())
+        self.runtime=module.FixedRuntime._with_maintenance_for_test(guard)
+        self.runtime._observation._clock=self.f.clock
+        owner=MaintenanceAdmission.maintenance(directory,os.getuid(),os.getgid())
+        request_read,request_write=os.pipe();reply_read,reply_write=os.pipe();errors=[]
+        def serve():
+            try:control.serve(self.runtime,request_read,reply_write,time.monotonic()+3)
+            except ValueError:errors.append(1)
+        thread=threading.Thread(target=serve);thread.start()
+        try:
+            self.assertTrue(control.request(owner,request_write,reply_read,time.monotonic()+3))
+            thread.join(3);self.assertFalse(thread.is_alive());self.assertEqual(errors,[])
+            self.assertTrue(self.runtime._closed);owner.close()
+        finally:
+            os.close(directory);self.runtime.close()
+            self.f.lock=self.f.journal.exclusive();self.f.lock.__enter__()
+
     def test_false_startup_barrier_refuses_dispatch_without_initialization(self):
         self.f.journal.startup_ready=Mock(return_value=False);self.f.journal.initialize=Mock()
         with self.assertRaises(ValueError):module.FixedRuntime.fixed()
