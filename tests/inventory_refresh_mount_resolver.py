@@ -133,7 +133,7 @@ def classify_metadata(root,rows,deadline,mount_id,uid,gid):
 CONTROL_NAMES={name:name.replace('.','_') for name in (
     'cgroup.procs','cgroup.threads','cgroup.subtree_control','cgroup.freeze','cgroup.kill','cgroup.events',
     'cgroup.stat','cgroup.controllers','cgroup.max.depth','cgroup.max.descendants',
-    'memory.max','memory.high','memory.reclaim','memory.current','memory.events',
+    'memory.max','memory.high','memory.reclaim','memory.current','memory.events','memory.pressure',
     'pids.max','pids.current','cpu.max','cpu.weight','io.max','io.weight')}
 
 

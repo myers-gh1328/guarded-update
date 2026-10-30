@@ -202,7 +202,7 @@ class PublisherHarnessTests(unittest.TestCase):
         chain=SimpleNamespace(fds=[10,11],verify=lambda:events.append('chain-verify'),close=lambda:events.append('chain-close'))
         probe=SimpleNamespace(sample=lambda:(events.append('process-sample') or 1234),close=lambda:events.append('process-close'))
         base={'Description':'proof','InvocationID':'abc','ControlGroup':'/unit','ActiveState':'active',
-            'Delegate':'no','ProtectControlGroups':'yes','MainPID':'123'}
+            'Delegate':'no','ProtectControlGroups':'yes','MemoryPressureWatch':'off','MainPID':'123'}
         values=[dict(base),dict(base)]
         scope={'re':re,'time':time,'os':SimpleNamespace(fstat=lambda fd:info,major=lambda dev:0,minor=lambda dev:27),
             '_Chain':lambda parts:chain,'ProcessProbe':SimpleNamespace(fixed=lambda *args:probe),
@@ -214,7 +214,7 @@ class PublisherHarnessTests(unittest.TestCase):
         events.clear();values=[dict(base),dict(base,InvocationID='changed')]
         with self.assertRaises(AssertionError):sample('unit','proof','/unit','abc',(7,9),time.monotonic()+1,lambda:values.pop(0))
         self.assertEqual(events[-2:],['process-close','chain-close'])
-        for changed in (dict(base,MainPID='124'),dict(base,Delegate='yes'),dict(base,ProtectControlGroups='no')):
+        for changed in (dict(base,MainPID='124'),dict(base,Delegate='yes'),dict(base,ProtectControlGroups='no'),dict(base,MemoryPressureWatch='auto')):
             values=[dict(base),changed]
             with self.assertRaises(AssertionError):sample('unit','proof','/unit','abc',(7,9),time.monotonic()+1,lambda:values.pop(0))
         values=[dict(base),dict(base)]
@@ -244,7 +244,7 @@ class PublisherHarnessTests(unittest.TestCase):
         node=next(node for node in tree.body if isinstance(node,ast.FunctionDef) and node.name=='prove_rust_reporter_roundtrip')
         code=ast.unparse(node)
         for item in ('User=60002','Group=60002','NoNewPrivileges=yes','PrivateNetwork=yes','RuntimeMaxSec=20',
-            '--exact','--ignored','--test-threads=1','ReadOnlyPaths=/sys/fs/cgroup','MountFlags=private','hosted_real_reporter_rust_journal_roundtrip',
+            '--exact','--ignored','--test-threads=1','ReadOnlyPaths=/sys/fs/cgroup','MountFlags=private','MemoryPressureWatch=off','hosted_real_reporter_rust_journal_roundtrip',
             'InvocationID','cgroup.events','populated 0','validate_rust_proof_output','retire_rust_reporter_artifact_fixture'):
             self.assertIn(item,code)
         self.assertNotIn('.kill(',code);self.assertNotIn('os.kill(',code)

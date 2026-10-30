@@ -86,6 +86,8 @@ class MountResolverTests(unittest.TestCase):
         target=self.root/'a'/'cgroup.freeze';target.write_bytes(b'')
         row={'id':7,'path':'/a/cgroup.freeze','root':'/hidden/cgroup.procs','fs':b'cgroup2','options':{b'rw'}}
         self.assertEqual(resolver.classify_origin(self.fd,[row],time.monotonic()+1,lambda fd:7),('sample','cgroup_freeze','cgroup_procs'))
+        row['root']='/hidden/memory.pressure'
+        self.assertEqual(resolver.classify_origin(self.fd,[row],time.monotonic()+1,lambda fd:7),('sample','cgroup_freeze','memory_pressure'))
         row['root']='/hidden/private-value'
         self.assertEqual(resolver.classify_origin(self.fd,[row],time.monotonic()+1,lambda fd:7),('sample','cgroup_freeze','other'))
         row['path']='/../invalid'

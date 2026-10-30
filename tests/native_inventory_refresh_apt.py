@@ -1722,7 +1722,7 @@ def write_rust_barrier_ack(fd,deadline):
 def sample_rust_unit_processes(unit,description,expected,invocation,identity,deadline,properties):
     value=properties()
     assert value['Description']==description and value['InvocationID']==invocation and value['ControlGroup']==expected
-    assert value['ActiveState']=='active' and value['Delegate']=='no' and value['ProtectControlGroups']=='yes'
+    assert value['ActiveState']=='active' and value['Delegate']=='no' and value['ProtectControlGroups']=='yes' and value['MemoryPressureWatch']=='off'
     assert re.fullmatch('[1-9][0-9]{0,9}',value['MainPID']);pid=int(value['MainPID'])
     group_chain=None;probe=None
     try:
@@ -1734,7 +1734,7 @@ def sample_rust_unit_processes(unit,description,expected,invocation,identity,dea
         assert probe.sample()==start;group_chain.verify()
         again=properties()
         assert again['Description']==description and again['InvocationID']==invocation and again['ControlGroup']==expected
-        assert again['MainPID']==str(pid) and again['ActiveState']=='active' and again['Delegate']=='no' and again['ProtectControlGroups']=='yes'
+        assert again['MainPID']==str(pid) and again['ActiveState']=='active' and again['Delegate']=='no' and again['ProtectControlGroups']=='yes' and again['MemoryPressureWatch']=='off'
         assert time.monotonic()<deadline
     finally:
         try:
@@ -1751,7 +1751,7 @@ def prove_rust_reporter_roundtrip(archive,public,physical_sample=False):
     unit='command-center-inventory.service';description='Rust reporter proof '+secrets.token_hex(16)
     expected='/command.slice/command-center.slice/command-center-inventory.slice/'+unit
     deadline=time.monotonic()+60
-    def properties():return rust_unit_properties(min(deadline,time.monotonic()+2),PROPERTIES+(('Delegate','ProtectControlGroups') if physical_sample else ()))
+    def properties():return rust_unit_properties(min(deadline,time.monotonic()+2),PROPERTIES+(('Delegate','ProtectControlGroups','MemoryPressureWatch') if physical_sample else ()))
     assert properties()['LoadState']=='not-found'
     fixture=stage_rust_reporter_artifact_fixture(archive,deadline)
     process=None;group=None;identity=None;invocation=None;confirmed=False;completed=False
@@ -1766,7 +1766,7 @@ def prove_rust_reporter_roundtrip(archive,public,physical_sample=False):
             args+=['-p',item]
         if physical_sample:
             args+=['--setenv=GUARDED_UPDATE_NATIVE_BARRIER_PROOF=1','-p','Delegate=no',
-                '-p','ReadOnlyPaths=/sys/fs/cgroup','-p','MountFlags=private']
+                '-p','ReadOnlyPaths=/sys/fs/cgroup','-p','MountFlags=private','-p','MemoryPressureWatch=off']
         test_name=('inventory::reporter_obs::tests::hosted_real_reporter_rust_journal_sample' if physical_sample else
             'inventory::reporter_obs::tests::hosted_real_reporter_rust_journal_roundtrip')
         args+=['/usr/local/libexec/command-center-inventory','--exact',test_name,'--ignored','--test-threads=1','--nocapture']
