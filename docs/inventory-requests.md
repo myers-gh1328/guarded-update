@@ -82,6 +82,11 @@ Manual support remains unavailable until actual helper/observation integration i
 verified. No arbitrary commands, paths, packages, policies or installation grants
 are accepted from a request.
 
+The Root journal can produce a locked, read-only internal projection of its
+epoch and separate refresh, observation and release counters when no operation
+is active or globally unconfirmed. The projection is not published to the agent,
+does not reserve a nonce, and cannot initialize or authenticate an enrollment.
+
 Linux sync inspects an existing request journal under its inventory lock before
 starting a daily collection. A pending journal replacement, invalid or unreadable
 journal, or retained manual or collection work defers that collection and

@@ -347,6 +347,18 @@ class Journal:
         self._ready()
         return self._decode_snapshot(self._read('initialized-epoch'),self._read('control.json'))
 
+    def counter_snapshot(self):
+        """Read one locked historical projection; never a reservation or seed."""
+        self._locked()
+        state=self.snapshot()
+        capabilities=state['capabilities']
+        if state['unconfirmed'] or any(capabilities[name]['active'] is not None for name in CAPABILITIES):
+            raise ValueError('Helper counter snapshot unavailable')
+        return {'schema_version':1,'root_epoch':state['epoch'],
+                'refresh_high_water':capabilities['refresh']['high_water'],
+                'observation_high_water':capabilities['observation']['high_water'],
+                'release_high_water':capabilities['release']['high_water']}
+
     def _decode_snapshot(self, marker, raw):
         if len(marker) != 32:
             raise ValueError('Helper initialized marker is invalid')

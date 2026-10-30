@@ -48,6 +48,56 @@ class RefreshStateTests(unittest.TestCase):
                 'lock_held_until_boottime_ms':125,'released_boottime_ms':126,'outcome':'released',
                 'installed_before_sha256':'d'*64,'installed_after_sha256':'d'*64}
 
+    def test_counter_snapshot_is_locked_read_only_and_preserves_distinct_floors(self):
+        self.initialize()
+        with self.assertRaises(ValueError):self.journal.counter_snapshot()
+        with self.journal.exclusive():
+            state=self.journal.snapshot()
+            for name,value in (('refresh',4),('observation',7),('release',9)):
+                state['capabilities'][name]['high_water']=value
+            self.journal._save(state)
+            before=(self.directory/'control.json').read_bytes()
+            result=self.journal.counter_snapshot()
+            self.assertEqual(result,{'schema_version':1,'root_epoch':'a'*32,'refresh_high_water':4,
+                'observation_high_water':7,'release_high_water':9})
+            result['refresh_high_water']=999
+            self.assertEqual(self.journal.counter_snapshot()['refresh_high_water'],4)
+            self.assertEqual((self.directory/'control.json').read_bytes(),before)
+
+    def test_counter_snapshot_rejects_active_or_unconfirmed_state(self):
+        self.initialize()
+        with self.journal.exclusive():
+            self.journal.receive('refresh',self.nonce,self.boot,100,'b'*64)
+            before=(self.directory/'control.json').read_bytes()
+            with self.assertRaises(ValueError):self.journal.counter_snapshot()
+            self.assertEqual((self.directory/'control.json').read_bytes(),before)
+            self.journal.fence_external()
+            before=(self.directory/'control.json').read_bytes()
+            with self.assertRaises(ValueError):self.journal.counter_snapshot()
+            self.assertEqual((self.directory/'control.json').read_bytes(),before)
+
+    def test_counter_snapshot_rejects_torn_invalid_or_mismatched_state(self):
+        self.initialize()
+        with self.journal.exclusive():
+            path=self.directory/'control.json'
+            original=path.read_bytes()
+            value=json.loads(original)
+            invalid=[]
+            wrong_epoch=dict(value,epoch='b'*32)
+            invalid.append(json.dumps(wrong_epoch).encode())
+            for number in (True,2**53):
+                item=json.loads(original)
+                item['capabilities']['observation']['high_water']=number
+                invalid.append(json.dumps(item).encode())
+            invalid.extend((b'{',b'{"schema_version":3,"schema_version":3}'))
+            for raw in invalid:
+                path.write_bytes(raw)
+                with self.subTest(raw=raw[:20]),self.assertRaises(ValueError):self.journal.counter_snapshot()
+                self.assertEqual(path.read_bytes(),raw)
+            path.write_bytes(original)
+            (self.directory/'initialized-epoch').write_bytes(b'broken')
+            with self.assertRaises(ValueError):self.journal.counter_snapshot()
+
     def test_external_publication_uncertainty_preserves_success_but_blocks_admission(self):
         self.initialize()
         with self.journal.exclusive():
