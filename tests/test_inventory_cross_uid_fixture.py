@@ -26,11 +26,13 @@ class BindingTest(unittest.TestCase):
             empty = {'LoadState':'not-found', 'ActiveState':'inactive', 'InvocationID':'', 'ControlGroup':''}
             try:
                 MODULE.require_slice_absent(empty, root, os.geteuid(), time.monotonic() + 5)
-                with self.assertRaises(ValueError):
+                with self.assertRaises(MODULE.PinError) as loaded:
                     MODULE.require_slice_absent(dict(empty, LoadState='loaded'), root, os.geteuid(), time.monotonic() + 5)
+                self.assertEqual(loaded.exception.reason, 'slice_absent_loaded')
                 (Path(temporary) / 'command.slice' / 'command-center.slice' / MODULE.SLICE).mkdir(parents=True)
-                with self.assertRaises(ValueError):
+                with self.assertRaises(MODULE.PinError) as existing:
                     MODULE.require_slice_absent(empty, root, os.geteuid(), time.monotonic() + 5)
+                self.assertEqual(existing.exception.reason, 'slice_absent_cgroup')
             finally: os.close(root)
 
     def test_slice_identity_and_manager_timeout_fail_closed(self):

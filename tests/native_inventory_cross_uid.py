@@ -259,9 +259,17 @@ def require_slice_absent(status, cgroup_root, owner, deadline):
     fds = []
     refs = []
     failed = False
+    reason = 'slice_absent_unavailable'
     try:
-        if (time.monotonic() >= deadline or status['LoadState'] != 'not-found' or
-            status['ActiveState'] != 'inactive' or status['InvocationID'] or status['ControlGroup']):
+        if time.monotonic() >= deadline: raise ValueError(ERROR)
+        if status['LoadState'] != 'not-found':
+            reason = 'slice_absent_loaded'
+            raise ValueError(ERROR)
+        if status['ActiveState'] != 'inactive':
+            reason = 'slice_absent_active'
+            raise ValueError(ERROR)
+        if status['InvocationID'] or status['ControlGroup']:
+            reason = 'slice_absent_identity'
             raise ValueError(ERROR)
         base = os.fstat(cgroup_root)
         if not stat.S_ISDIR(base.st_mode) or base.st_uid != owner or base.st_mode & 0o022: raise ValueError(ERROR)
@@ -282,7 +290,9 @@ def require_slice_absent(status, cgroup_root, owner, deadline):
         if not absent:
             try: os.stat(SLICE, dir_fd=parent, follow_symlinks=False)
             except FileNotFoundError: pass
-            else: raise ValueError(ERROR)
+            else:
+                reason = 'slice_absent_cgroup'
+                raise ValueError(ERROR)
         for old_parent, name, child, identity in refs:
             held = os.fstat(child); named = os.stat(name, dir_fd=old_parent, follow_symlinks=False)
             if identity != (held.st_dev, held.st_ino, held.st_mode, held.st_uid, held.st_gid) or identity != (named.st_dev, named.st_ino, named.st_mode, named.st_uid, named.st_gid):
@@ -294,7 +304,7 @@ def require_slice_absent(status, cgroup_root, owner, deadline):
         for fd in reversed(fds):
             try: os.close(fd)
             except OSError: failed = True
-    if failed or time.monotonic() >= deadline: raise ValueError(ERROR)
+    if failed or time.monotonic() >= deadline: raise PinError(reason)
 
 
 def validate_live_identity(status, description, group, invocation=None, pid=None):
@@ -703,14 +713,22 @@ def run(archive):
     stage = 'unit_status'
     try:
         if unit_status(min(deadline, time.monotonic() + 3))['LoadState'] != 'not-found': raise ValueError(ERROR)
-        stage = 'slice_preflight'
+        stage = 'slice_cgroup_root'
         cgroup_base = _Chain(('sys', 'fs', 'cgroup'))
         cgroup_base.verify()
-        require_slice_absent(slice_status(min(deadline, time.monotonic() + 3)), cgroup_base.fds[-1], 0, deadline)
+        stage = 'slice_status'
+        initial_slice = slice_status(min(deadline, time.monotonic() + 3))
+        stage = 'slice_absent'
+        try: require_slice_absent(initial_slice, cgroup_base.fds[-1], 0, deadline)
+        except PinError as error:
+            stage = error.reason
+            raise
         cgroup_base.verify()
+        stage = 'slice_unit_directory'
         unit_file_chain = _Chain(('run', 'systemd', 'system'))
         unit_file_chain.verify()
         slice_description = 'Synthetic inventory slice ' + secrets.token_hex(16)
+        stage = 'slice_file'
         slice_file = SliceFile.create(unit_file_chain.fds[-1], 0, slice_description, deadline)
         slice_file.verify(); unit_file_chain.verify()
         stage = 'slice_reload'
