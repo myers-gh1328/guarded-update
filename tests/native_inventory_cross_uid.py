@@ -91,13 +91,13 @@ class SliceFile:
     NAME = 'command-center-inventory.slice'
 
     @classmethod
-    def create(cls, parent, owner, description, deadline):
+    def create(cls, parent, owner, description, deadline, *, reporter_resources=False):
         value = cls()
         value._fds = []
         value._closed = False
         value._failed = False
         try:
-            if (type(owner) is not int or owner != os.geteuid() or
+            if (type(reporter_resources) is not bool or type(owner) is not int or owner != os.geteuid() or
                 type(description) is not str or not re.fullmatch(r'Synthetic inventory slice [0-9a-f]{32}', description) or
                 type(deadline) not in (float, int) or not math.isfinite(deadline) or time.monotonic() >= deadline):
                 raise ValueError(ERROR)
@@ -107,7 +107,8 @@ class SliceFile:
             if not stat.S_ISDIR(parent_info.st_mode) or parent_info.st_uid != owner or parent_info.st_mode & 0o022:
                 raise ValueError(ERROR)
             value._parent_identity = (parent_info.st_dev, parent_info.st_ino, parent_info.st_mode, parent_info.st_uid, parent_info.st_gid)
-            value._bytes = ('[Unit]\nDescription=' + description + '\n[Slice]\n').encode('ascii')
+            limits='MemoryMax=268435456\nMemorySwapMax=0\nTasksMax=64\n' if reporter_resources else ''
+            value._bytes = ('[Unit]\nDescription=' + description + '\n[Slice]\n' + limits).encode('ascii')
             value._file = os.open(cls.NAME, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600, dir_fd=value._parent)
             value._fds.append(value._file)
             offset = 0

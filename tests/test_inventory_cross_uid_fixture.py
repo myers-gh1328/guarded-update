@@ -95,6 +95,26 @@ class BindingTest(unittest.TestCase):
                 self.assertEqual((Path(temporary) / MODULE.SliceFile.NAME).read_bytes(), b'foreign')
             finally: os.close(parent)
 
+    def test_reporter_resource_slice_uses_fixed_limits(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            parent=os.open(temporary,os.O_RDONLY|os.O_DIRECTORY)
+            try:
+                description='Synthetic inventory slice '+'a'*32
+                owner=MODULE.SliceFile.create(parent,os.geteuid(),description,time.monotonic()+5,reporter_resources=True)
+                raw=(Path(temporary)/MODULE.SliceFile.NAME).read_bytes()
+                self.assertIn(b'MemoryMax=268435456\nMemorySwapMax=0\nTasksMax=64\n',raw)
+                owner.verify();owner.close()
+            finally:os.close(parent)
+        with tempfile.TemporaryDirectory() as temporary:
+            parent=os.open(temporary,os.O_RDONLY|os.O_DIRECTORY)
+            try:
+                with self.assertRaises(ValueError):
+                    MODULE.SliceFile.create(parent,os.geteuid(),description,time.monotonic()+5,reporter_resources=1)
+                self.assertFalse((Path(temporary)/MODULE.SliceFile.NAME).exists())
+                owner=MODULE.SliceFile.create(parent,os.geteuid(),description,time.monotonic()+5)
+                self.assertNotIn(b'MemoryMax=',(Path(temporary)/MODULE.SliceFile.NAME).read_bytes());owner.close()
+            finally:os.close(parent)
+
     def test_slice_sync_or_close_failure_never_removes_or_relabels_state(self):
         for fault in ('sync', 'close'):
             with self.subTest(fault=fault), tempfile.TemporaryDirectory() as temporary:
