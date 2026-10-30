@@ -4,6 +4,7 @@ import subprocess
 import os
 import time
 import types
+import tempfile
 from pathlib import Path
 import unittest
 from unittest.mock import Mock,patch
@@ -12,6 +13,66 @@ import native_inventory_maintenance_public as native
 
 
 class PublicMarkerNativeTests(unittest.TestCase):
+    def test_two_sources_publish_exclusively_and_revalidate(self):
+        with tempfile.TemporaryDirectory() as path:
+            directory=os.open(path,os.O_RDONLY|os.O_DIRECTORY)
+            contents={name:name.encode() for name in native.SOURCE_NAMES}
+            try:
+                stage=native.MarkerSources(directory,contents,os.getuid(),os.getgid())
+                stage.publish();stage.verify()
+                with self.assertRaises(ValueError):
+                    native.MarkerSources(directory,contents,os.getuid(),os.getgid()).publish()
+                os.chmod(Path(path)/native.SOURCE_NAMES[0],0o600)
+                with self.assertRaises(ValueError):stage.verify()
+                stage.close()
+            finally:os.close(directory)
+
+    def test_two_source_publication_preserves_partial_and_rejects_extra(self):
+        with tempfile.TemporaryDirectory() as path:
+            directory=os.open(path,os.O_RDONLY|os.O_DIRECTORY)
+            contents={name:b'fixed bytes' for name in native.SOURCE_NAMES}
+            try:
+                stage=native.MarkerSources(directory,contents,os.getuid(),os.getgid())
+                with patch.object(native.os,'fsync',side_effect=OSError('uncertain')):
+                    with self.assertRaises(ValueError):stage.publish()
+                self.assertTrue((Path(path)/native.SOURCE_NAMES[0]).exists());stage.close()
+            finally:os.close(directory)
+        with tempfile.TemporaryDirectory() as path:
+            directory=os.open(path,os.O_RDONLY|os.O_DIRECTORY)
+            try:
+                (Path(path)/'shadow.py').write_bytes(b'foreign')
+                stage=native.MarkerSources(directory,contents,os.getuid(),os.getgid())
+                with self.assertRaises(ValueError):stage.publish()
+                self.assertEqual((Path(path)/'shadow.py').read_bytes(),b'foreign');stage.close()
+            finally:os.close(directory)
+
+    def test_two_source_short_writes_and_close_failure(self):
+        with tempfile.TemporaryDirectory() as path:
+            directory=os.open(path,os.O_RDONLY|os.O_DIRECTORY)
+            contents={name:b'fixed bytes' for name in native.SOURCE_NAMES}
+            try:
+                stage=native.MarkerSources(directory,contents,os.getuid(),os.getgid())
+                original=native.os.write
+                with patch.object(native.os,'write',side_effect=lambda fd,data:original(fd,data[:1])):stage.publish()
+                stage.verify()
+                original_close=native.os.close
+                def fail(fd):original_close(fd);raise OSError('uncertain')
+                with patch.object(native.os,'close',side_effect=fail):
+                    with self.assertRaises(ValueError):stage.close()
+                    with self.assertRaises(ValueError):stage.close()
+            finally:os.close(directory)
+
+    def test_replaced_staged_source_is_rejected(self):
+        with tempfile.TemporaryDirectory() as path:
+            directory=os.open(path,os.O_RDONLY|os.O_DIRECTORY)
+            contents={name:b'fixed bytes' for name in native.SOURCE_NAMES}
+            try:
+                stage=native.MarkerSources(directory,contents,os.getuid(),os.getgid());stage.publish()
+                target=Path(path)/native.SOURCE_NAMES[0];target.rename(Path(path)/'old')
+                target.write_bytes(contents[native.SOURCE_NAMES[0]]);target.chmod(0o444)
+                with self.assertRaises(ValueError):stage.verify()
+                stage.close()
+            finally:os.close(directory)
     def test_command_has_fixed_profile_and_only_known_modes(self):
         command=native.command('absent',False)
         self.assertEqual(command[:6],['/usr/bin/setpriv','--reuid=60002','--regid=60002','--clear-groups','--inh-caps=-all','--bounding-set=-all'])
@@ -59,7 +120,7 @@ class PublicMarkerNativeTests(unittest.TestCase):
     def test_existing_fixture_directory_stops_before_invocation(self):
         chain=Mock();chain.fds=[123]
         fake_modules={
-            'inventory_refresh_artifact_fixture':types.SimpleNamespace(verify_archive=Mock(return_value={'files':{}})),
+            'inventory_refresh_artifact_fixture':types.SimpleNamespace(LIB='lib/',verify_archive=Mock(return_value={'files':{}})),
             'inventory_refresh_resources':types.SimpleNamespace(_Chain=Mock(return_value=chain)),
             'inventory_refresh_reporter_fixture_files':types.SimpleNamespace(FixtureSources=Mock()),
             'native_inventory_cross_uid':types.SimpleNamespace(create_account=Mock(),ensure_libexec=Mock()),
@@ -77,7 +138,7 @@ class PublicMarkerNativeTests(unittest.TestCase):
     def test_changed_parent_stops_before_invocation(self):
         local=Mock();local.fds=[123];local.verify.side_effect=[None,ValueError('replaced')]
         fake_modules={
-            'inventory_refresh_artifact_fixture':types.SimpleNamespace(verify_archive=Mock(return_value={'files':{}})),
+            'inventory_refresh_artifact_fixture':types.SimpleNamespace(LIB='lib/',verify_archive=Mock(return_value={'files':{}})),
             'inventory_refresh_resources':types.SimpleNamespace(_Chain=Mock(return_value=local)),
             'inventory_refresh_reporter_fixture_files':types.SimpleNamespace(FixtureSources=Mock()),
             'native_inventory_cross_uid':types.SimpleNamespace(create_account=Mock(),ensure_libexec=Mock()),
@@ -91,11 +152,11 @@ class PublicMarkerNativeTests(unittest.TestCase):
 
     def test_changed_staged_source_stops_before_invocation(self):
         chain=Mock();chain.fds=[123];sources=Mock();sources.verify.side_effect=[None,ValueError('replaced')]
-        staged=Mock();staged.fixed.return_value=sources
+        contents={'lib/'+name:b'x' for name in native.SOURCE_NAMES}
         fake_modules={
-            'inventory_refresh_artifact_fixture':types.SimpleNamespace(verify_archive=Mock(return_value={'files':{}})),
+            'inventory_refresh_artifact_fixture':types.SimpleNamespace(LIB='lib/',verify_archive=Mock(return_value={'files':contents})),
             'inventory_refresh_resources':types.SimpleNamespace(_Chain=Mock(return_value=chain)),
-            'inventory_refresh_reporter_fixture_files':types.SimpleNamespace(FixtureSources=staged),
+            'inventory_refresh_reporter_fixture_files':types.SimpleNamespace(FixtureSources=Mock()),
             'native_inventory_cross_uid':types.SimpleNamespace(create_account=Mock(),ensure_libexec=Mock()),
         }
         info=types.SimpleNamespace(st_uid=0,st_gid=0,st_mode=0o40755)
@@ -103,7 +164,7 @@ class PublicMarkerNativeTests(unittest.TestCase):
               patch.object(native.os,'getresuid',return_value=(0,0,0),create=True),
               patch.object(native.os,'getresgid',return_value=(0,0,0),create=True),
               patch.dict(os.environ,{'GITHUB_ACTIONS':'true'}),patch.object(native.os,'mkdir'),
-              patch.object(native.os,'fsync'),patch.object(native.os,'fstat',return_value=info),
+              patch.object(native.os,'fsync'),patch.object(native.os,'fstat',return_value=info),patch.object(native,'MarkerSources',return_value=sources),
               patch.object(native,'invoke') as invoke):
             with self.assertRaises(ValueError):native.run('synthetic')
         invoke.assert_not_called();sources.close.assert_called_once()

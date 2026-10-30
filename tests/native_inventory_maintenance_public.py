@@ -12,6 +12,7 @@ from pathlib import Path
 ERROR='Synthetic public maintenance marker unavailable'
 LIB='/usr/local/libexec/command-center-inventory-refresh'
 ENV={'PATH':'/usr/sbin:/usr/bin:/sbin:/bin','LC_ALL':'C'}
+SOURCE_NAMES=('inventory_refresh_maintenance_fence.py','inventory_refresh_observation.py')
 PROGRAM=r'''import os,sys
 sys.path.insert(0,'/usr/local/libexec/command-center-inventory-refresh')
 import inventory_refresh_maintenance_fence as fence
@@ -42,6 +43,100 @@ elif mode=='present':
  print('PRESENT')
 else:sys.exit(93)
 '''
+
+
+def _metadata(info):
+    return (info.st_dev,info.st_ino,info.st_mode,info.st_uid,info.st_gid,info.st_nlink,info.st_size,info.st_mtime_ns,info.st_ctime_ns)
+
+
+class MarkerSources:
+    """Two exact archive files; partial state is never retired here."""
+    def __init__(self,directory,contents,uid,gid):
+        self.fd=os.dup(directory);self.uid=uid;self.gid=gid;self.contents=contents
+        self.closed=False;self.failed=False;self.close_failed=False;self.published=False;self.records={}
+        try:
+            info=os.fstat(self.fd);self.identity=(info.st_dev,info.st_ino,info.st_mode,info.st_uid,info.st_gid)
+            if (not stat.S_ISDIR(info.st_mode) or (info.st_uid,info.st_gid)!=(uid,gid) or info.st_mode&0o022 or
+                type(contents) is not dict or set(contents)!=set(SOURCE_NAMES) or
+                any(type(data) is not bytes or not 0<len(data)<=65536 for data in contents.values())):raise ValueError(ERROR)
+        except BaseException:
+            try:os.close(self.fd)
+            except OSError:pass
+            self.closed=True;raise ValueError(ERROR) from None
+
+    def _directory(self):
+        info=os.fstat(self.fd)
+        if self.closed or (info.st_dev,info.st_ino,info.st_mode,info.st_uid,info.st_gid)!=self.identity:raise ValueError(ERROR)
+
+    def publish(self):
+        if self.failed or self.published:raise ValueError(ERROR)
+        try:
+            self._directory()
+            if os.listdir(self.fd):raise ValueError(ERROR)
+            for name in SOURCE_NAMES:
+                self._directory()
+                if set(os.listdir(self.fd))!=set(self.records):raise ValueError(ERROR)
+                fd=None;identity=None
+                try:
+                    fd=os.open(name,os.O_RDWR|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW|os.O_NONBLOCK,0o600,dir_fd=self.fd)
+                    first=os.fstat(fd);identity=(first.st_dev,first.st_ino)
+                    raw=self.contents[name];offset=0
+                    while offset<len(raw):
+                        count=os.write(fd,raw[offset:])
+                        if count<=0 or count>len(raw)-offset:raise ValueError(ERROR)
+                        offset+=count
+                    os.fsync(fd);os.fchmod(fd,0o444);os.fsync(fd)
+                    info=os.fstat(fd);named=os.stat(name,dir_fd=self.fd,follow_symlinks=False)
+                    if ((info.st_dev,info.st_ino)!=identity or not stat.S_ISREG(info.st_mode) or
+                        (info.st_uid,info.st_gid)!=(self.uid,self.gid) or stat.S_IMODE(info.st_mode)!=0o444 or
+                        info.st_nlink!=1 or info.st_size!=len(raw) or info.st_dev!=self.identity[0] or _metadata(info)!=_metadata(named)):
+                        raise ValueError(ERROR)
+                    self.records[name]=_metadata(info)
+                finally:
+                    if fd is not None:
+                        info=os.fstat(fd)
+                        if identity!=(info.st_dev,info.st_ino):raise ValueError(ERROR)
+                        os.close(fd)
+            os.fsync(self.fd);self.published=True;self.verify()
+        except BaseException:
+            self.failed=True;raise ValueError(ERROR) from None
+
+    def verify(self):
+        try:
+            if self.failed or not self.published:raise ValueError(ERROR)
+            self._directory()
+            if set(os.listdir(self.fd))!=set(SOURCE_NAMES):raise ValueError(ERROR)
+            for name in SOURCE_NAMES:
+                fd=None;identity=None
+                try:
+                    fd=os.open(name,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK,dir_fd=self.fd)
+                    info=os.fstat(fd);identity=(info.st_dev,info.st_ino);raw=b''
+                    while len(raw)<=len(self.contents[name]):
+                        chunk=os.read(fd,len(self.contents[name])+1-len(raw))
+                        if not chunk:break
+                        raw+=chunk
+                    named=os.stat(name,dir_fd=self.fd,follow_symlinks=False)
+                    if raw!=self.contents[name] or _metadata(info)!=self.records[name] or _metadata(os.fstat(fd))!=self.records[name] or _metadata(named)!=self.records[name]:raise ValueError(ERROR)
+                finally:
+                    if fd is not None:
+                        info=os.fstat(fd)
+                        if identity!=(info.st_dev,info.st_ino):raise ValueError(ERROR)
+                        os.close(fd)
+            self._directory()
+        except BaseException:
+            self.failed=True;raise ValueError(ERROR) from None
+
+    def close(self):
+        if self.closed:
+            if self.close_failed:raise ValueError(ERROR)
+            return
+        self.closed=True
+        try:
+            info=os.fstat(self.fd)
+            if (info.st_dev,info.st_ino,info.st_mode,info.st_uid,info.st_gid)!=self.identity:raise ValueError(ERROR)
+            os.close(self.fd)
+        except ValueError:self.close_failed=True;raise ValueError(ERROR) from None
+        except OSError:self.close_failed=True;raise ValueError(ERROR) from None
 
 
 def command(mode,root):
@@ -85,9 +180,8 @@ def invoke(mode,deadline):
 def run(archive):
     if sys.platform!='linux' or os.getresuid()!=(0,0,0) or os.getresgid()!=(0,0,0) or os.environ.get('GITHUB_ACTIONS')!='true':raise ValueError(ERROR)
     repo=Path(__file__).resolve().parents[1];sys.path.insert(0,str(repo/'scripts'))
-    from inventory_refresh_artifact_fixture import verify_archive
+    from inventory_refresh_artifact_fixture import verify_archive,LIB as ARCHIVE_LIB
     from inventory_refresh_resources import _Chain
-    from inventory_refresh_reporter_fixture_files import FixtureSources
     from native_inventory_cross_uid import create_account,ensure_libexec
     deadline=time.monotonic()+45;owned=[];failed=False;complete=False;stage='account'
     try:
@@ -96,7 +190,10 @@ def run(archive):
         local=_Chain(('usr','local'));owned.append(local);local.verify();ensure_libexec(local.fds[-1],0,deadline);local.verify()
         libexec=_Chain(('usr','local','libexec'));owned.append(libexec);libexec.verify()
         os.mkdir('command-center-inventory-refresh',0o755,dir_fd=libexec.fds[-1]);os.fsync(libexec.fds[-1]);libexec.verify()
-        stage='sources';sources=FixtureSources.fixed(verified,include_entry=True);owned.append(sources);sources.publish();sources.verify()
+        stage='sources';source_chain=_Chain(('usr','local','libexec','command-center-inventory-refresh'));owned.append(source_chain)
+        source_chain.verify()
+        contents={name:verified['files'][ARCHIVE_LIB+name] for name in SOURCE_NAMES}
+        sources=MarkerSources(source_chain.fds[-1],contents,0,0);owned.append(sources);sources.publish();sources.verify();source_chain.verify()
         stage='public_directory'
         varlib=_Chain(('var','lib'));owned.append(varlib);varlib.verify()
         os.mkdir('command-center-inventory-maintenance',0o755,dir_fd=varlib.fds[-1]);os.fsync(varlib.fds[-1]);varlib.verify()
@@ -105,8 +202,8 @@ def run(archive):
         if (info.st_uid,info.st_gid,stat.S_IMODE(info.st_mode))!=(0,0,0o755):raise ValueError(ERROR)
         for mode in ('absent','deny','absent','create','present'):
             stage='invoke_'+mode
-            sources.verify();public.verify();varlib.verify();invoke(mode,deadline)
-            sources.verify();public.verify();varlib.verify()
+            sources.verify();source_chain.verify();public.verify();varlib.verify();invoke(mode,deadline)
+            sources.verify();source_chain.verify();public.verify();varlib.verify()
         complete=True
     except BaseException:failed=True
     finally:
