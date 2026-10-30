@@ -24,11 +24,16 @@ def resolve(root,path,deadline,mount_id):
         def identity(info):return (info.st_dev,info.st_ino,info.st_mode,info.st_uid,info.st_gid)
         stage='root';root_info=os.fstat(root);assert stat.S_ISDIR(root_info.st_mode)
         owned.append(os.dup(root));assert identity(root_info)==identity(os.fstat(owned[0]))
-        for part in components:
+        for index,part in enumerate(components):
             assert time.monotonic()<deadline
-            stage='open';parent=owned[-1];child=os.open(part,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW|os.O_NONBLOCK,dir_fd=parent)
+            parent=owned[-1];last=index==len(components)-1
+            stage='open';before=os.stat(part,dir_fd=parent,follow_symlinks=False)
+            stage='identity';assert stat.S_ISDIR(before.st_mode) or last and stat.S_ISREG(before.st_mode)
+            flags=os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK|(0 if last else os.O_DIRECTORY)
+            stage='open';child=os.open(part,flags,dir_fd=parent)
             stage='identity';owned.append(child);info=os.fstat(child);named=os.stat(part,dir_fd=parent,follow_symlinks=False)
-            assert stat.S_ISDIR(info.st_mode) and stat.S_ISDIR(named.st_mode) and identity(info)==identity(named)
+            assert identity(before)==identity(info)==identity(named)
+            assert stat.S_ISDIR(info.st_mode) or last and stat.S_ISREG(info.st_mode)
             refs.append((parent,part,child,identity(info)))
         stage='mount_id';first=mount_id(owned[-1]);assert type(first) is int and 0<first<2**64 and time.monotonic()<deadline
         stage='recheck';assert identity(os.fstat(root))==identity(root_info)==identity(os.fstat(owned[0]))

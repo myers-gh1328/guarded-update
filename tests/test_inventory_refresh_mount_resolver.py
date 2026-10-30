@@ -23,6 +23,22 @@ class MountResolverTests(unittest.TestCase):
         (self.root/'link').symlink_to('a',target_is_directory=True)
         for path in ('a/b','/a/../b','/a//b','/link/b','/a/b/',('/x'*33),'/'+'x'*256):
             with self.assertRaises(ValueError):self.sample(path)
+    def test_final_regular_file_is_sampled_but_special_and_intermediate_files_fail(self):
+        (self.root/'a'/'file').write_bytes(b'unchanged')
+        self.assertEqual(self.sample('/a/file'),7)
+        self.assertEqual((self.root/'a'/'file').read_bytes(),b'unchanged')
+        (self.root/'a'/'filelink').symlink_to('file')
+        os.mkfifo(self.root/'a'/'fifo')
+        for path in ('/a/file/child','/a/filelink','/a/fifo'):
+            with self.assertRaises(ValueError):self.sample(path)
+        calls=[]
+        def replace_file(fd):
+            if not calls:
+                calls.append(True);(self.root/'a'/'file').rename(self.root/'a'/'oldfile')
+                (self.root/'a'/'file').write_bytes(b'replacement')
+            return 7
+        with self.assertRaises(ValueError):self.sample('/a/file',replace_file)
+
     def test_safe_linux_component_characters_and_encoded_byte_limits(self):
         for name in ('unit@123',r'unit\x2dname','with space','item:1'):
             (self.root/name).mkdir()
@@ -59,8 +75,11 @@ class MountResolverTests(unittest.TestCase):
         # This fixture intentionally follows its own kernel /proc/self/root magiclink.
         root=os.open('/proc/self/root',os.O_RDONLY|os.O_DIRECTORY)
         target=os.open('/sys',os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
-        try:self.assertEqual(resolver.resolve(root,'/sys',time.monotonic()+3,_mount_id),_mount_id(target))
-        finally:os.close(target);os.close(root)
+        cgroup_file=os.open('/sys/fs/cgroup/cgroup.procs',os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK)
+        try:
+            self.assertEqual(resolver.resolve(root,'/sys',time.monotonic()+3,_mount_id),_mount_id(target))
+            self.assertEqual(resolver.resolve(root,'/sys/fs/cgroup/cgroup.procs',time.monotonic()+3,_mount_id),_mount_id(cgroup_file))
+        finally:os.close(cgroup_file);os.close(target);os.close(root)
 
     def test_unavailable_comparison_exposes_only_fixed_failure_category(self):
         row={'id':7,'path':'/secret-name','fs':b'cgroup2','options':{b'rw'}}
