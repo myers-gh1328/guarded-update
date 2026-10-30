@@ -126,6 +126,62 @@ impl Tools for SystemTools {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    #[ignore]
+    fn maintenance_inheritance_child() {
+        let value = std::env::var("INVENTORY_LOCK_FIXTURE").unwrap();
+        let parts: Vec<&str> = value.split(',').collect();
+        assert_eq!(parts.len(), 4);
+        let program = "import os,select,sys\nfd,ready,control=map(int,sys.argv[1:])\npid=os.fork()\nif pid==0:\n os.close(0);os.close(1);os.close(2)\n s=os.fstat(fd);os.write(ready,('%d:%d\\n'%(s.st_dev,s.st_ino)).encode())\n if select.select([control],[],[],8)[0]: os.read(control,1)\n os._exit(0)\n";
+        SystemTools
+            .run(
+                "/usr/bin/python3",
+                &[
+                    "-I", "-B", "-S", "-c", program, parts[0], parts[1], parts[2],
+                ],
+                &[],
+                32,
+            )
+            .unwrap();
+        use std::io::Read;
+        use std::os::fd::FromRawFd;
+        let fd: i32 = parts[3].parse().unwrap();
+        let mut input = unsafe { std::fs::File::from_raw_fd(fd) };
+        let mut byte = [0];
+        input.read_exact(&mut byte).unwrap();
+        assert_eq!(byte, [b'x']);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn maintenance_lock_survives_reporter_and_system_tools_exec() {
+        let mut child = Command::new("/usr/bin/python3")
+            .args([
+                "-I",
+                "-B",
+                "-S",
+                concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/tests/inventory_maintenance_exec_fixture.py"
+                ),
+            ])
+            .arg(std::env::current_exe().unwrap())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                assert!(status.success());
+                break;
+            }
+            assert!(Instant::now() < deadline, "fixture child exit unknown");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
     #[test]
     fn output_is_bounded_and_secret_environment_is_absent() {
         assert!(
