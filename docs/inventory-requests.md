@@ -84,12 +84,14 @@ are accepted from a request.
 
 Linux sync inspects an existing request journal under its inventory lock before
 starting a daily collection. A pending journal replacement, invalid or unreadable
-journal, or any retained manual or collection request defers that collection and
+journal, or retained manual or collection work defers that collection and
 reports an error on check-in; retained uploads and check-ins continue. The fence
 does not change the journal or initialize missing counters. A genuinely absent
 journal and pending file retain the existing scheduling behavior. This is a
-conservative transition: even a completed retained request prevents another daily
-collection until a later reconciliation implementation can safely retire it. The
+conservative transition: terminal failed or expired deliveries with no start
+acknowledgement or work evidence no longer block collection, and their tombstones
+remain intact. Any completed, acknowledged or uncertain work still prevents a
+daily collection until a later reconciliation implementation can safely clear it. The
 fence does not prove processes have stopped or enable device requests.
 
 ## Collection lifecycle implementation

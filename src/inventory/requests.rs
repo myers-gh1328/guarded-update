@@ -1265,8 +1265,7 @@ pub struct RequestJournal<'a> {
     poisoned: bool,
     _lock: &'a super::state::Lock,
 }
-/// Conservative read-only runtime fence. A pending replacement or any retained
-/// work blocks daily collection; this does not establish process cleanup.
+/// Conservative read-only runtime fence. This does not establish process cleanup.
 pub(super) fn runtime_collection_fence(
     dir: &std::path::Path,
     enrollment: &str,
@@ -1290,10 +1289,40 @@ pub(super) fn runtime_collection_fence(
     if present(&pending)? {
         return Ok(true);
     }
-    Ok(journal.journal.manual.active.is_some()
-        || journal.journal.manual.last_terminal.is_some()
-        || journal.journal.collection.active.is_some()
-        || journal.journal.collection.last_terminal.is_some())
+    Ok([&journal.journal.manual, &journal.journal.collection]
+        .iter()
+        .any(|domain| {
+            domain.active.is_some()
+                || domain
+                    .last_terminal
+                    .as_ref()
+                    .is_some_and(|entry| !terminal_never_started(entry))
+        }))
+}
+fn terminal_never_started(entry: &Entry) -> bool {
+    let empty = match &entry.proof {
+        Proof::Manual(proof) => {
+            proof.helper.is_none()
+                && proof.reader.is_none()
+                && proof.observation.is_none()
+                && proof.scan.is_none()
+        }
+        Proof::Collection(proof) => proof.scan.is_none(),
+    };
+    matches!(
+        entry.terminal,
+        Some(CanonicalStatus::Failed | CanonicalStatus::Expired)
+    ) && matches!(
+        entry.pending_status,
+        ClientStatus::Received | ClientStatus::Failed
+    ) && entry.acknowledged_nonce.is_none()
+        && !entry.submitted
+        && entry.native_attempt.is_none()
+        && entry.report.is_none()
+        && entry.previous_no_work.is_none()
+        && !entry.no_work_acknowledged
+        && entry.attempts == 1
+        && empty
 }
 impl<'a> RequestJournal<'a> {
     pub fn initialize(
@@ -2336,12 +2365,136 @@ mod tests {
                 .canonical(cap, &canonical(&status, CanonicalStatus::Failed, None))
                 .unwrap();
             let before = std::fs::read(fixture.dir.join("requests.json")).unwrap();
-            assert!(runtime_collection_fence(&fixture.dir, BOOT, &fixture.lock).unwrap());
+            assert!(!runtime_collection_fence(&fixture.dir, BOOT, &fixture.lock).unwrap());
             assert_eq!(
                 std::fs::read(fixture.dir.join("requests.json")).unwrap(),
                 before
             );
         }
+    }
+    #[test]
+    fn terminal_release_rejects_all_start_authority_and_work_markers() {
+        let fixture = Fixture::new();
+        let mut journal = fixture.open();
+        journal
+            .admit(
+                manual_delivery(1),
+                1,
+                &clock(1000),
+                "aaaaaaaaaaaaaaaa",
+                &session(),
+            )
+            .unwrap();
+        let status = journal.pending(Capability::Manual).unwrap().unwrap();
+        journal
+            .canonical(
+                Capability::Manual,
+                &canonical(&status, CanonicalStatus::Failed, None),
+            )
+            .unwrap();
+        let base = journal
+            .journal
+            .manual
+            .last_terminal
+            .as_ref()
+            .unwrap()
+            .clone();
+        assert!(terminal_never_started(&base));
+        let mut bad = Vec::new();
+        let mut value = base.clone();
+        value.acknowledged_nonce = Some(base.proof.nonce().into());
+        bad.push(value);
+        let mut value = base.clone();
+        value.submitted = true;
+        bad.push(value);
+        let mut value = base.clone();
+        value.no_work_acknowledged = true;
+        bad.push(value);
+        let mut value = base.clone();
+        value.attempts = 2;
+        bad.push(value);
+        let mut value = base.clone();
+        value.previous_no_work = Some(manual_ready(1, 1000, 100000));
+        bad.push(value);
+        let mut value = base.clone();
+        value.report = Some(ReportRef {
+            id: REPORT.into(),
+            sequence: 1,
+            sha256: "c".repeat(64),
+        });
+        bad.push(value);
+        let mut value = base.clone();
+        value.terminal = Some(CanonicalStatus::Complete);
+        bad.push(value);
+        let mut value = base.clone();
+        value.pending_status = ClientStatus::Unconfirmed;
+        bad.push(value);
+        let mut value = base.clone();
+        value.native_attempt = Some(NativeAttempt {
+            observation_nonce: "0000000000000001aaaaaaaaaaaaaaaa".into(),
+            boot_id: BOOT.into(),
+            admitted_boottime_ms: 1001,
+            release_requested_boottime_ms: None,
+        });
+        bad.push(value);
+        let full = manual_ready(1, 1000, 100000);
+        for field in 0..4 {
+            let mut value = base.clone();
+            let Proof::Manual(proof) = &mut value.proof else {
+                panic!("manual proof expected")
+            };
+            match field {
+                0 => proof.helper = full.helper.clone(),
+                1 => proof.reader = full.reader.clone(),
+                2 => proof.observation = full.observation.clone(),
+                _ => proof.scan = full.scan.clone(),
+            }
+            bad.push(value);
+        }
+        assert!(bad.iter().all(|entry| !terminal_never_started(entry)));
+    }
+    #[test]
+    fn safe_terminal_does_not_hide_acknowledged_work_in_other_domain() {
+        let fixture = Fixture::new();
+        let mut journal = fixture.open();
+        journal
+            .admit(
+                manual_delivery(1),
+                1,
+                &clock(1000),
+                "aaaaaaaaaaaaaaaa",
+                &session(),
+            )
+            .unwrap();
+        let manual = journal.pending(Capability::Manual).unwrap().unwrap();
+        journal
+            .canonical(
+                Capability::Manual,
+                &canonical(&manual, CanonicalStatus::Failed, None),
+            )
+            .unwrap();
+        journal
+            .admit(delivery(1), 1, &clock(1000), "bbbbbbbbbbbbbbbb", &session())
+            .unwrap();
+        let collection = journal.pending(Capability::Collection).unwrap().unwrap();
+        journal
+            .canonical(
+                Capability::Collection,
+                &canonical(&collection, CanonicalStatus::Delivered, None),
+            )
+            .unwrap();
+        journal
+            .canonical(
+                Capability::Collection,
+                &canonical(&collection, CanonicalStatus::Failed, None),
+            )
+            .unwrap();
+        let before = std::fs::read(fixture.dir.join("requests.json")).unwrap();
+        assert!(runtime_collection_fence(&fixture.dir, BOOT, &fixture.lock).unwrap());
+        assert_eq!(
+            std::fs::read(fixture.dir.join("requests.json")).unwrap(),
+            before
+        );
     }
     fn native_without_attached_scan<'a>(
         fixture: &'a Fixture,
