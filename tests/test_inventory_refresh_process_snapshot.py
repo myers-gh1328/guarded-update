@@ -73,7 +73,7 @@ class ProcessSnapshotTests(unittest.TestCase):
                 owner=ProcessProbe._from_directory(fd,123,(0,27),time.monotonic()+2,owner=os.getuid())
                 with patch('inventory_refresh_process_snapshot.os.geteuid',return_value=0),patch.dict(os.environ,{'GITHUB_ACTIONS':'true'}),contextlib.redirect_stderr(output):
                     with self.assertRaises(ValueError):owner.sample()
-                self.assertEqual(output.getvalue(),'Native fixture process probe stage=profile_mount_writable_nested_descendant_one_other_root_single\n')
+                self.assertEqual(output.getvalue(),'Native fixture mount comparison=unavailable\nNative fixture process probe stage=profile_mount_writable_nested_descendant_one_other_root_single\n')
                 owner.close()
             finally:os.close(fd)
 
@@ -87,7 +87,32 @@ class ProcessSnapshotTests(unittest.TestCase):
                 owner=ProcessProbe._from_directory(fd,123,(0,27),time.monotonic()+2,owner=os.getuid())
                 with patch('inventory_refresh_process_snapshot.os.geteuid',return_value=0),patch.dict(os.environ,{'GITHUB_ACTIONS':'true'}),contextlib.redirect_stderr(output):
                     with self.assertRaises(ValueError):owner.sample()
-                self.assertEqual(output.getvalue(),'Native fixture process probe stage=profile_mount_writable_root\n')
+                self.assertEqual(output.getvalue(),'Native fixture mount comparison=unavailable\nNative fixture process probe stage=profile_mount_writable_root\n')
+                owner.close()
+            finally:os.close(fd)
+
+    def test_proc_root_mount_diagnostic_is_fixed_and_absorbs_uncertainty(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp);proc=root/'123';proc.mkdir();(proc/'ns').mkdir()
+            (proc/'root').symlink_to('/',target_is_directory=True)
+            (proc/'ns'/'mnt:[123]').write_bytes(b'namespace');(proc/'ns'/'mnt').symlink_to('mnt:[123]')
+            for name,raw in (('stat',self.stat),('status',self.status),('cgroup',self.cgroup),('mountinfo',self.mounts)):(proc/name).write_bytes(raw)
+            fd=os.open(root,os.O_RDONLY|os.O_DIRECTORY)
+            try:
+                owner=ProcessProbe._from_directory(fd,123,(0,27),time.monotonic()+2,owner=os.getuid())
+                with patch('inventory_refresh_process_snapshot.classify_mounts',return_value='matching'):
+                    self.assertEqual(owner.mount_diagnostic(self.stat,self.mounts),'matching')
+                actual_close=os.close;closed=[];classified=[]
+                def uncertain(number):
+                    actual_close(number)
+                    if classified:closed.append(number);raise OSError('uncertain')
+                def compare(*args):classified.append(True);return 'matching'
+                with patch('inventory_refresh_process_snapshot.classify_mounts',side_effect=compare),patch('inventory_refresh_process_snapshot.os.close',side_effect=uncertain):
+                    self.assertEqual(owner.mount_diagnostic(self.stat,self.mounts),'unavailable')
+                self.assertGreaterEqual(len(closed),4)
+                (proc/'root').unlink();(proc/'root').symlink_to('/tmp',target_is_directory=True)
+                with patch('inventory_refresh_process_snapshot.classify_mounts',return_value='matching'):
+                    self.assertEqual(owner.mount_diagnostic(self.stat,self.mounts),'unavailable')
                 owner.close()
             finally:os.close(fd)
 

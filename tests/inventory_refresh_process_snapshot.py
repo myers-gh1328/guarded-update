@@ -1,5 +1,7 @@
 """Pure hosted fixture decoding; byte input is untrusted, never a PID witness."""
 from inventory_refresh_cgroup_witness import process_start_ticks
+from inventory_refresh_mount_resolver import classify as classify_mounts
+from inventory_refresh_resources import _mount_id
 from inventory_refresh_reporter_parent import validate_process_view
 from inventory_refresh_resources import mount_rows
 from inventory_refresh_reporter_resources import validate_identity
@@ -74,6 +76,7 @@ def validate_snapshot(pid,stat,status,cgroup,mountinfo,device):
 
 
 import math
+import re
 import os
 import stat as filetype
 import time
@@ -160,6 +163,38 @@ class ProcessProbe:
         if failed or time.monotonic()>=self._deadline:raise ValueError('Process profile unavailable')
         self._check();return bytes(raw)
 
+    def mount_diagnostic(self,initial_stat,mountinfo):
+        """Point comparison only; trusts procfs/kernel and is not an atomic witness."""
+        owned=[];failed=False;result='unavailable'
+        try:
+            self._check();start=process_start_ticks(initial_stat,self._pid)
+            assert process_start_ticks(self._read('stat',8192),self._pid)==start
+            assert os.readlink('root',dir_fd=self._process)=='/'
+            ns=os.open('ns',os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW|os.O_NONBLOCK,dir_fd=self._process);owned.append(ns)
+            namespace_link=os.readlink('mnt',dir_fd=ns)
+            assert re.fullmatch(r'mnt:\[[1-9][0-9]{0,19}\]',namespace_link)
+            namespace=os.open('mnt',os.O_RDONLY|os.O_NONBLOCK,dir_fd=ns);owned.append(namespace)
+            root=os.open('root',os.O_RDONLY|os.O_DIRECTORY|os.O_NONBLOCK,dir_fd=self._process);owned.append(root)
+            ident=lambda info:(info.st_dev,info.st_ino,info.st_mode)
+            namespace_id=ident(os.fstat(namespace));root_id=ident(os.fstat(root))
+            assert namespace_id==ident(os.stat('mnt',dir_fd=ns,follow_symlinks=True))
+            candidate=classify_mounts(root,list(mount_rows(mountinfo).values()),self._deadline,_mount_id)
+            assert candidate in ('matching','different','unavailable')
+            self._check();assert process_start_ticks(self._read('stat',8192),self._pid)==start
+            assert os.readlink('root',dir_fd=self._process)=='/' and os.readlink('mnt',dir_fd=ns)==namespace_link
+            assert namespace_id==ident(os.fstat(namespace))==ident(os.stat('mnt',dir_fd=ns,follow_symlinks=True))
+            check=os.open('root',os.O_RDONLY|os.O_DIRECTORY|os.O_NONBLOCK,dir_fd=self._process);owned.append(check)
+            assert root_id==ident(os.fstat(root))==ident(os.fstat(check))
+            self._check();assert time.monotonic()<self._deadline
+            result=candidate
+        except BaseException:failed=True
+        finally:
+            for fd in reversed(owned):
+                try:os.close(fd)
+                except BaseException:failed=True
+        if failed or time.monotonic()>=self._deadline:return 'unavailable'
+        return result
+
     def sample(self):
         stage='check'
         try:
@@ -172,7 +207,6 @@ class ProcessProbe:
             assert self._start is None or self._start==start
             stage='final';self._start=start;self._check();return start
         except BaseException as exc:
-            self._failed=True
             labels={'check','stat','status','cgroup','mountinfo','profile','stat_recheck','final',
                 'profile_device','profile_stat','profile_view','profile_identity_fields','profile_uid','profile_gid',
                 'profile_groups','profile_nnp','profile_caps','profile_cgroup','profile_mount_parse','profile_mount_missing',
@@ -188,6 +222,12 @@ class ProcessProbe:
                         parts[1] in ('control','init','other') and parts[2] in ('root','subtree') and parts[3] in ('stacked','single'))
                 return False
             if isinstance(exc,ProfileError) and permitted(str(exc)):stage=str(exc)
+            comparison=None
+            try:
+                if stage.startswith('profile_mount_writable_') and os.geteuid()==0 and os.environ.get('GITHUB_ACTIONS')=='true':
+                    comparison=self.mount_diagnostic(first,mount)
+            finally:self._failed=True
+            if comparison is not None:print('Native fixture mount comparison='+comparison,file=sys.stderr)
             safe=permitted(stage)
             if os.geteuid()==0 and os.environ.get('GITHUB_ACTIONS')=='true' and safe:
                 print('Native fixture process probe stage='+stage,file=sys.stderr)
