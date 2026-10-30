@@ -2250,6 +2250,113 @@ command(10,'await_receipt');response(10,'await_receipt','prepared',evidence=dict
         hosted_native_roundtrip(true).unwrap();
     }
 
+    /// Synthetic cross-UID fixture, without production start or authority.
+    #[test]
+    #[ignore = "requires the dedicated restricted cross-UID CI service"]
+    #[cfg(target_os = "linux")]
+    #[allow(clippy::disallowed_methods)] // Dedicated fixture control pipe, not a log.
+    fn hosted_cross_uid_counter_admission() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{Duration, Instant};
+        assert_eq!(
+            std::env::var("GUARDED_UPDATE_CROSS_UID_PROOF")
+                .ok()
+                .as_deref(),
+            Some("1")
+        );
+        let deadline = Instant::now() + Duration::from_secs(18);
+        let parent = super::super::reporter_request_fixture::FixedParent::fixed().unwrap();
+        parent.verify().unwrap();
+        let dir = std::path::Path::new("/tmp").join(format!(
+            "inventory-cas-{}",
+            super::super::transport::report_id().unwrap()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let lock = super::super::state::Lock::acquire(&dir).unwrap();
+        RequestJournal::initialize(
+            &dir,
+            BOOT,
+            CounterSeeds {
+                helper: 5,
+                observation: 7,
+            },
+            &lock,
+        )
+        .unwrap();
+        let mut journal = RequestJournal::open(&dir, BOOT, &lock).unwrap();
+        let session = negotiated();
+        journal
+            .admit(
+                Delivery::Collection(CollectionDelivery {
+                    request_id: REQUEST.into(),
+                    delivery_sequence: 1,
+                    not_before: "2026-01-01T00:00:00.000Z".into(),
+                    source_revision: 1,
+                }),
+                1,
+                &clock(1000),
+                "aaaaaaaaaaaaaaaa",
+                &session,
+            )
+            .unwrap();
+        let pending = journal.pending(Capability::Collection).unwrap().unwrap();
+        journal
+            .canonical(
+                Capability::Collection,
+                &Canonical {
+                    schema_version: 1,
+                    request: CanonicalRequest {
+                        request_id: pending.request_id,
+                        delivery_sequence: 1,
+                        status: CanonicalStatus::Delivered,
+                        reason: None,
+                        report_id: None,
+                        report_sha256: None,
+                        operation_nonce: pending.operation_nonce,
+                    },
+                    receipt: None,
+                },
+            )
+            .unwrap();
+        let intent = journal
+            .admit_native_collection(REPORT, 1, 1, &clock(1001), "dddddddddddddddd", &session)
+            .unwrap();
+        assert_eq!(
+            intent.observation_nonce(),
+            "0000000000000008dddddddddddddddd"
+        );
+        let published = journal
+            .publish_native_observation(intent, &clock(1002), &session, |nonce| {
+                super::super::reporter_request_fixture::publish_checked(
+                    parent.parent().map_err(|_| ERROR.to_owned())?,
+                    0,
+                    60002,
+                    60002,
+                    nonce,
+                    deadline,
+                    &|| parent.verify(),
+                )
+                .map_err(|_| ERROR.to_owned())
+            })
+            .unwrap();
+        assert_eq!(
+            published.observation_nonce(),
+            "0000000000000008dddddddddddddddd"
+        );
+        // Root may consume the inbox only after this post-callback marker.
+        super::super::reporter_barrier::handshake(&std::io::stdin(), &std::io::stderr(), deadline)
+            .unwrap();
+        assert_eq!(
+            journal.recover_collection(None).unwrap(),
+            super::super::requests::CollectionRecovery::Unfinished
+        );
+        parent.verify().unwrap();
+        parent.close().unwrap();
+        assert!(Instant::now() < deadline);
+        // Keep the journal and its lock until process exit; no fixture cleanup claim.
+    }
+
     #[test]
     fn final_native_sample_must_keep_boot_and_original_deadline() {
         assert!(final_native_clock(BOOT, 1012, 10000, &clock(1012)).is_ok());

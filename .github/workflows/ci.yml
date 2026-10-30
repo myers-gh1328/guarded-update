@@ -168,6 +168,31 @@ jobs:
           path: native-reporter-physical-sample-proof.json
           if-no-files-found: error
 
+  inventory-cross-uid-cas:
+    name: Synthetic cross-UID journal admission
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Test cross-UID fixture gates
+        run: python3 -B -m unittest discover -s tests -p 'test_inventory_cross_uid_fixture.py' -v
+      - name: Build separate inactive inventory metadata helper archive
+        run: python3 -I -B -S scripts/package-inventory-helper.py "$RUNNER_TEMP/inventory-helper-source"
+      - name: Build isolated unprivileged Rust parent fixture
+        run: python3 -I -B -S tests/native_inventory_refresh_rust_build.py
+      - name: Verify synthetic cross-UID journal admission
+        run: |
+          archive_commit="$(git --no-replace-objects rev-parse --verify 'HEAD^{commit}')"
+          sudo --preserve-env=GITHUB_ACTIONS python3 -B tests/native_inventory_cross_uid.py "$RUNNER_TEMP/inventory-helper-source/helper-$archive_commit/command-center-inventory-metadata-helper.tar.gz" > native-cross-uid-proof.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-cross-uid-proof
+          path: native-cross-uid-proof.json
+          if-no-files-found: error
+
   windows-discovery:
     name: Native Windows provider discovery contract
     runs-on: windows-latest

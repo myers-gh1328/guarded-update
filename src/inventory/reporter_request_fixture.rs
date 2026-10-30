@@ -73,6 +73,87 @@ fn valid_nonce(value: &str) -> bool {
             .is_ok_and(|sequence| (1..=9_007_199_254_740_991).contains(&sequence))
 }
 
+/// Held and named fixture ancestry, under trusted-kernel/exclusive-mutation
+/// assumptions. This supplies no production identity or maintenance authority.
+pub(super) struct FixedParent {
+    files: Vec<File>,
+    owner: u32,
+}
+
+impl FixedParent {
+    const PARTS: [&'static [u8]; 2] = [b"run\0", b"command-center-inventory-cas-fixture\0"];
+
+    pub(super) fn fixed() -> Result<Self> {
+        let root = File::open("/").map_err(|_| ERROR)?;
+        Self::from_root(root, 0)
+    }
+
+    fn from_root(root: File, owner: u32) -> Result<Self> {
+        let mut chain = Self {
+            files: vec![root],
+            owner,
+        };
+        let result = (|| -> Result<()> {
+            for name in Self::PARTS {
+                let parent = chain.files.last().ok_or(ERROR)?;
+                chain.files.push(opened(
+                    parent,
+                    name,
+                    DIRECTORY | NOFOLLOW | NONBLOCK | CLOEXEC,
+                    0,
+                )?);
+            }
+            chain.verify()
+        })();
+        if result.is_err() {
+            let _ = chain.close();
+            return Err(ERROR);
+        }
+        Ok(chain)
+    }
+
+    pub(super) fn parent(&self) -> Result<&File> {
+        self.files.last().ok_or(ERROR)
+    }
+
+    pub(super) fn verify(&self) -> Result<()> {
+        if self.files.len() != Self::PARTS.len() + 1 {
+            return Err(ERROR);
+        }
+        for (index, held) in self.files.iter().enumerate() {
+            let metadata = held.metadata().map_err(|_| ERROR)?;
+            if !metadata.is_dir() || metadata.uid() != self.owner || metadata.mode() & 0o022 != 0 {
+                return Err(ERROR);
+            }
+            if index > 0 {
+                let named = opened(
+                    &self.files[index - 1],
+                    Self::PARTS[index - 1],
+                    DIRECTORY | NOFOLLOW | NONBLOCK | CLOEXEC,
+                    0,
+                )?;
+                let named_meta = named.metadata().map_err(|_| ERROR);
+                let closed = checked_close(named);
+                if !same(&metadata, &named_meta?) {
+                    return Err(ERROR);
+                }
+                closed?;
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn close(self) -> Result<()> {
+        let mut failed = false;
+        for file in self.files.into_iter().rev() {
+            if checked_close(file).is_err() {
+                failed = true;
+            }
+        }
+        if failed { Err(ERROR) } else { Ok(()) }
+    }
+}
+
 #[derive(Clone, Copy)]
 enum Fault<'a> {
     None,
@@ -106,6 +187,47 @@ fn publish_fault(
     deadline: Instant,
     fault: Fault<'_>,
 ) -> Result<()> {
+    publish_inner(
+        parent,
+        owner,
+        reporter,
+        group,
+        nonce,
+        deadline,
+        (fault, &|| Ok(())),
+    )
+}
+
+pub(super) fn publish_checked(
+    parent: &File,
+    owner: u32,
+    reporter: u32,
+    group: u32,
+    nonce: &str,
+    deadline: Instant,
+    ancestry: &dyn Fn() -> Result<()>,
+) -> Result<()> {
+    publish_inner(
+        parent,
+        owner,
+        reporter,
+        group,
+        nonce,
+        deadline,
+        (Fault::None, ancestry),
+    )
+}
+
+fn publish_inner(
+    parent: &File,
+    owner: u32,
+    reporter: u32,
+    group: u32,
+    nonce: &str,
+    deadline: Instant,
+    controls: (Fault<'_>, &dyn Fn() -> Result<()>),
+) -> Result<()> {
+    let (fault, ancestry) = controls;
     if Instant::now() >= deadline
         || !valid_nonce(nonce)
         || unsafe { geteuid() } != reporter
@@ -113,6 +235,7 @@ fn publish_fault(
     {
         return Err(ERROR);
     }
+    ancestry()?;
     let parent_before = parent.metadata().map_err(|_| ERROR)?;
     if !parent_before.is_dir() || parent_before.uid() != owner || parent_before.mode() & 0o022 != 0
     {
@@ -129,6 +252,7 @@ fn publish_fault(
     let outcome = (|| -> Result<()> {
         let initial = inbox.metadata().map_err(|_| ERROR)?;
         let verify = || -> Result<()> {
+            ancestry()?;
             if Instant::now() >= deadline {
                 return Err(ERROR);
             }
@@ -287,6 +411,9 @@ fn publish_fault(
             failed = true;
         }
     }
+    if ancestry().is_err() {
+        failed = true;
+    }
     if failed || matches!(fault, Fault::Close) || Instant::now() >= deadline {
         Err(ERROR)
     } else {
@@ -320,6 +447,19 @@ mod tests {
         use std::os::unix::fs::MetadataExt;
         let nonce = "0000000000000001abcdefabcdefabcd";
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        assert!(
+            super::publish_checked(
+                &parent,
+                identity.uid(),
+                identity.uid(),
+                identity.gid(),
+                nonce,
+                deadline,
+                &|| Err(super::ERROR)
+            )
+            .is_err()
+        );
+        assert!(!path.join("observation/request").exists());
         std::os::unix::fs::symlink("missing", path.join("observation/request")).unwrap();
         assert!(
             super::publish(
@@ -540,5 +680,63 @@ finally:
             assert!(old.join(format!(".request-{nonce}")).exists());
             std::fs::remove_dir_all(path).unwrap();
         }
+    }
+
+    #[test]
+    fn failed_caller_ancestry_check_prevents_publication() {
+        use std::os::unix::fs::MetadataExt;
+        let path = std::env::temp_dir().join(format!("request-ancestry-{}", std::process::id()));
+        std::fs::create_dir(&path).unwrap();
+        std::fs::create_dir(path.join("observation")).unwrap();
+        std::fs::set_permissions(
+            path.join("observation"),
+            std::fs::Permissions::from_mode(0o770),
+        )
+        .unwrap();
+        let parent = std::fs::File::open(&path).unwrap();
+        let info = parent.metadata().unwrap();
+        let valid = std::cell::Cell::new(true);
+        let guard = || {
+            if valid.get() {
+                Ok(())
+            } else {
+                Err(super::ERROR)
+            }
+        };
+        let hook = || valid.set(false);
+        let nonce = "0000000000000001abcdefabcdefabcd";
+        assert!(
+            super::publish_inner(
+                &parent,
+                info.uid(),
+                info.uid(),
+                info.gid(),
+                nonce,
+                std::time::Instant::now() + std::time::Duration::from_secs(10),
+                (super::Fault::BeforeRenameHook(&hook), &guard)
+            )
+            .is_err()
+        );
+        assert!(!path.join("observation/request").exists());
+        assert!(path.join(format!("observation/.request-{nonce}")).exists());
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn ancestry_detects_a_replaced_parent() {
+        use std::os::unix::fs::MetadataExt;
+        let path = std::env::temp_dir().join(format!("request-chain-{}", std::process::id()));
+        std::fs::create_dir(&path).unwrap();
+        std::fs::create_dir(path.join("run")).unwrap();
+        std::fs::create_dir(path.join("run/command-center-inventory-cas-fixture")).unwrap();
+        let root = std::fs::File::open(&path).unwrap();
+        let owner = root.metadata().unwrap().uid();
+        let chain = super::FixedParent::from_root(root, owner).unwrap();
+        chain.verify().unwrap();
+        std::fs::rename(path.join("run"), path.join("old-run")).unwrap();
+        std::fs::create_dir(path.join("run")).unwrap();
+        assert!(chain.verify().is_err());
+        chain.close().unwrap();
+        std::fs::remove_dir_all(path).unwrap();
     }
 }
