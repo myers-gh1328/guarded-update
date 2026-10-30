@@ -126,6 +126,144 @@ impl Tools for SystemTools {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore]
+    fn held_fd_exec_child() {
+        use std::os::unix::fs::MetadataExt;
+        let value = std::env::var("EXEC_IDENTITY").unwrap();
+        let parts: Vec<u64> = value.split(',').map(|part| part.parse().unwrap()).collect();
+        assert_eq!(parts.len(), 7);
+        assert_eq!(u64::from(std::process::id()), parts[0]);
+        let stat = std::fs::read_to_string("/proc/self/stat").unwrap();
+        let fields: Vec<&str> = stat
+            .rsplit_once(") ")
+            .unwrap()
+            .1
+            .split_whitespace()
+            .collect();
+        assert_eq!(fields[19].parse::<u64>().unwrap(), parts[1]);
+        let exe = std::fs::metadata("/proc/self/exe").unwrap();
+        assert_eq!((exe.dev(), exe.ino()), (parts[2], parts[3]));
+        let lock = std::fs::metadata(format!("/proc/self/fd/{}", parts[4])).unwrap();
+        assert_eq!((lock.dev(), lock.ino()), (parts[5], parts[6]));
+        let descriptors: Vec<_> = std::fs::read_dir("/proc/self/fd")
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        for descriptor in descriptors {
+            match std::fs::metadata(&descriptor) {
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => panic!("descriptor metadata unavailable: {error}"),
+            }
+            let fd: u64 = descriptor
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .parse()
+                .unwrap();
+            assert!([0, 1, 2, parts[4]].contains(&fd));
+        }
+        let contender = "import fcntl,os,sys\nf=os.open(sys.argv[1],os.O_RDONLY)\ntry:fcntl.flock(f,fcntl.LOCK_EX|fcntl.LOCK_NB)\nexcept BlockingIOError:os.write(1,b'contended');sys.exit(0)\nsys.exit(1)";
+        let result = SystemTools.run(
+            "/usr/bin/python3",
+            &[
+                "-I",
+                "-B",
+                "-S",
+                "-c",
+                contender,
+                &std::env::var("EXEC_LOCK_PATH").unwrap(),
+            ],
+            &[],
+            32,
+        );
+        assert_eq!(result.unwrap(), b"contended");
+    }
+
+    #[cfg(target_os = "linux")]
+    fn held_fd_test_output(raw: &[u8]) -> bool {
+        let Ok(text) = std::str::from_utf8(raw) else {
+            return false;
+        };
+        let lines: Vec<&str> = text.lines().filter(|line| !line.is_empty()).collect();
+        if lines.len() != 3
+            || lines[0] != "running 1 test"
+            || lines[1] != "test inventory::process::tests::held_fd_exec_child ... ok"
+        {
+            return false;
+        }
+        let Some(tail) =
+            lines[2].strip_prefix("test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; ")
+        else {
+            return false;
+        };
+        let Some((count, duration)) = tail.split_once(" filtered out; finished in ") else {
+            return false;
+        };
+        !count.is_empty()
+            && count.bytes().all(|byte| byte.is_ascii_digit())
+            && duration.strip_suffix('s').is_some_and(|value| {
+                !value.is_empty()
+                    && value
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || byte == b'.')
+            })
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn held_fd_exec_requires_one_named_test() {
+        assert!(!held_fd_test_output(b"running 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s\n"));
+        assert!(held_fd_test_output(b"running 1 test\ntest inventory::process::tests::held_fd_exec_child ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s\n"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn held_fd_exec_preserves_reporter_identity_and_lifetime_lock() {
+        let mut child = Command::new("/usr/bin/python3")
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("LC_ALL", "C")
+            .args([
+                "-I",
+                "-B",
+                "-S",
+                concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/tests/inventory_reporter_exec_identity.py"
+                ),
+            ])
+            .arg(std::env::current_exe().unwrap())
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let reader = std::thread::spawn(move || {
+            use std::io::Read;
+            let mut data = Vec::new();
+            stdout.take(2049).read_to_end(&mut data).map(|_| data)
+        });
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut status = None;
+        loop {
+            if status.is_none() {
+                status = child.try_wait().unwrap();
+            }
+            if status.is_some() && reader.is_finished() {
+                assert!(status.unwrap().success());
+                let output = reader.join().unwrap().unwrap();
+                assert!(output.len() <= 2048 && held_fd_test_output(&output));
+                break;
+            }
+            assert!(Instant::now() < deadline, "fixture child exit unknown");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     #[ignore]
