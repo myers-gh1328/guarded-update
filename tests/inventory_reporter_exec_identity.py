@@ -1,5 +1,6 @@
 """Disposable Linux held-FD exec fixture, not a deployed reporter wrapper."""
 import hashlib
+import errno
 import os
 from pathlib import Path
 import stat
@@ -12,6 +13,19 @@ from inventory_refresh_maintenance_lock import MaintenanceAdmission
 STAGE='setup'
 
 
+def close_inherited():
+    """Fixture-only, single-thread cleanup before acquiring owned resources."""
+    names=os.listdir('/proc/self/fd')
+    if len(names)>4096:raise ValueError('descriptor inventory unavailable')
+    for name in names:
+        if not name.isascii() or not name.isdigit():raise ValueError('invalid descriptor')
+        fd=int(name)
+        if fd<3:continue
+        try:os.close(fd)
+        except OSError as error:
+            if error.errno!=errno.EBADF:raise
+
+
 def ticks():
     with open('/proc/self/stat','rb') as stream:raw=stream.read(4097)
     if len(raw)>4096:raise ValueError('process identity unavailable')
@@ -20,6 +34,7 @@ def ticks():
 
 def main(binary):
     global STAGE
+    close_inherited()
     if os.execve not in os.supports_fd:raise ValueError('fd exec unavailable')
     path=Path(binary)
     if not path.is_absolute() or any(x in ('.','..') for x in path.parts):raise ValueError('invalid executable')
