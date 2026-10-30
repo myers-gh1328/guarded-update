@@ -21,13 +21,28 @@ from inventory_refresh_io import Inbox
 
 class BindingTest(unittest.TestCase):
     def test_unit_pin_distinguishes_exit_and_wrong_cgroup_without_raw_values(self):
-        status = {'LoadState': 'loaded', 'InvocationID': 'a' * 32, 'ControlGroup': '/expected'}
-        self.assertEqual(MODULE.unit_pin_decision(status, None, '/expected', time.monotonic() + 5), 'ready')
+        status = {'LoadState': 'loaded', 'ActiveState': 'active', 'Description':'test', 'InvocationID': 'a' * 32, 'ControlGroup': '/expected'}
+        self.assertEqual(MODULE.unit_pin_decision(status, None, '/expected', 'test', time.monotonic() + 5), 'ready')
+        starting = dict(status, ActiveState='activating')
+        self.assertEqual(MODULE.unit_pin_decision(starting, None, '/expected', 'test', time.monotonic() + 5, 'a' * 32), 'wait')
+        self.assertEqual(MODULE.unit_pin_decision(status, None, '/expected', 'test', time.monotonic() + 5, 'a' * 32), 'ready')
+        with self.assertRaises(MODULE.PinError):
+            MODULE.unit_pin_decision(dict(starting, ControlGroup=''), None, '/expected', 'test', time.monotonic() + 5, 'a' * 32)
+        with self.assertRaises(MODULE.PinError):
+            MODULE.unit_pin_decision(dict(starting, LoadState='not-found'), None, '/expected', 'test', time.monotonic() + 5, 'a' * 32)
+        with self.assertRaises(MODULE.PinError):
+            MODULE.unit_pin_decision(dict(starting, InvocationID='b' * 32), None, '/expected', 'test', time.monotonic() + 5, 'a' * 32)
+        with self.assertRaises(MODULE.PinError):
+            MODULE.unit_pin_decision(starting, 1, '/expected', 'test', time.monotonic() + 5, 'a' * 32)
+        with self.assertRaises(MODULE.PinError):
+            MODULE.unit_pin_decision(starting, None, '/expected', 'test', time.monotonic() - 1, 'a' * 32)
+        with self.assertRaises(MODULE.PinError):
+            MODULE.unit_pin_decision(dict(starting, Description='foreign'), None, '/expected', 'test', time.monotonic() + 5, 'a' * 32)
         with self.assertRaises(MODULE.PinError) as wrong:
-            MODULE.unit_pin_decision(dict(status, ControlGroup='/private-detail'), None, '/expected', time.monotonic() + 5)
+            MODULE.unit_pin_decision(dict(status, ControlGroup='/private-detail'), None, '/expected', 'test', time.monotonic() + 5)
         self.assertEqual(wrong.exception.reason, 'unit_pin_cgroup')
         with self.assertRaises(MODULE.PinError) as exited:
-            MODULE.unit_pin_decision({'LoadState': 'not-found', 'InvocationID': '', 'ControlGroup': ''}, 1, '/expected', time.monotonic() + 5)
+            MODULE.unit_pin_decision({'LoadState': 'not-found', 'InvocationID': '', 'ControlGroup': ''}, 1, '/expected', 'test', time.monotonic() + 5)
         self.assertEqual(exited.exception.reason, 'unit_pin_exited')
 
     def test_libexec_creation_is_exclusive_and_preserves_uncertain_paths(self):

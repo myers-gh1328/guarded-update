@@ -37,14 +37,23 @@ class PinError(ValueError):
         super().__init__(ERROR)
 
 
-def unit_pin_decision(status, exit_code, expected_group, deadline):
+def unit_pin_decision(status, exit_code, expected_group, description, deadline, invocation=None):
     if time.monotonic() >= deadline: raise PinError('unit_pin_deadline')
+    if exit_code is not None: raise PinError('unit_pin_exited')
     if status['LoadState'] not in ('not-found', 'loaded'): raise PinError('unit_pin_load')
+    if invocation is not None and status['LoadState'] != 'loaded': raise PinError('unit_pin_load')
     group = status['ControlGroup']
     if group and group != expected_group: raise PinError('unit_pin_cgroup')
-    if status['LoadState'] == 'loaded' and status['InvocationID'] and group == expected_group:
-        return 'ready'
-    if exit_code is not None: raise PinError('unit_pin_exited')
+    current = status['InvocationID']
+    if invocation is not None and current != invocation: raise PinError('unit_pin_invocation')
+    if invocation is not None and group != expected_group: raise PinError('unit_pin_cgroup')
+    if status['LoadState'] == 'loaded' and current:
+        if not re.fullmatch('[0-9a-f]{32}', current): raise PinError('unit_pin_invocation')
+        if status['Description'] != description: raise PinError('unit_pin_description')
+        if group == expected_group:
+            active = status['ActiveState']
+            if active == 'active': return 'ready'
+            if active != 'activating': raise PinError('unit_pin_state')
     return 'wait'
 
 
@@ -518,12 +527,15 @@ def run(archive):
             verified_endpoints = tuple((stream, direction, identity) for (stream, direction), identity in zip(endpoints, identities))
             verify_endpoints(verified_endpoints)
             stage = 'unit_pin_query'
+            pinned_invocation = None
             while True:
                 status = unit_status(min(deadline, time.monotonic() + 3))
-                try: decision = unit_pin_decision(status, launcher.poll(), expected_group, deadline)
+                try: decision = unit_pin_decision(status, launcher.poll(), expected_group, description, deadline, pinned_invocation)
                 except PinError as error:
                     stage = error.reason
                     raise
+                if status['LoadState'] == 'loaded' and status['InvocationID'] and status['ControlGroup'] == expected_group:
+                    pinned_invocation = status['InvocationID']
                 if decision == 'ready': break
                 time.sleep(.02)
             stage = 'unit_pin_identity'
