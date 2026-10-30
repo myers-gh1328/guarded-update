@@ -133,8 +133,12 @@ mod tests {
         use std::os::unix::fs::MetadataExt;
         let value = std::env::var("EXEC_IDENTITY").unwrap();
         let parts: Vec<u64> = value.split(',').map(|part| part.parse().unwrap()).collect();
-        assert_eq!(parts.len(), 7);
-        assert_eq!(u64::from(std::process::id()), parts[0]);
+        assert_eq!(parts.len(), 7, "synthetic_stage_fields");
+        assert_eq!(
+            u64::from(std::process::id()),
+            parts[0],
+            "synthetic_stage_pid"
+        );
         let stat = std::fs::read_to_string("/proc/self/stat").unwrap();
         let fields: Vec<&str> = stat
             .rsplit_once(") ")
@@ -142,11 +146,23 @@ mod tests {
             .1
             .split_whitespace()
             .collect();
-        assert_eq!(fields[19].parse::<u64>().unwrap(), parts[1]);
+        assert_eq!(
+            fields[19].parse::<u64>().unwrap(),
+            parts[1],
+            "synthetic_stage_start"
+        );
         let exe = std::fs::metadata("/proc/self/exe").unwrap();
-        assert_eq!((exe.dev(), exe.ino()), (parts[2], parts[3]));
+        assert_eq!(
+            (exe.dev(), exe.ino()),
+            (parts[2], parts[3]),
+            "synthetic_stage_exe"
+        );
         let lock = std::fs::metadata(format!("/proc/self/fd/{}", parts[4])).unwrap();
-        assert_eq!((lock.dev(), lock.ino()), (parts[5], parts[6]));
+        assert_eq!(
+            (lock.dev(), lock.ino()),
+            (parts[5], parts[6]),
+            "synthetic_stage_lock"
+        );
         let descriptors: Vec<_> = std::fs::read_dir("/proc/self/fd")
             .unwrap()
             .map(|entry| entry.unwrap().path())
@@ -164,7 +180,10 @@ mod tests {
                 .unwrap()
                 .parse()
                 .unwrap();
-            assert!([0, 1, 2, parts[4]].contains(&fd));
+            assert!(
+                [0, 1, 2, parts[4]].contains(&fd),
+                "synthetic_stage_extra_fd"
+            );
         }
         let contender = "import fcntl,os,sys\nf=os.open(sys.argv[1],os.O_RDONLY)\ntry:fcntl.flock(f,fcntl.LOCK_EX|fcntl.LOCK_NB)\nexcept BlockingIOError:os.write(1,b'contended');sys.exit(0)\nsys.exit(1)";
         let result = SystemTools.run(
@@ -180,7 +199,7 @@ mod tests {
             &[],
             32,
         );
-        assert_eq!(result.unwrap(), b"contended");
+        assert_eq!(result.unwrap(), b"contended", "synthetic_stage_contention");
     }
 
     #[cfg(target_os = "linux")]
@@ -214,14 +233,38 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
-    fn held_fd_stage(raw: &[u8]) -> &'static str {
-        match raw {
+    fn held_fd_stage(raw: &[u8], output: &[u8]) -> &'static str {
+        let stage = match raw {
             b"Synthetic held-fd exec stage=setup\n" => "setup",
             b"Synthetic held-fd exec stage=ancestry\n" => "ancestry",
             b"Synthetic held-fd exec stage=source\n" => "source",
             b"Synthetic held-fd exec stage=lock\n" => "lock",
             b"Synthetic held-fd exec stage=exec\n" => "exec",
-            _ => "child_or_unknown",
+            _ => "unknown",
+        };
+        if stage != "unknown" {
+            return stage;
+        }
+        for (marker, label) in [
+            (b"synthetic_stage_fields".as_slice(), "fields"),
+            (b"synthetic_stage_pid".as_slice(), "pid"),
+            (b"synthetic_stage_start".as_slice(), "start"),
+            (b"synthetic_stage_exe".as_slice(), "exe"),
+            (b"synthetic_stage_lock".as_slice(), "lock_identity"),
+            (b"synthetic_stage_extra_fd".as_slice(), "extra_fd"),
+            (b"synthetic_stage_contention".as_slice(), "contention"),
+        ] {
+            if output.windows(marker.len()).any(|window| window == marker) {
+                return label;
+            }
+        }
+        if output
+            .windows(b"running 1 test".len())
+            .any(|window| window == b"running 1 test")
+        {
+            "child_test"
+        } else {
+            "pre_exec_unknown"
         }
     }
 
@@ -231,8 +274,12 @@ mod tests {
         assert!(!held_fd_test_output(b"running 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s\n"));
         assert!(held_fd_test_output(b"running 1 test\ntest inventory::process::tests::held_fd_exec_child ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s\n"));
         assert_eq!(
-            held_fd_stage(b"token=synthetic-secret\n"),
-            "child_or_unknown"
+            held_fd_stage(b"token=synthetic-secret\n", b""),
+            "pre_exec_unknown"
+        );
+        assert_eq!(
+            held_fd_stage(b"", b"panic synthetic_stage_extra_fd token=secret"),
+            "extra_fd"
         );
     }
 
@@ -287,7 +334,7 @@ mod tests {
                 if !status.success() {
                     panic!(
                         "Synthetic held-fd exec stage={}",
-                        held_fd_stage(&error_output)
+                        held_fd_stage(&error_output, &output)
                     );
                 }
                 assert!(
