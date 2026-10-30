@@ -384,3 +384,9 @@ including canonical manifest/recipe and generated entry. This detects hidden
 members or nonzero padding after end markers, duplicate metadata and self-forged
 hashes without executing generator/runtime or extracting untrusted paths. It
 does not publish files or establish a running reporter/completion witness.
+
+The hosted OBS9 mechanics test remains separate from the experimental process
+sample. CI runs the latter in its own disposable job with an explicit opt-in;
+a failure remains visible. Its current cgroup mount gate rejects the hosted
+runner's writable nested mount. Until effective visibility and confinement are
+proved, the process sample grants no completion witness or production authority.

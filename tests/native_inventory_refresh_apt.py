@@ -1380,12 +1380,14 @@ def retire_reporter_artifact_fixture(fixture,confirmed_empty):
     assert not failed,'Reporter artifact fixture retirement unconfirmed'
 
 
-def validate_rust_proof_output(raw):
+def validate_rust_proof_output(raw,physical_sample=False):
+    assert type(physical_sample) is bool
     assert type(raw) is bytes and len(raw)<=8192
     lines=raw.decode('ascii').splitlines()
     lines=[line for line in lines if line]
     assert len(lines)==3 and lines[0]=='running 1 test'
-    assert lines[1]=='test inventory::reporter_obs::tests::hosted_real_reporter_rust_journal_roundtrip ... ok'
+    name='sample' if physical_sample else 'roundtrip'
+    assert lines[1]=='test inventory::reporter_obs::tests::hosted_real_reporter_rust_journal_'+name+' ... ok'
     assert re.fullmatch(r'test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out; finished in [0-9]+\.[0-9]+s',lines[2])
 
 
@@ -1732,14 +1734,15 @@ def sample_rust_unit_processes(unit,description,expected,invocation,identity,dea
             if group_chain is not None:group_chain.close()
 
 
-def prove_rust_reporter_roundtrip(archive,public):
+def prove_rust_reporter_roundtrip(archive,public,physical_sample=False):
     """Hosted fixture mechanics; no production or process-set completion witness."""
     import select
     from inventory_refresh_unit_status import PROPERTIES
+    assert type(physical_sample) is bool
     unit='command-center-inventory.service';description='Rust reporter proof '+secrets.token_hex(16)
     expected='/command.slice/command-center.slice/command-center-inventory.slice/'+unit
     deadline=time.monotonic()+60
-    def properties():return rust_unit_properties(min(deadline,time.monotonic()+2),PROPERTIES+('Delegate','ProtectControlGroups'))
+    def properties():return rust_unit_properties(min(deadline,time.monotonic()+2),PROPERTIES+(('Delegate','ProtectControlGroups') if physical_sample else ()))
     assert properties()['LoadState']=='not-found'
     fixture=stage_rust_reporter_artifact_fixture(archive,deadline)
     process=None;group=None;identity=None;invocation=None;confirmed=False;completed=False
@@ -1748,14 +1751,19 @@ def prove_rust_reporter_roundtrip(archive,public):
             '--description='+description,'--setenv=GITHUB_ACTIONS=true','--setenv=GUARDED_UPDATE_NATIVE_RUST_PROOF=1']
         for item in ('User=60002','Group=60002','Type=exec','Restart=no','RemainAfterExit=no','KillMode=control-group',
             'KillSignal=SIGKILL','TimeoutStopSec=1','RuntimeMaxSec=20','OOMPolicy=kill','TasksMax=8','MemoryAccounting=yes','NoNewPrivileges=yes','CapabilityBoundingSet=',
-            'AmbientCapabilities=','Delegate=no','ProtectSystem=strict','ProtectHome=yes','ProtectControlGroups=yes',
-            'ProtectKernelTunables=yes','PrivateDevices=yes','PrivateTmp=yes','PrivateNetwork=yes','ReadOnlyPaths=/sys/fs/cgroup','MountFlags=private',
+            'AmbientCapabilities=','ProtectSystem=strict','ProtectHome=yes','ProtectControlGroups=yes',
+            'ProtectKernelTunables=yes','PrivateDevices=yes','PrivateTmp=yes','PrivateNetwork=yes',
             'ReadWritePaths=/run/command-center-inventory-refresh/observation /run/command-center-inventory-refresh/release'):
             args+=['-p',item]
-        args+=['/usr/local/libexec/command-center-inventory','--exact',
-            'inventory::reporter_obs::tests::hosted_real_reporter_rust_journal_roundtrip','--ignored','--test-threads=1','--nocapture']
+        if physical_sample:
+            args+=['--setenv=GUARDED_UPDATE_NATIVE_BARRIER_PROOF=1','-p','Delegate=no',
+                '-p','ReadOnlyPaths=/sys/fs/cgroup','-p','MountFlags=private']
+        test_name=('inventory::reporter_obs::tests::hosted_real_reporter_rust_journal_sample' if physical_sample else
+            'inventory::reporter_obs::tests::hosted_real_reporter_rust_journal_roundtrip')
+        args+=['/usr/local/libexec/command-center-inventory','--exact',test_name,'--ignored','--test-threads=1','--nocapture']
         fixture['binary'].verify_published();assert time.monotonic()<deadline
-        process=subprocess.Popen(args,env=ENV,stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+        process=subprocess.Popen(args,env=ENV,stdin=subprocess.PIPE if physical_sample else subprocess.DEVNULL,stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE if physical_sample else subprocess.DEVNULL)
         while True:
             value=properties()
             if value['LoadState']=='loaded' and value['InvocationID'] and value['ControlGroup']==expected:
@@ -1764,19 +1772,20 @@ def prove_rust_reporter_roundtrip(archive,public):
                 info=os.fstat(group);identity=(info.st_dev,info.st_ino);break
             assert value['LoadState'] in ('loaded','not-found') and process.poll() is None and time.monotonic()<deadline
             time.sleep(.02)
-        # The control stream is separate from libtest output and every endpoint
-        # is checked before changing shared open-file-description flags.
-        endpoints=((process.stdin,os.O_WRONLY),(process.stdout,os.O_RDONLY),(process.stderr,os.O_RDONLY));identities=[]
-        for stream,direction in endpoints:
-            info=os.fstat(stream.fileno());flags=fcntl.fcntl(stream.fileno(),fcntl.F_GETFL)
-            assert stat.S_ISFIFO(info.st_mode) and flags&os.O_ACCMODE==direction
-            identities.append((info.st_dev,info.st_ino))
-        assert len(set(identities))==3
-        for stream,_ in endpoints:os.set_blocking(stream.fileno(),False)
-        read_rust_barrier_marker(process.stderr.fileno(),deadline)
-        sample_rust_unit_processes(unit,description,expected,invocation,identity,deadline,properties)
-        write_rust_barrier_ack(process.stdin.fileno(),deadline)
-        process.stdin.close();process.stdin=None
+        if physical_sample:
+            # The control stream is separate from libtest output and every endpoint
+            # is checked before changing shared open-file-description flags.
+            endpoints=((process.stdin,os.O_WRONLY),(process.stdout,os.O_RDONLY),(process.stderr,os.O_RDONLY));identities=[]
+            for stream,direction in endpoints:
+                info=os.fstat(stream.fileno());flags=fcntl.fcntl(stream.fileno(),fcntl.F_GETFL)
+                assert stat.S_ISFIFO(info.st_mode) and flags&os.O_ACCMODE==direction
+                identities.append((info.st_dev,info.st_ino))
+            assert len(set(identities))==3
+            for stream,_ in endpoints:os.set_blocking(stream.fileno(),False)
+            read_rust_barrier_marker(process.stderr.fileno(),deadline)
+            sample_rust_unit_processes(unit,description,expected,invocation,identity,deadline,properties)
+            write_rust_barrier_ack(process.stdin.fileno(),deadline)
+            process.stdin.close();process.stdin=None
         fd=process.stdout.fileno();info=os.fstat(fd);flags=fcntl.fcntl(fd,fcntl.F_GETFL)
         assert stat.S_ISFIFO(info.st_mode) and flags&os.O_ACCMODE==os.O_RDONLY
         os.set_blocking(fd,False);output=bytearray();poller=select.poll();poller.register(fd,select.POLLIN|select.POLLHUP|select.POLLERR)
@@ -1787,11 +1796,12 @@ def prove_rust_reporter_roundtrip(archive,public):
             assert time.monotonic()<deadline
             if not chunk:break
             output.extend(chunk);assert len(output)<=8192
-        poller=select.poll();poller.register(process.stderr.fileno(),select.POLLIN|select.POLLHUP|select.POLLERR)
-        remaining=deadline-time.monotonic();assert remaining>0 and poller.poll(max(1,int(remaining*1000)))
-        assert os.read(process.stderr.fileno(),1)==b'' and time.monotonic()<deadline
+        if physical_sample:
+            poller=select.poll();poller.register(process.stderr.fileno(),select.POLLIN|select.POLLHUP|select.POLLERR)
+            remaining=deadline-time.monotonic();assert remaining>0 and poller.poll(max(1,int(remaining*1000)))
+            assert os.read(process.stderr.fileno(),1)==b'' and time.monotonic()<deadline
         assert process.wait(timeout=max(0,deadline-time.monotonic()))==0 and time.monotonic()<deadline
-        validate_rust_proof_output(bytes(output))
+        validate_rust_proof_output(bytes(output),physical_sample)
         status=public();receipt=status['observation_receipt']
         assert status['observation_lease'] is None and receipt['nonce']=='0000000000000009'+'d'*16 and receipt['outcome']=='released'
         assert time.monotonic()<deadline
@@ -1831,8 +1841,9 @@ def prove_rust_reporter_roundtrip(archive,public):
         if failed:raise ValueError('Rust reporter fixture cleanup unconfirmed')
 
 
-def prove_actual_coordinator_entry_loop(archive):
+def prove_actual_coordinator_entry_loop(archive,physical_sample=False):
     """GHA-only actual entry, restricted inbox actor and controlled policy refusal."""
+    assert type(physical_sample) is bool
     from inventory_refresh_publisher_profile import publisher_properties
     from inventory_refresh_resources import UNIT,SELF_CGROUP
     from inventory_refresh_unit_status import PROPERTIES,inert
@@ -1977,7 +1988,7 @@ def prove_actual_coordinator_entry_loop(archive):
         # The Rust attempt may publish a newer receipt even when its witness
         # fails. Do not demand the obsolete OBS8 receipt during failure cleanup.
         receipt=None
-        receipt=prove_rust_reporter_roundtrip(archive,public)
+        receipt=prove_rust_reporter_roundtrip(archive,public,physical_sample)
         assert receipt['nonce']=='0000000000000009'+'d'*16
         invalidate_policy()
         assert launcher.wait(timeout=35)==74
@@ -1997,7 +2008,7 @@ def prove_actual_coordinator_entry_loop(archive):
         finally:
             if group is not None:os.close(group)
     assert proved
-    return {'fixed_coordinator_entry_loop_and_controlled_policy_refusal_verified':True,
+    result={'fixed_coordinator_entry_loop_and_controlled_policy_refusal_verified':True,
         'restricted_reporter_actual_entry_observation_receipt_verified':True,
         'projected_reader_policy_native_query_verified':True,
         'restricted_reporter_fingerprint_matches_root_receipt_verified':True,
@@ -2009,6 +2020,8 @@ def prove_actual_coordinator_entry_loop(archive):
         'restricted_rust_parent_real_reporter_journal_mechanics_verified':True,
         'restricted_reporter_artifact':packaged['artifact'],
         'restricted_reporter_request_writer_roundtrip_verified':True}
+    result['restricted_rust_parent_sampled_process_profile_verified']=physical_sample
+    return result
 
 def is_live_worker(raw,*,parent=None):
     try:
@@ -2436,7 +2449,9 @@ for path in sys.argv[2:]:
         recovered,_,_=run_worker(good,8,policy_guard=private_policy_guard)
         assert recovered==0, 'Owned failed refresh unit was not acknowledged for the next job'
         assert (Path(CACHE_ROOT)/'current.json').read_bytes()==previous
-        resource_proof.update(prove_actual_coordinator_entry_loop(archive))
+        barrier_marker=os.environ.get('GUARDED_UPDATE_NATIVE_BARRIER_PROOF')
+        assert barrier_marker in (None,'1')
+        resource_proof.update(prove_actual_coordinator_entry_loop(archive,barrier_marker=='1'))
         proof = {'schema_version': 1, 'scope': 'fixed_worker_trusted_policy',
             'synthetic_repository_only': True, 'target_repository_fit_proven': False,
             'coordinator_exercised': False, 'apt_refresh_exercised': True,

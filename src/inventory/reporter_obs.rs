@@ -1453,7 +1453,7 @@ command(10,'await_receipt');response(10,'await_receipt','prepared',evidence=dict
     }
 
     #[cfg(target_os = "linux")]
-    fn hosted_native_roundtrip() -> Result<()> {
+    fn hosted_native_roundtrip(sample: bool) -> Result<()> {
         use std::os::unix::fs::PermissionsExt;
         use std::time::{Duration, Instant};
         require(
@@ -1461,6 +1461,12 @@ command(10,'await_receipt');response(10,'await_receipt','prepared',evidence=dict
                 .ok()
                 .as_deref()
                 == Some("1"),
+        )?;
+        require(
+            std::env::var("GUARDED_UPDATE_NATIVE_BARRIER_PROOF")
+                .ok()
+                .as_deref()
+                == if sample { Some("1") } else { None },
         )?;
         let deadline = Instant::now() + Duration::from_secs(18);
         let status =
@@ -1592,6 +1598,9 @@ command(10,'await_receipt');response(10,'await_receipt','prepared',evidence=dict
         require(Instant::now() < deadline)?;
         #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
         {
+            if !sample {
+                return Ok(());
+            }
             hosted_barrier(deadline)?;
             let after = super::super::reporter_direct_clock::snapshot(deadline)
                 .map_err(|_| ERROR.to_owned())?;
@@ -1600,7 +1609,7 @@ command(10,'await_receipt');response(10,'await_receipt','prepared',evidence=dict
         }
         #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
         {
-            Err(ERROR.into())
+            if sample { Err(ERROR.into()) } else { Ok(()) }
         }
     }
 
@@ -1718,7 +1727,15 @@ command(10,'await_receipt');response(10,'await_receipt','prepared',evidence=dict
     #[ignore = "requires the dedicated restricted native CI service"]
     #[cfg(target_os = "linux")]
     fn hosted_real_reporter_rust_journal_roundtrip() {
-        hosted_native_roundtrip().unwrap();
+        hosted_native_roundtrip(false).unwrap();
+    }
+
+    /// Hosted-only sample; strict mount uncertainty prevents completion proof.
+    #[test]
+    #[ignore = "requires the dedicated restricted physical-sample CI service"]
+    #[cfg(target_os = "linux")]
+    fn hosted_real_reporter_rust_journal_sample() {
+        hosted_native_roundtrip(true).unwrap();
     }
 
     #[test]

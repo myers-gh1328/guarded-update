@@ -97,6 +97,11 @@ class PublisherHarnessTests(unittest.TestCase):
         valid=(b'\nrunning 1 test\ntest inventory::reporter_obs::tests::hosted_real_reporter_rust_journal_roundtrip ... ok\n'
             b'\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 169 filtered out; finished in 1.23s\n')
         check(valid)
+        sample=valid.replace(b'journal_roundtrip',b'journal_sample')
+        check(sample,True)
+        with self.assertRaises(AssertionError):check(sample)
+        with self.assertRaises(AssertionError):check(valid,True)
+        with self.assertRaises(AssertionError):check(valid,1)
         for bad in (valid.replace(b'running 1 test',b'running 0 tests'),valid.replace(b'0 ignored',b'1 ignored'),
             valid.replace(b' ... ok',b' ... ignored'),valid+b'extra\n',valid.replace(b'1 passed',b'0 passed')):
             with self.assertRaises((AssertionError,ValueError)):check(bad)
@@ -115,6 +120,20 @@ class PublisherHarnessTests(unittest.TestCase):
             self.assertTrue(stream.closed)
             self.assertEqual(process.Popen.call_args.args[0][0],'/bin/systemctl')
         finally:os.close(write_fd)
+
+    def test_physical_sample_is_separate_explicit_hosted_job(self):
+        workflow=(Path(__file__).parent.parent/'.github/workflows/ci.yml').read_text()
+        self.assertIn('inventory-refresh-physical-sample:',workflow)
+        self.assertIn('GUARDED_UPDATE_NATIVE_BARRIER_PROOF',workflow)
+        sample_job=workflow.split('  inventory-refresh-physical-sample:',1)[1].split('  windows-discovery:',1)[0]
+        self.assertNotIn('continue-on-error',sample_job)
+        baseline=workflow.split('  inventory-refresh-storage:',1)[1].split('  inventory-refresh-physical-sample:',1)[0]
+        self.assertNotIn('GUARDED_UPDATE_NATIVE_BARRIER_PROOF',baseline)
+        rust=(Path(__file__).parent.parent/'src/inventory/reporter_obs.rs').read_text()
+        self.assertIn('fn hosted_real_reporter_rust_journal_sample()',rust)
+        tree=ast.parse((Path(__file__).parent/'native_inventory_refresh_apt.py').read_bytes())
+        node=next(node for node in tree.body if isinstance(node,ast.FunctionDef) and node.name=='prove_actual_coordinator_entry_loop')
+        self.assertIn('restricted_rust_parent_sampled_process_profile_verified',ast.unparse(node))
 
     def test_native_harness_imports_without_running_main(self):
         root=Path(__file__).parent.parent
