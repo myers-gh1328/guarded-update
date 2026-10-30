@@ -222,6 +222,8 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    // A deadline leaves child ownership unknown; never wait without a bound.
+    #[allow(clippy::zombie_processes)]
     fn held_fd_exec_preserves_reporter_identity_and_lifetime_lock() {
         let mut child = Command::new("/usr/bin/python3")
             .env_clear()
@@ -254,8 +256,10 @@ mod tests {
             if status.is_none() {
                 status = child.try_wait().unwrap();
             }
-            if status.is_some() && reader.is_finished() {
-                assert!(status.unwrap().success());
+            if let Some(status) = status
+                && reader.is_finished()
+            {
+                assert!(status.success());
                 let output = reader.join().unwrap().unwrap();
                 assert!(output.len() <= 2048 && held_fd_test_output(&output));
                 break;
