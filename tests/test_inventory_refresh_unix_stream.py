@@ -3,11 +3,13 @@ import os
 import fcntl
 from pathlib import Path
 import socket
+import select
 import array
 import subprocess
 import struct
 import sys
 import time
+import tempfile
 import unittest
 from unittest.mock import patch
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'scripts'))
@@ -100,3 +102,35 @@ class SeqpacketTests(unittest.TestCase):
         with self.assertRaises(ValueError):owner.receive(b'DRAIN-1')
         with self.assertRaises(ValueError):owner.close()
         right.close()
+
+    @unittest.skipUnless(sys.platform=='linux','Linux SCM_CREDENTIALS fixture')
+    def test_accepted_connection_attributes_each_sender(self):
+        program="import os,socket,sys\ns=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM);s.settimeout(5);s.connect(sys.argv[1]);assert s.recv(1)==b'x'\nif sys.argv[2]=='fork':\n p=os.fork()\n if p==0:s.sendall(b'DRAIN-1');s.shutdown(socket.SHUT_WR);os._exit(0)\n _,status=os.waitpid(p,0);assert os.WIFEXITED(status) and os.WEXITSTATUS(status)==0\nelse:s.sendall(b'DRAIN-1');s.shutdown(socket.SHUT_WR)\ns.close()"
+        for mode in ('direct','fork'):
+            with self.subTest(mode=mode):
+                path=tempfile.mkdtemp(prefix='inventory-credential-')
+                address=str(Path(path)/'control.sock');listener=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM)
+                listener.setsockopt(socket.SOL_SOCKET,socket.SO_PASSCRED,1);listener.bind(address);listener.listen(1)
+                child=subprocess.Popen([sys.executable,'-I','-B','-S','-c',program,address,mode],
+                    env={'PATH':'/usr/bin:/bin','LC_ALL':'C'},stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+                listener.settimeout(5);connection,_=listener.accept();connection.setsockopt(socket.SOL_SOCKET,socket.SO_PASSCRED,1)
+                self.assertEqual(connection.getsockopt(socket.SOL_SOCKET,socket.SO_PASSCRED),1)
+                credentials=struct.unpack('iII',connection.getsockopt(socket.SOL_SOCKET,socket.SO_PEERCRED,12))
+                self.assertEqual(credentials,(child.pid,os.getuid(),os.getgid()));connection.sendall(b'x')
+                received=b'';deadline=time.monotonic()+5
+                while len(received)<len(b'DRAIN-1'):
+                    remaining=deadline-time.monotonic();self.assertGreater(remaining,0)
+                    self.assertTrue(select.select([connection],[],[],remaining)[0])
+                    raw,ancillary,flags,_=connection.recvmsg(8-len(received),socket.CMSG_SPACE(12),socket.MSG_CMSG_CLOEXEC)
+                    self.assertTrue(raw);received+=raw;self.assertTrue(b'DRAIN-1'.startswith(received))
+                    if mode=='direct':self.assertEqual(packet.decode_credentials(raw,ancillary,flags,credentials),credentials)
+                    else:
+                        with self.assertRaises(ValueError):packet.decode_credentials(raw,ancillary,flags,credentials)
+                self.assertEqual(received,b'DRAIN-1')
+                remaining=deadline-time.monotonic();self.assertGreater(remaining,0)
+                self.assertTrue(select.select([connection],[],[],remaining)[0])
+                extra,ancillary,flags,_=connection.recvmsg(1,socket.CMSG_SPACE(16),socket.MSG_CMSG_CLOEXEC)
+                packet.OneMessage._discard(ancillary)
+                self.assertEqual(extra,b'');self.assertEqual(ancillary,[]);self.assertFalse(flags&(socket.MSG_TRUNC|socket.MSG_CTRUNC))
+                connection.close();listener.close();self.assertEqual(child.wait(timeout=5),0)
+                os.unlink(address);os.rmdir(path)
