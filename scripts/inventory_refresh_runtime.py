@@ -111,6 +111,17 @@ class FixedRuntime:
             except BaseException:pass
             raise ValueError('Inventory runtime dispatch unconfirmed') from None
 
+    def drain(self):
+        """Enter one-way logical drain while retaining runtime ownership."""
+        if self._closed:raise ValueError('Inventory runtime closed')
+        try:
+            self._check();result=self._dispatcher.drain();self._check();return result
+        except BaseException:
+            self._fence()
+            try:self.close()
+            except BaseException:pass
+            raise ValueError('Inventory runtime drain unconfirmed') from None
+
     def close(self):
         if self._closed:
             if self._failed:raise ValueError('Inventory runtime shutdown unconfirmed')

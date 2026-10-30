@@ -134,7 +134,9 @@ but can finish the matching release of an already owned observation. Its
 `drained` result requires no active or unconfirmed journal entries, no owned
 observation scope or pin, valid inbox reads, and revalidated policy and resource
 context. It is not wired to a stop
-request and does not prove process-set emptiness, lock release, or maintenance
+request. The internal runtime rechecks its admitted context and retains its
+Root journal lock while draining; neither result proves process-set emptiness,
+lock release, or maintenance
 ownership. Valid unstarted requests can still remain in the inboxes; a future
 maintenance owner must fence producers and reconcile those files before
 switching modes. Those remain separate requirements before publishing a binding.

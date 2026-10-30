@@ -56,6 +56,62 @@ class RuntimeTests(unittest.TestCase):
         self.assertIs(self.runtime._dispatcher._journal,self.f.journal)
         self.assertEqual(self.f.status()['cache_generation'],'c'*32)
 
+    def test_runtime_drain_latches_without_releasing_root_lock(self):
+        self.runtime=module.FixedRuntime.fixed()
+        self.runtime._observation._clock=self.f.clock
+        self.assertEqual(self.runtime.drain()['state'],'drained')
+        self.assertEqual(self.runtime.step()['state'],'drained')
+        self.assertNotIn('lock_exit',self.events)
+        self.assertFalse(self.f.journal.snapshot()['unconfirmed'])
+
+    def test_runtime_drain_keeps_active_request_and_fences_context_failure(self):
+        self.runtime=module.FixedRuntime.fixed()
+        self.runtime._observation._clock=self.f.clock
+        self.f.journal.receive('refresh','0000000000000002'+'a'*16,self.f.boot,200,self.f.policy.generation)
+        self.assertEqual(self.runtime.drain()['state'],'draining')
+        self.assertNotIn('lock_exit',self.events)
+        self.accounts[0].pw_uid=503
+        with self.assertRaises(ValueError):self.runtime.drain()
+        self.assertTrue(self.f.journal.snapshot()['unconfirmed'])
+        self.assertIn('lock_exit',self.events)
+
+    def test_runtime_drain_fences_after_context_changes(self):
+        self.runtime=module.FixedRuntime.fixed();self.runtime._observation._clock=self.f.clock
+        original=self.runtime._check;calls=[]
+        def changed():
+            calls.append(1)
+            if len(calls)>1:raise ValueError('changed')
+            return original()
+        self.runtime._check=Mock(side_effect=changed)
+        with self.assertRaises(ValueError):self.runtime.drain()
+        self.assertGreaterEqual(len(calls),2)
+        self.assertTrue(self.f.journal.snapshot()['unconfirmed'])
+        self.assertIn('lock_exit',self.events)
+
+    def test_runtime_drain_retains_real_journal_lock_until_close(self):
+        import subprocess
+        self.f.lock.__exit__(None,None,None)
+        self.f.journal.exclusive=self.original_exclusive
+        self.runtime=module.FixedRuntime.fixed();self.runtime._observation._clock=self.f.clock
+        from inventory_refresh_state import Journal
+        other=Journal(self.f.fds[0],owner=os.getuid())
+        program="import fcntl,os,sys\nfd=os.open(sys.argv[1],os.O_RDWR|os.O_NOFOLLOW)\ntry:\n fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)\nexcept BlockingIOError: sys.exit(42)\nfinally: os.close(fd)"
+        def contender():
+            child=subprocess.Popen([sys.executable,'-I','-B','-S','-c',program,str(self.f.root/'state/control.lock')],
+                stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+            return child.wait(timeout=5)
+        try:
+            self.assertEqual(self.runtime.drain()['state'],'drained')
+            with self.assertRaises(OSError):
+                with other.exclusive():pass
+            self.assertEqual(contender(),42)
+            self.runtime.close()
+            with other.exclusive():pass
+            self.assertEqual(contender(),0)
+        finally:
+            self.runtime.close()
+            self.f.lock=self.f.journal.exclusive();self.f.lock.__enter__()
+
     def test_false_startup_barrier_refuses_dispatch_without_initialization(self):
         self.f.journal.startup_ready=Mock(return_value=False);self.f.journal.initialize=Mock()
         with self.assertRaises(ValueError):module.FixedRuntime.fixed()
