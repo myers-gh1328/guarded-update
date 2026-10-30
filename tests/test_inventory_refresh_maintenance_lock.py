@@ -30,8 +30,8 @@ class MaintenanceLockTest(unittest.TestCase):
         os.close(self.parent);self.temp.cleanup()
     def guard(self,mode):
         return module.MaintenanceLock.from_directory(self.parent,mode,os.geteuid(),os.getegid())
-    def contender(self,mode):
-        child=subprocess.Popen([sys.executable,'-I','-B','-S','-c',PROGRAM,str(self.path/'maintenance.lock'),mode],
+    def contender(self,mode,name='maintenance.lock'):
+        child=subprocess.Popen([sys.executable,'-I','-B','-S','-c',PROGRAM,str(self.path/name),mode],
             stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
         return child.wait(timeout=5)
     def test_shared_and_exclusive_are_real_cross_process_guards(self):
@@ -198,6 +198,45 @@ class MaintenanceLockTest(unittest.TestCase):
         self.assertNotIsInstance(raised.exception,module.MaintenanceContended)
         with self.assertRaises(ValueError):owner.close()
         owner._gate.close()
+
+    def test_checked_participant_checks_marker_twice_under_shared_gate(self):
+        (self.path/'admission.lock').write_bytes(b'');(self.path/'admission.lock').chmod(0o644)
+        calls=[]
+        def absent():
+            calls.append(1)
+            self.assertEqual(self.contender('exclusive','admission.lock'),42)
+            return False
+        lifetime=module.MaintenanceAdmission.participant_checked(self.parent,os.geteuid(),os.getegid(),absent)
+        self.assertEqual(calls,[1,1]);lifetime.close()
+
+    def test_checked_participant_rejects_marker_change_and_nonboolean(self):
+        (self.path/'admission.lock').write_bytes(b'');(self.path/'admission.lock').chmod(0o644)
+        program="import os,sys\nsys.path.insert(0,sys.argv[1])\nfrom inventory_refresh_maintenance_lock import MaintenanceAdmission\nd=os.open(sys.argv[2],os.O_RDONLY|os.O_DIRECTORY);mode=sys.argv[3];seen=[]\ndef sample():\n seen.append(1)\n if mode=='error':raise OSError('private')\n return 0 if mode=='nonboolean' else len(seen)>1\ntry: MaintenanceAdmission.participant_checked(d,os.getuid(),os.getgid(),sample)\nexcept ValueError:os._exit(42)\nos._exit(1)"
+        for mode in ('changed','error','nonboolean'):
+            child=subprocess.Popen([sys.executable,'-I','-B','-S','-c',program,str(Path(module.__file__).parent),str(self.path),mode],
+                stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+            self.assertEqual(child.wait(timeout=5),42)
+
+    def test_checked_participant_never_transfers_on_partial_or_close_failure(self):
+        (self.path/'admission.lock').write_bytes(b'');(self.path/'admission.lock').chmod(0o644)
+        original=module.MaintenanceLock.from_directory;owned=[]
+        def fail_lifetime(*args,**kwargs):
+            if kwargs.get('name')!=module.GATE:raise ValueError('uncertain')
+            value=original(*args,**kwargs);owned.append(value);return value
+        with patch.object(module.MaintenanceLock,'from_directory',side_effect=fail_lifetime):
+            with self.assertRaises(ValueError):
+                module.MaintenanceAdmission.participant_checked(self.parent,os.geteuid(),os.getegid(),lambda:False)
+        self.assertEqual(self.contender('exclusive','admission.lock'),42);owned.pop().close()
+        def gate_close_fails(*args,**kwargs):
+            value=original(*args,**kwargs);owned.append(value)
+            if kwargs.get('name')==module.GATE:
+                value.close=unittest.mock.Mock(side_effect=ValueError('uncertain'))
+            return value
+        with patch.object(module.MaintenanceLock,'from_directory',side_effect=gate_close_fails):
+            with self.assertRaises(ValueError):
+                module.MaintenanceAdmission.participant_checked(self.parent,os.geteuid(),os.getegid(),lambda:False)
+        self.assertEqual(self.contender('exclusive'),42)
+        owned[1].close();module.MaintenanceLock.close(owned[0])
 
 
 if __name__=='__main__':unittest.main()

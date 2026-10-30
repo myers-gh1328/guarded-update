@@ -154,6 +154,31 @@ class MaintenanceAdmission:
     preserve uncertainty on timeout. All producers must cooperate.
     """
     @staticmethod
+    def participant_checked(directory,owner,group,marker_present,verify_ancestry=lambda:None):
+        """Check a caller-supplied marker twice while admission stays held.
+
+        This sampled, unregistered seam assumes publishers use the same gate;
+        it does not authenticate the callback or resolve marker migration.
+        """
+        if not callable(marker_present):raise ValueError(ERROR)
+        def require_absent():
+            try:result=marker_present()
+            except BaseException:raise ValueError(ERROR) from None
+            if result is not False:raise ValueError(ERROR)
+        gate=MaintenanceLock.from_directory(directory,'participant',owner,group,verify_ancestry,name=GATE)
+        require_absent()
+        gate.verify()
+        try:
+            lifetime=MaintenanceLock.from_directory(directory,'participant',owner,group,verify_ancestry)
+        except MaintenanceContended:
+            gate.close()
+            raise
+        if gate._identity[:2]==lifetime._identity[:2]:raise ValueError(ERROR)
+        require_absent()
+        gate.verify();lifetime.verify();gate.close()
+        return lifetime
+
+    @staticmethod
     def participant(directory,owner,group,verify_ancestry=lambda:None):
         gate=MaintenanceLock.from_directory(directory,'participant',owner,group,verify_ancestry,name=GATE)
         try:
