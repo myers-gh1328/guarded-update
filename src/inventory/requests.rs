@@ -1271,6 +1271,7 @@ pub(super) fn runtime_collection_fence(
     enrollment: &str,
     lock: &super::state::Lock,
 ) -> Result<bool> {
+    lock.verify_for(dir)?;
     fn present(path: &std::path::Path) -> Result<bool> {
         match std::fs::symlink_metadata(path) {
             Ok(_) => Ok(true),
@@ -1283,12 +1284,15 @@ pub(super) fn runtime_collection_fence(
         return Ok(true);
     }
     if !present(&dir.join("requests.json"))? {
-        return present(&pending);
+        let pending = present(&pending)?;
+        lock.verify_for(dir)?;
+        return Ok(pending);
     }
     let journal = RequestJournal::open(dir, enrollment, lock)?;
     if present(&pending)? {
         return Ok(true);
     }
+    lock.verify_for(dir)?;
     Ok([&journal.journal.manual, &journal.journal.collection]
         .iter()
         .any(|domain| {
@@ -1340,11 +1344,12 @@ impl<'a> RequestJournal<'a> {
         dir: &std::path::Path,
         enrollment: &str,
         seeds: CounterSeeds,
-        _lock: &super::state::Lock,
+        lock: &super::state::Lock,
     ) -> Result<()> {
         let _access = JOURNAL_ACCESS
             .lock()
             .map_err(|_| "Request journal access uncertain; restart and reconcile")?;
+        lock.verify_for(dir)?;
         require(uuid(enrollment) && safe(seeds.helper) && safe(seeds.observation))?;
         let path = dir.join("requests.json");
         if std::fs::symlink_metadata(&path).is_ok() {
@@ -1361,7 +1366,10 @@ impl<'a> RequestJournal<'a> {
             manual: Domain::default(),
             collection: Domain::default(),
         };
-        super::state::atomic(&path, &journal.encode()?)
+        let saved = super::state::atomic(&path, &journal.encode()?);
+        let checked = lock.verify_for(dir);
+        saved?;
+        checked
     }
     pub fn open(
         dir: &std::path::Path,
@@ -1371,11 +1379,13 @@ impl<'a> RequestJournal<'a> {
         let _access = JOURNAL_ACCESS
             .lock()
             .map_err(|_| "Request journal access uncertain; restart and reconcile")?;
+        lock.verify_for(dir)?;
         let snapshot = super::state::read(&dir.join("requests.json"), MAX_JOURNAL)?;
         let journal: Journal = serde_json::from_slice(&snapshot)
             .map_err(|_| "Request journal invalid; explicit recovery required")?;
         journal.validate()?;
         require(journal.enrollment_id == enrollment)?;
+        lock.verify_for(dir)?;
         Ok(Self {
             dir: dir.to_owned(),
             journal,
@@ -1389,6 +1399,13 @@ impl<'a> RequestJournal<'a> {
         self.epoch = std::sync::Arc::new(());
     }
     fn change<T>(&mut self, apply: impl FnOnce(&mut Journal) -> Result<T>) -> Result<T> {
+        self.change_with(apply, super::state::atomic)
+    }
+    fn change_with<T>(
+        &mut self,
+        apply: impl FnOnce(&mut Journal) -> Result<T>,
+        save: impl FnOnce(&std::path::Path, &[u8]) -> Result<()>,
+    ) -> Result<T> {
         // Also protect private compare-and-write entry from future callers.
         self.revoke_native_intents();
         let _access = JOURNAL_ACCESS
@@ -1396,6 +1413,10 @@ impl<'a> RequestJournal<'a> {
             .map_err(|_| "Request journal access uncertain; restart and reconcile")?;
         if self.poisoned {
             return Err("Request journal persistence uncertain; reopen and reconcile".into());
+        }
+        if self._lock.verify_for(&self.dir).is_err() {
+            self.poisoned = true;
+            return Err("Request journal lock uncertain".into());
         }
         if !super::state::read(&self.dir.join("requests.json"), MAX_JOURNAL)
             .is_ok_and(|bytes| bytes == self.snapshot)
@@ -1433,7 +1454,10 @@ impl<'a> RequestJournal<'a> {
         }
         let bytes = next.encode()?;
         self.poisoned = true;
-        super::state::atomic(&self.dir.join("requests.json"), &bytes)?;
+        let saved = save(&self.dir.join("requests.json"), &bytes);
+        let checked = self._lock.verify_for(&self.dir);
+        saved?;
+        checked?;
         self.journal = next;
         self.snapshot = bytes;
         self.poisoned = false;
@@ -1555,6 +1579,7 @@ impl<'a> RequestJournal<'a> {
         let _access = JOURNAL_ACCESS
             .lock()
             .map_err(|_| "Request journal access uncertain; restart and reconcile")?;
+        self._lock.verify_for(&self.dir)?;
         if !super::state::read(&self.dir.join("requests.json"), MAX_JOURNAL)
             .is_ok_and(|bytes| bytes == self.snapshot)
         {
@@ -1563,6 +1588,7 @@ impl<'a> RequestJournal<'a> {
         if self.poisoned {
             return Err("Request journal persistence uncertain".into());
         }
+        self._lock.verify_for(&self.dir)?;
         self.journal
             .domain(cap)
             .active
@@ -1801,14 +1827,18 @@ impl<'a> RequestJournal<'a> {
                             == Some(release.first_requested_boottime_ms)
                 }),
         )?;
-        publish_release(&release.observation_nonce)?;
-        self.native_snapshot()?;
+        let published = publish_release(&release.observation_nonce);
+        let checked = self.native_snapshot();
+        published?;
+        checked?;
         Ok(())
     }
     fn native_snapshot(&mut self) -> Result<()> {
         if self.poisoned
+            || self._lock.verify_for(&self.dir).is_err()
             || !super::state::read(&self.dir.join("requests.json"), MAX_JOURNAL)
                 .is_ok_and(|bytes| bytes == self.snapshot)
+            || self._lock.verify_for(&self.dir).is_err()
         {
             self.poisoned = true;
             return Err("Native publication journal unavailable or stale".into());
@@ -1841,10 +1871,12 @@ impl<'a> RequestJournal<'a> {
                 .as_ref()
                 .is_some_and(|entry| entry.matches_native_intent(&intent)),
         )?;
-        publish(&intent.observation_nonce)?;
+        let published = publish(&intent.observation_nonce);
         // Also detect out-of-band/callback-side state replacement, not merely
         // cooperative mutex writers. Never roll back a possibly visible effect.
-        self.native_snapshot()?;
+        let checked = self.native_snapshot();
+        published?;
+        checked?;
         intent.epoch = self.epoch.clone();
         Ok(PublishedNativeCollection { intent })
     }
@@ -2278,6 +2310,121 @@ impl<'a> RequestJournal<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn journal_rejects_lock_from_another_directory() {
+        let first = Fixture::new();
+        let other = Fixture::new();
+        assert!(RequestJournal::open(&first.dir, BOOT, &other.lock).is_err());
+    }
+    #[test]
+    #[cfg(unix)]
+    fn replaced_lock_blocks_journal_mutation_even_if_restored() {
+        use std::os::unix::fs::PermissionsExt;
+        let fixture = Fixture::new();
+        let mut journal = fixture.open();
+        let before = std::fs::read(fixture.dir.join("requests.json")).unwrap();
+        let path = fixture.dir.join("running.lock");
+        std::fs::rename(&path, fixture.dir.join("old.lock")).unwrap();
+        std::fs::write(&path, b"").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(
+            journal
+                .reserve_nonce(OperationDomain::Helper, "aaaaaaaaaaaaaaaa")
+                .is_err()
+        );
+        std::fs::remove_file(&path).unwrap();
+        std::fs::rename(fixture.dir.join("old.lock"), &path).unwrap();
+        assert!(
+            journal
+                .reserve_nonce(OperationDomain::Helper, "bbbbbbbbbbbbbbbb")
+                .is_err()
+        );
+        assert_eq!(
+            std::fs::read(fixture.dir.join("requests.json")).unwrap(),
+            before
+        );
+    }
+    #[test]
+    #[cfg(unix)]
+    fn publication_error_still_poisons_replaced_lock_for_all_handles() {
+        use std::os::unix::fs::PermissionsExt;
+        let fixture = Fixture::new();
+        let session = session();
+        let mut journal = native_ready(&fixture, &session);
+        let intent = journal
+            .admit_native_collection(REPORT, 1, 1, &clock(1001), "bbbbbbbbbbbbbbbb", &session)
+            .unwrap();
+        let before = std::fs::read(fixture.dir.join("requests.json")).unwrap();
+        let path = fixture.dir.join("running.lock");
+        assert!(
+            journal
+                .publish_native_observation(intent, &clock(1002), &session, |_| {
+                    std::fs::rename(&path, fixture.dir.join("old.lock")).unwrap();
+                    std::fs::write(&path, b"").unwrap();
+                    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+                        .unwrap();
+                    Err("synthetic publication uncertainty".into())
+                })
+                .is_err()
+        );
+        std::fs::remove_file(&path).unwrap();
+        std::fs::rename(fixture.dir.join("old.lock"), &path).unwrap();
+        assert!(RequestJournal::open(&fixture.dir, BOOT, &fixture.lock).is_err());
+        assert_eq!(
+            std::fs::read(fixture.dir.join("requests.json")).unwrap(),
+            before
+        );
+    }
+    #[test]
+    #[cfg(unix)]
+    fn replaced_lock_prevents_native_publication_callback() {
+        use std::os::unix::fs::PermissionsExt;
+        let fixture = Fixture::new();
+        let session = session();
+        let mut journal = native_ready(&fixture, &session);
+        let intent = journal
+            .admit_native_collection(REPORT, 1, 1, &clock(1001), "bbbbbbbbbbbbbbbb", &session)
+            .unwrap();
+        let path = fixture.dir.join("running.lock");
+        std::fs::rename(&path, fixture.dir.join("old.lock")).unwrap();
+        std::fs::write(&path, b"").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let mut called = false;
+        assert!(
+            journal
+                .publish_native_observation(intent, &clock(1002), &session, |_| {
+                    called = true;
+                    Ok(())
+                })
+                .is_err()
+        );
+        assert!(!called);
+    }
+    #[test]
+    #[cfg(unix)]
+    fn lock_replacement_after_journal_fsync_returns_uncertain_and_poisons() {
+        use std::os::unix::fs::PermissionsExt;
+        let fixture = Fixture::new();
+        let mut journal = fixture.open();
+        let path = fixture.dir.join("running.lock");
+        let result = journal.change_with(
+            |j| {
+                j.counters
+                    .reserve(OperationDomain::Helper, "aaaaaaaaaaaaaaaa")
+            },
+            |destination, bytes| {
+                super::super::state::atomic(destination, bytes)?;
+                std::fs::rename(&path, fixture.dir.join("old.lock")).unwrap();
+                std::fs::write(&path, b"").unwrap();
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+                Ok(())
+            },
+        );
+        assert!(result.is_err());
+        std::fs::remove_file(&path).unwrap();
+        std::fs::rename(fixture.dir.join("old.lock"), &path).unwrap();
+        assert!(RequestJournal::open(&fixture.dir, BOOT, &fixture.lock).is_err());
+    }
     #[test]
     fn runtime_fence_preserves_empty_and_unfinished_journals() {
         let fixture = Fixture::new();

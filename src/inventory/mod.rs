@@ -317,6 +317,7 @@ fn sync(
     let collection_fenced =
         requests::runtime_collection_fence(&config.state_dir, &config.enrollment_id, &_lock)
             .unwrap_or(true);
+    _lock.verify_for(&config.state_dir)?;
     #[cfg(not(target_os = "linux"))]
     let collection_fenced = false;
     pass(config, &mut store, tools, network, now, collection_fenced)
