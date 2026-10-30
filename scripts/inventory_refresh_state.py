@@ -359,6 +359,22 @@ class Journal:
                 'observation_high_water':capabilities['observation']['high_water'],
                 'release_high_water':capabilities['release']['high_water']}
 
+    def admit_counter_proposal(self, epoch, capability, nonce, boot_id, now, policy):
+        """Durably admit an exact next nonce, without granting a reservation or start."""
+        self._locked()
+        if (capability not in ('refresh','observation') or not hexadecimal(epoch,32) or
+                not boot(boot_id) or not safe_integer(now) or not hexadecimal(policy,64)):
+            raise ValueError('Invalid counter proposal')
+        _,sequence=identity(nonce)
+        counters=self.counter_snapshot()
+        floor=(counters['refresh_high_water'] if capability=='refresh' else
+               max(counters['observation_high_water'],counters['release_high_water']))
+        if counters['root_epoch']!=epoch or not safe_integer(floor+1) or sequence!=floor+1:
+            raise ValueError('Stale or exhausted counter proposal')
+        if self.receive(capability,nonce,boot_id,now,policy)!='new':
+            raise ValueError('Counter proposal not admitted')
+        return 'new'
+
     def _decode_snapshot(self, marker, raw):
         if len(marker) != 32:
             raise ValueError('Helper initialized marker is invalid')

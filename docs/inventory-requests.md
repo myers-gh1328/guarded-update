@@ -86,6 +86,10 @@ The Root journal can produce a locked, read-only internal projection of its
 epoch and separate refresh, observation and release counters when no operation
 is active or globally unconfirmed. The projection is not published to the agent,
 does not reserve a nonce, and cannot initialize or authenticate an enrollment.
+An unregistered Root journal operation can admit a proposed exact next nonce
+against that locked snapshot. Its `received` record is durable but revocable;
+it authenticates neither the supplied context nor the agent and does not grant
+start authority. It has no runtime, client, CLI or provisioning entry point.
 
 ### Counter allocation integration boundary
 
