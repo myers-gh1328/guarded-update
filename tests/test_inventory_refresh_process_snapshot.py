@@ -77,6 +77,21 @@ class ProcessSnapshotTests(unittest.TestCase):
                 owner.close()
             finally:os.close(fd)
 
+    def test_matching_object_diagnostic_is_fixed_and_still_rejects(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp);proc=root/'123';proc.mkdir()
+            for name,raw in (('stat',self.stat),('status',self.status),('cgroup',self.cgroup),('mountinfo',self.mounts.replace(b' ro,nosuid',b' rw,nosuid'))):
+                (proc/name).write_bytes(raw)
+            fd=os.open(root,os.O_RDONLY|os.O_DIRECTORY);output=io.StringIO()
+            try:
+                owner=ProcessProbe._from_directory(fd,123,(0,27),time.monotonic()+2,owner=os.getuid())
+                def diagnostic(*args):owner._mount_detail='file_procs';return 'matching'
+                with patch.object(owner,'mount_diagnostic',side_effect=diagnostic),patch('inventory_refresh_process_snapshot.os.geteuid',return_value=0),patch.dict(os.environ,{'GITHUB_ACTIONS':'true'}),contextlib.redirect_stderr(output):
+                    with self.assertRaises(ValueError):owner.sample()
+                self.assertEqual(output.getvalue(),'Native fixture mount comparison=matching\nNative fixture mount object=file_procs\nNative fixture process probe stage=profile_mount_writable_root\n')
+                owner.close()
+            finally:os.close(fd)
+
     def test_hosted_failure_reports_only_fixed_probe_stage(self):
         with tempfile.TemporaryDirectory() as temp:
             root=Path(temp);proc=root/'123';proc.mkdir()

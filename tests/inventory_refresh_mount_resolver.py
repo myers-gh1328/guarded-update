@@ -14,7 +14,7 @@ class ResolutionError(ValueError):
     pass
 
 
-def resolve(root,path,deadline,mount_id):
+def _resolve(root,path,deadline,mount_id):
     owned=[];refs=[];failed=False;result=None;stage='validation'
     try:
         assert type(path) is str and path.startswith('/') and len(os.fsencode(path))<=1024
@@ -41,7 +41,8 @@ def resolve(root,path,deadline,mount_id):
             assert time.monotonic()<deadline
             assert identity(os.fstat(child))==expected==identity(os.stat(part,dir_fd=parent,follow_symlinks=False))
         assert mount_id(owned[-1])==first and time.monotonic()<deadline
-        result=first
+        kind='file' if stat.S_ISREG(os.fstat(owned[-1]).st_mode) else 'directory'
+        result=(first,kind)
     except OSError as error:
         failed=True
         if stage=='open':stage='open_missing' if error.errno==errno.ENOENT else 'open_denied' if error.errno in (errno.EACCES,errno.EPERM) else 'open_other'
@@ -53,6 +54,9 @@ def resolve(root,path,deadline,mount_id):
     if failed or time.monotonic()>=deadline:raise ResolutionError(stage)
     return result
 
+
+def resolve(root,path,deadline,mount_id):
+    return _resolve(root,path,deadline,mount_id)[0]
 
 def classify_detail(root,rows,deadline,mount_id):
     """Classify point samples only; different never proves a mount is hidden."""
@@ -69,12 +73,15 @@ def classify_detail(root,rows,deadline,mount_id):
             assert all(type(item) is bytes for item in options) and (b'ro' in options)!=(b'rw' in options)
             if filesystem==b'cgroup2' and b'rw' in options:candidates.append((identifier,path))
         stage='candidates';assert 0<len(candidates)<=64
-        matching=False
+        matches=[]
         for identifier,path in candidates:
-            stage='resolve';actual=resolve(root,path,deadline,mount_id)
-            if actual==identifier:matching=True
+            stage='resolve';actual,kind=_resolve(root,path,deadline,mount_id)
+            if actual==identifier:
+                name=path.rsplit('/',1)[-1]
+                category={'cgroup.procs':'procs','cgroup.threads':'threads','cgroup.subtree_control':'subtree'}.get(name,'other')
+                matches.append(kind+'_'+category)
         assert time.monotonic()<deadline
-        return ('matching' if matching else 'different'),'ok'
+        return ('matching',matches[0] if len(matches)==1 else 'multiple') if matches else ('different','ok')
     except ResolutionError as error:
         return 'unavailable',str(error) if str(error) in ('validation','root','open_missing','open_denied','open_other','identity','mount_id','recheck','close') else 'resolve'
     except BaseException:return 'unavailable',stage

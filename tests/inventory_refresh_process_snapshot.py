@@ -180,14 +180,15 @@ class ProcessProbe:
             assert namespace_id==ident(os.stat('mnt',dir_fd=ns,follow_symlinks=True))
             stage='classify';candidate,detail=classify_mounts(root,list(mount_rows(mountinfo).values()),self._deadline,_mount_id)
             assert candidate in ('matching','different','unavailable') and detail in ('ok','rows','candidates','resolve',
-                'validation','root','open_missing','open_denied','open_other','identity','mount_id','recheck','close')
+                'validation','root','open_missing','open_denied','open_other','identity','mount_id','recheck','close',
+                'file_procs','file_threads','file_subtree','file_other','directory_procs','directory_threads','directory_subtree','directory_other','multiple')
             stage='recheck';self._check();assert process_start_ticks(self._read('stat',8192),self._pid)==start
             assert os.readlink('root',dir_fd=self._process)=='/' and os.readlink('mnt',dir_fd=ns)==namespace_link
             assert namespace_id==ident(os.fstat(namespace))==ident(os.stat('mnt',dir_fd=ns,follow_symlinks=True))
             check=os.open('root',os.O_RDONLY|os.O_DIRECTORY|os.O_NONBLOCK,dir_fd=self._process);owned.append(check)
             assert root_id==ident(os.fstat(root))==ident(os.fstat(check))
             self._check();assert time.monotonic()<self._deadline
-            result=candidate;stage='classify_'+detail if candidate=='unavailable' else 'done'
+            result=candidate;stage='classify_'+detail if candidate=='unavailable' else detail
         except BaseException:failed=True
         finally:
             for fd in reversed(owned):
@@ -231,6 +232,8 @@ class ProcessProbe:
             finally:self._failed=True
             if comparison is not None:
                 print('Native fixture mount comparison='+comparison,file=sys.stderr)
+                if comparison=='matching' and self._mount_detail in ('file_procs','file_threads','file_subtree','file_other','directory_procs','directory_threads','directory_subtree','directory_other','multiple'):
+                    print('Native fixture mount object='+self._mount_detail,file=sys.stderr)
                 detail=self._mount_detail
                 allowed=('check','root_link','namespace_dir','namespace_link','namespace_open','root_open','identity','classify','recheck','close')
                 resolver=('ok','rows','candidates','resolve','validation','root','open_missing','open_denied','open_other','identity','mount_id','recheck','close')

@@ -81,6 +81,13 @@ class MountResolverTests(unittest.TestCase):
             self.assertEqual(resolver.resolve(root,'/sys/fs/cgroup/cgroup.procs',time.monotonic()+3,_mount_id),_mount_id(cgroup_file))
         finally:os.close(cgroup_file);os.close(target);os.close(root)
 
+    def test_matching_mount_reports_only_fixed_object_category(self):
+        (self.root/'a'/'cgroup.procs').write_bytes(b'')
+        (self.root/'a'/'confidential-name').mkdir()
+        def row(path):return {'id':7,'path':path,'fs':b'cgroup2','options':{b'rw'}}
+        self.assertEqual(resolver.classify_detail(self.fd,[row('/a/cgroup.procs')],time.monotonic()+1,lambda fd:7),('matching','file_procs'))
+        self.assertEqual(resolver.classify_detail(self.fd,[row('/a/confidential-name')],time.monotonic()+1,lambda fd:7),('matching','directory_other'))
+
     def test_unavailable_comparison_exposes_only_fixed_failure_category(self):
         row={'id':7,'path':'/secret-name','fs':b'cgroup2','options':{b'rw'}}
         result,detail=resolver.classify_detail(self.fd,[row],time.monotonic()+1,lambda fd:7)
