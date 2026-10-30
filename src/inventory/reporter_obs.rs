@@ -2264,6 +2264,14 @@ command(10,'await_receipt');response(10,'await_receipt','prepared',evidence=dict
                 .as_deref(),
             Some("1")
         );
+        let outcome = match std::env::var("GUARDED_UPDATE_CROSS_UID_MODE").as_deref() {
+            Ok("positive") => super::super::reporter_barrier::Outcome::Accepted,
+            Ok("epoch") => super::super::reporter_barrier::Outcome::Epoch,
+            Ok("floor") => super::super::reporter_barrier::Outcome::Floor,
+            Ok("replay") => super::super::reporter_barrier::Outcome::Replay,
+            Ok("lost") => super::super::reporter_barrier::Outcome::Lost,
+            _ => panic!("Invalid fixture outcome"),
+        };
         let deadline = Instant::now() + Duration::from_secs(18);
         let parent = super::super::reporter_request_fixture::FixedParent::fixed().unwrap();
         parent.verify().unwrap();
@@ -2326,8 +2334,10 @@ command(10,'await_receipt');response(10,'await_receipt','prepared',evidence=dict
             intent.observation_nonce(),
             "0000000000000008dddddddddddddddd"
         );
+        let sends = std::cell::Cell::new(0);
         let published = journal
             .publish_native_observation(intent, &clock(1002), &session, |nonce| {
+                sends.set(sends.get() + 1);
                 super::super::reporter_request_fixture::publish_checked(
                     parent.parent().map_err(|_| ERROR.to_owned())?,
                     0,
@@ -2344,13 +2354,20 @@ command(10,'await_receipt');response(10,'await_receipt','prepared',evidence=dict
             published.observation_nonce(),
             "0000000000000008dddddddddddddddd"
         );
+        assert_eq!(sends.get(), 1);
         // Root may consume the inbox only after this post-callback marker.
-        super::super::reporter_barrier::handshake(&std::io::stdin(), &std::io::stderr(), deadline)
-            .unwrap();
+        super::super::reporter_barrier::handshake_outcome(
+            &std::io::stdin(),
+            &std::io::stderr(),
+            deadline,
+            outcome,
+        )
+        .unwrap();
         assert_eq!(
             journal.recover_collection(None).unwrap(),
             super::super::requests::CollectionRecovery::Unfinished
         );
+        assert_eq!(sends.get(), 1);
         parent.verify().unwrap();
         parent.close().unwrap();
         assert!(Instant::now() < deadline);

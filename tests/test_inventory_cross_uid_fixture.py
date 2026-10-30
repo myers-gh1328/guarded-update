@@ -20,6 +20,21 @@ from inventory_refresh_io import Inbox
 
 
 class BindingTest(unittest.TestCase):
+    def test_fixture_responses_are_distinct_and_allow_no_arbitrary_bytes(self):
+        for response in (b'ACK-1\n', b'EPC-1\n', b'FLR-1\n', b'RPL-1\n', b''):
+            read_fd, write_fd = os.pipe()
+            try:
+                MODULE.write_outcome(write_fd, time.monotonic() + 5, response)
+                os.close(write_fd); write_fd = None
+                self.assertEqual(os.read(read_fd, 32), response)
+            finally:
+                os.close(read_fd)
+                if write_fd is not None: os.close(write_fd)
+        read_fd, write_fd = os.pipe()
+        try:
+            with self.assertRaises(ValueError): MODULE.write_outcome(write_fd, time.monotonic() + 5, b'other')
+        finally: os.close(read_fd); os.close(write_fd)
+
     def test_loaded_slice_config_must_be_exact_and_inactive(self):
         status = {'LoadState':'loaded', 'ActiveState':'inactive', 'Description':'fixture',
                   'InvocationID':'', 'ControlGroup':'', 'Delegate':'no',
@@ -387,14 +402,80 @@ class BindingTest(unittest.TestCase):
                         journal.initialize('b' * 32 if stale_epoch else MODULE.BINDING['epoch'])
                         state = journal.snapshot()
                         state['capabilities']['observation']['high_water'] = 7 if stale_epoch else 8
+                        state['capabilities']['release']['high_water'] = 7
                         journal._save(state)
                         before = journal.snapshot()
+                        before_bytes = journal._read('control.json')
                         with self.assertRaises(ValueError): MODULE.accept_after_marker(b'INVENTORY-BARRIER-1\n', fixture, journal, inbox)
                         self.assertEqual(journal.snapshot(), before)
+                        mode = 'epoch' if stale_epoch else 'floor'
+                        self.assertEqual(MODULE.accept_after_marker(b'INVENTORY-BARRIER-1\n', fixture, journal, inbox, mode),
+                                         b'EPC-1\n' if stale_epoch else b'FLR-1\n')
+                        self.assertEqual(journal.snapshot(), before)
+                        self.assertEqual(journal._read('control.json'), before_bytes)
+                        with patch.object(journal, 'admit_counter_proposal', side_effect=ValueError('unrelated')):
+                            with self.assertRaises(ValueError):
+                                MODULE.accept_after_marker(b'INVENTORY-BARRIER-1\n', fixture, journal, inbox, mode)
                 finally:
                     inbox.close()
                     fixture.close()
                     os.close(parent)
+
+    def test_replay_and_lost_reply_keep_one_unstarted_record(self):
+        for mode in ('replay', 'lost'):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as temporary:
+                parent = os.open(temporary, os.O_RDONLY | os.O_DIRECTORY)
+                fixture = MODULE.Fixture.create(parent, os.geteuid(), os.getegid(), time.monotonic() + 10)
+                journal = Journal(fixture.state, owner=os.geteuid())
+                inbox = Inbox(fixture.root, 'observation', os.geteuid(), os.getegid(), owner=os.geteuid())
+                try:
+                    fd = os.open('request', os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=fixture.observation)
+                    os.write(fd, MODULE.BINDING['nonce'].encode('ascii')); os.close(fd)
+                    with journal.exclusive():
+                        journal.initialize(MODULE.BINDING['epoch'])
+                        state = journal.snapshot()
+                        state['capabilities']['observation']['high_water'] = 7
+                        state['capabilities']['release']['high_water'] = 7
+                        journal._save(state)
+                        response = MODULE.accept_after_marker(b'INVENTORY-BARRIER-1\n', fixture, journal, inbox, mode)
+                        self.assertEqual(response, b'RPL-1\n' if mode == 'replay' else b'')
+                        state = journal.snapshot()
+                        active = state['capabilities']['observation']['active']
+                        self.assertEqual(state['capabilities']['observation']['high_water'], 8)
+                        self.assertEqual(active['correlator'], MODULE.BINDING['nonce'])
+                        self.assertEqual(active['phase'], 'received')
+                        self.assertIsNone(active['started_boottime_ms'])
+                        self.assertIsNone(state['capabilities']['observation']['terminal'])
+                finally:
+                    inbox.close(); fixture.close(); os.close(parent)
+
+    def test_unrelated_replay_error_never_counts_as_rejection(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            parent = os.open(temporary, os.O_RDONLY | os.O_DIRECTORY)
+            fixture = MODULE.Fixture.create(parent, os.geteuid(), os.getegid(), time.monotonic() + 10)
+            journal = Journal(fixture.state, owner=os.geteuid())
+            inbox = Inbox(fixture.root, 'observation', os.geteuid(), os.getegid(), owner=os.geteuid())
+            try:
+                fd = os.open('request', os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=fixture.observation)
+                os.write(fd, MODULE.BINDING['nonce'].encode('ascii')); os.close(fd)
+                with journal.exclusive():
+                    journal.initialize(MODULE.BINDING['epoch'])
+                    state = journal.snapshot()
+                    state['capabilities']['observation']['high_water'] = 7
+                    state['capabilities']['release']['high_water'] = 7
+                    journal._save(state)
+                    original = journal.admit_counter_proposal
+                    calls = []
+                    def reject_unrelated(*args):
+                        calls.append(1)
+                        if len(calls) == 2: raise ValueError('unrelated')
+                        return original(*args)
+                    with patch.object(journal, 'admit_counter_proposal', side_effect=reject_unrelated):
+                        with self.assertRaises(ValueError):
+                            MODULE.accept_after_marker(b'INVENTORY-BARRIER-1\n', fixture, journal, inbox, 'replay')
+                    self.assertEqual(len(calls), 2)
+            finally:
+                inbox.close(); fixture.close(); os.close(parent)
 
     def test_status_timeout_never_signals_the_owned_root_child(self):
         read_fd, write_fd = os.pipe()

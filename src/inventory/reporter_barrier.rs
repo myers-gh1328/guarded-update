@@ -77,6 +77,32 @@ pub(super) fn handshake<R: AsFd, W: AsFd>(
     source_output: &W,
     deadline: Instant,
 ) -> Result<(), &'static str> {
+    handshake_outcome(source_input, source_output, deadline, Outcome::Accepted)
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum Outcome {
+    Accepted,
+    Epoch,
+    Floor,
+    Replay,
+    Lost,
+}
+
+pub(super) fn handshake_outcome<R: AsFd, W: AsFd>(
+    source_input: &R,
+    source_output: &W,
+    deadline: Instant,
+    outcome: Outcome,
+) -> Result<(), &'static str> {
+    // These are fixture assertions, not Root acceptance or authority.
+    let expected: &[u8] = match outcome {
+        Outcome::Accepted => b"ACK-1\n",
+        Outcome::Epoch => b"EPC-1\n",
+        Outcome::Floor => b"FLR-1\n",
+        Outcome::Replay => b"RPL-1\n",
+        Outcome::Lost => b"",
+    };
     let mut input = None;
     let mut output = None;
     let mut originals = None;
@@ -162,7 +188,7 @@ pub(super) fn handshake<R: AsFd, W: AsFd>(
             verify(reader, writer)?;
         }
         verify(reader, writer)?;
-        if ack != b"ACK-1\n" {
+        if ack != expected {
             return Err(ERROR);
         }
         Ok(())
@@ -309,5 +335,62 @@ mod tests {
         .unwrap();
         drop(child.stdin.take());
         assert!(child.wait().unwrap().success());
+    }
+
+    #[test]
+    fn lost_reply_requires_clean_eof_after_marker() {
+        use std::process::{Command, Stdio};
+        use std::time::{Duration, Instant};
+        for (payload, accepted) in [("", true), ("x", false)] {
+            let program = format!(
+                "import sys; assert sys.stdin.buffer.readline()==b'INVENTORY-BARRIER-1\\n'; sys.stdout.buffer.write(b'{payload}'); sys.stdout.buffer.flush()"
+            );
+            let mut child = Command::new("/usr/bin/python3")
+                .args(["-I", "-B", "-S", "-c", &program])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let result = super::handshake_outcome(
+                child.stdout.as_ref().unwrap(),
+                child.stdin.as_ref().unwrap(),
+                Instant::now() + Duration::from_secs(3),
+                super::Outcome::Lost,
+            );
+            assert_eq!(result.is_ok(), accepted);
+            drop(child.stdin.take());
+            assert!(child.wait().unwrap().success());
+        }
+    }
+
+    #[test]
+    fn fixture_rejection_responses_must_match_the_specific_outcome() {
+        use std::process::{Command, Stdio};
+        use std::time::{Duration, Instant};
+        for (outcome, payload, accepted) in [
+            (super::Outcome::Epoch, "EPC-1\\n", true),
+            (super::Outcome::Floor, "FLR-1\\n", true),
+            (super::Outcome::Replay, "RPL-1\\n", true),
+            (super::Outcome::Epoch, "FLR-1\\n", false),
+        ] {
+            let program = format!(
+                "import sys; assert sys.stdin.buffer.readline()==b'INVENTORY-BARRIER-1\\n'; sys.stdout.buffer.write(b'{payload}'); sys.stdout.buffer.flush()"
+            );
+            let mut child = Command::new("/usr/bin/python3")
+                .args(["-I", "-B", "-S", "-c", &program])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let result = super::handshake_outcome(
+                child.stdout.as_ref().unwrap(),
+                child.stdin.as_ref().unwrap(),
+                Instant::now() + Duration::from_secs(3),
+                outcome,
+            );
+            assert_eq!(result.is_ok(), accepted);
+            drop(child.stdin.take());
+            assert!(child.wait().unwrap().success());
+        }
     }
 }

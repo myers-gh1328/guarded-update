@@ -450,7 +450,13 @@ def read_marker(fd, deadline, verify=lambda: None):
 
 
 def write_ack(fd, deadline, verify=lambda: None):
-    data = b'ACK-1\n'
+    write_outcome(fd, deadline, b'ACK-1\n', verify)
+
+
+def write_outcome(fd, deadline, data, verify=lambda: None):
+    if data not in (b'ACK-1\n', b'EPC-1\n', b'FLR-1\n', b'RPL-1\n', b''): raise ValueError(ERROR)
+    if time.monotonic() >= deadline: raise ValueError(ERROR)
+    verify()
     offset = 0
     poller = select.poll()
     poller.register(fd, select.POLLOUT | select.POLLHUP | select.POLLERR)
@@ -563,18 +569,48 @@ def _fixed_status(deadline, unit, properties):
     return parse_status(bytes(raw), properties)
 
 
-def accept_after_marker(marker, fixture, journal, inbox):
+def accept_after_marker(marker, fixture, journal, inbox, mode='positive'):
     """Synthetic-only coordinator admission; no start or caller authentication."""
-    if marker != b'INVENTORY-BARRIER-1\n': raise ValueError(ERROR)
+    if marker != b'INVENTORY-BARRIER-1\n' or mode not in ('positive', 'epoch', 'floor', 'replay', 'lost'): raise ValueError(ERROR)
     fixture.verify()
     if inbox.read() != (BINDING['nonce'], 8): raise ValueError(ERROR)
-    if journal.admit_counter_proposal(BINDING['epoch'], 'observation', BINDING['nonce'],
-        BINDING['enrollment'], 1001, BINDING['policy']) != 'new': raise ValueError(ERROR)
-    active = journal.snapshot()['capabilities']['observation']['active']
+    before = journal.snapshot()
+    before_bytes = journal._read('control.json')
+    counters = journal.counter_snapshot()
+    expected_epoch = 'b' * 32 if mode == 'epoch' else BINDING['epoch']
+    expected_floor = 8 if mode == 'floor' else 7
+    if (counters['root_epoch'] != expected_epoch or counters['observation_high_water'] != expected_floor or
+        counters['release_high_water'] != 7 or
+        any(item['active'] is not None or item['terminal'] is not None for item in before['capabilities'].values())):
+        raise ValueError(ERROR)
+    try:
+        admitted = journal.admit_counter_proposal(BINDING['epoch'], 'observation', BINDING['nonce'],
+            BINDING['enrollment'], 1001, BINDING['policy'])
+    except ValueError as error:
+        if (type(error) is not ValueError or error.args != ('Stale or exhausted counter proposal',) or
+            mode not in ('epoch', 'floor') or journal.snapshot() != before or journal._read('control.json') != before_bytes):
+            raise ValueError(ERROR) from None
+        fixture.verify()
+        return b'EPC-1\n' if mode == 'epoch' else b'FLR-1\n'
+    if admitted != 'new' or mode in ('epoch', 'floor'): raise ValueError(ERROR)
+    committed = journal.snapshot()
+    active = committed['capabilities']['observation']['active']
     if (type(active) is not dict or active.get('correlator') != BINDING['nonce'] or
         active.get('phase') != 'received' or active.get('started_boottime_ms') is not None):
         raise ValueError(ERROR)
+    if mode == 'replay':
+        committed_bytes = journal._read('control.json')
+        try:
+            journal.admit_counter_proposal(BINDING['epoch'], 'observation', BINDING['nonce'],
+                BINDING['enrollment'], 1001, BINDING['policy'])
+        except ValueError as error:
+            if type(error) is not ValueError or error.args != ('Helper counter snapshot unavailable',):
+                raise ValueError(ERROR) from None
+        else:
+            raise ValueError(ERROR)
+        if journal.snapshot() != committed or journal._read('control.json') != committed_bytes: raise ValueError(ERROR)
     fixture.verify()
+    return {'positive': b'ACK-1\n', 'replay': b'RPL-1\n', 'lost': b''}[mode]
 
 
 def parse_binding(raw):
@@ -746,8 +782,9 @@ class Fixture:
         if self._close_failed: raise ValueError(ERROR)
 
 
-def run(archive):
+def run(archive, mode='positive'):
     """Dedicated hosted test only. No production IPC, start or cleanup authority."""
+    if mode not in ('positive', 'epoch', 'floor', 'replay', 'lost'): raise ValueError(ERROR)
     if sys.platform != 'linux' or os.geteuid() != 0 or os.environ.get('GITHUB_ACTIONS') != 'true':
         raise ValueError(ERROR)
     root = Path(__file__).resolve().parents[1]
@@ -838,14 +875,14 @@ def run(archive):
         description = 'Synthetic cross-UID inventory CAS ' + secrets.token_hex(16)
         expected_group = '/command.slice/command-center.slice/command-center-inventory.slice/' + UNIT
         with journal.exclusive():
-            journal.initialize(BINDING['epoch'])
+            journal.initialize('b' * 32 if mode == 'epoch' else BINDING['epoch'])
             state = journal.snapshot()
-            state['capabilities']['observation']['high_water'] = 7
+            state['capabilities']['observation']['high_water'] = 8 if mode == 'floor' else 7
             state['capabilities']['release']['high_water'] = 7
             journal._save(state)
             args = ['/usr/bin/systemd-run', '--quiet', '--wait', '--pipe', '--unit=' + UNIT,
                 '--slice=command-center-inventory.slice', '--description=' + description,
-                '--setenv=GUARDED_UPDATE_CROSS_UID_PROOF=1']
+                '--setenv=GUARDED_UPDATE_CROSS_UID_PROOF=1', '--setenv=GUARDED_UPDATE_CROSS_UID_MODE=' + mode]
             for item in ('User=60002', 'Group=60002', 'Type=exec', 'Restart=no', 'RemainAfterExit=no',
                 'RuntimeMaxSec=20', 'TasksMax=8', 'NoNewPrivileges=yes', 'CapabilityBoundingSet=',
                 'AmbientCapabilities=', 'ProtectSystem=strict', 'ProtectHome=yes', 'ProtectControlGroups=yes',
@@ -917,7 +954,7 @@ def run(archive):
             fixture.verify(); parent_chain.verify(); group_chain.verify(); slice_chain.verify()
             reference.verify()
             stage = 'cas'
-            accept_after_marker(marker, fixture, journal, inbox)
+            response = accept_after_marker(marker, fixture, journal, inbox, mode)
             stage = 'process_recheck'
             if probe.sample() != start: raise ValueError(ERROR)
             observe_single_process(group_chain.fds[-2], UNIT, group_chain.fds[-1], pid, deadline)
@@ -927,7 +964,7 @@ def run(archive):
             reference.verify()
             probe.close(); probe = None
             stage = 'ack'
-            write_ack(launcher.stdin.fileno(), deadline, lambda: verify_endpoints(verified_endpoints))
+            write_outcome(launcher.stdin.fileno(), deadline, response, lambda: verify_endpoints(verified_endpoints))
             launcher.stdin.close(); launcher.stdin = None
             stage = 'completion'
             output = read_completion(launcher.stdout.fileno(), launcher.stderr.fileno(), deadline,
@@ -974,10 +1011,15 @@ def run(archive):
     if failed or not completed or time.monotonic() >= deadline:
         print('Synthetic cross-UID stage=' + stage, file=sys.stderr)
         raise ValueError(ERROR)
-    return {'synthetic_cross_uid_journal_cas_received_unstarted': True,
+    evidence = {'positive': 'synthetic_cross_uid_received_unstarted',
+                'epoch': 'synthetic_cross_uid_epoch_rejected',
+                'floor': 'synthetic_cross_uid_floor_rejected',
+                'replay': 'synthetic_cross_uid_root_cas_replay_rejected',
+                'lost': 'synthetic_cross_uid_lost_response_unfinished'}
+    return {evidence[mode]: True,
             'production_authority': False, 'all_producer_cleanup_proven': False}
 
 
 if __name__ == '__main__':
     if len(sys.argv) != 2: raise SystemExit(ERROR)
-    print(json.dumps(run(sys.argv[1]), sort_keys=True))
+    print(json.dumps(run(sys.argv[1], os.environ.get('GUARDED_UPDATE_CROSS_UID_MODE', '')), sort_keys=True))
