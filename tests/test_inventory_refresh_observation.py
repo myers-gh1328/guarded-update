@@ -373,5 +373,52 @@ class NativeObservationTests(unittest.TestCase):
         self.assertEqual(self.attempt(self.runtime/'guarded-update-executor.lock', 'executor'), 0)
 
 
+    def test_data_only_fingerprint_preserves_exact_v1_digest_without_kernel_locks(self):
+        with (patch.object(p.fcntl,'lockf',side_effect=AssertionError('No native lock acquisition')),
+              patch.object(p.fcntl,'flock',side_effect=AssertionError('No executor lock acquisition'))):
+            digest=p.installed_fingerprint(self.dpkg_fd,os.getuid(),1000,lambda:100)
+        self.assertEqual(digest,'4e68a6ad7e42d2732fefb99fc6365b4f63ed8b1d12086a9f6828f9f346ba9360')
+        os.fstat(self.dpkg_fd)
+
+    def test_standalone_hash_does_not_claim_lock_authority_or_release_another_guard(self):
+        with self.held(self.dpkg/'lock','native'):
+            self.assertEqual(len(p.installed_fingerprint(self.dpkg_fd,os.getuid(),1000,lambda:100)),64)
+            self.assertEqual(self.attempt(self.dpkg/'lock','native'),75)
+        guard=p.NativeReadLocks.acquire(self.dpkg_fd,self.runtime_fd,owner=os.getuid())
+        try:
+            self.assertEqual(p.installed_fingerprint(self.dpkg_fd,os.getuid(),1000,lambda:100),guard.fingerprint(1000,lambda:100))
+            self.assertEqual(self.attempt(self.dpkg/'lock','native'),75)
+            self.assertEqual(self.attempt(self.runtime/'guarded-update-executor.lock','executor'),75)
+        finally:guard.close()
+
+    def test_standalone_hash_failure_preserves_borrowed_directory_descriptor(self):
+        (self.dpkg/'status').chmod(0o666)
+        with self.assertRaises(p.ObservationError) as error:p.installed_fingerprint(self.dpkg_fd,os.getuid(),1000,lambda:100)
+        self.assertEqual(error.exception.reason,'state_inconsistent');os.fstat(self.dpkg_fd)
+
+    def test_root_hash_wraps_data_helper_with_both_physical_guard_checks(self):
+        guard=p.NativeReadLocks.acquire(self.dpkg_fd,self.runtime_fd,owner=os.getuid());events=[]
+        try:
+            with (patch.object(guard,'verify',side_effect=lambda:events.append('guard')),
+                  patch.object(p,'installed_fingerprint',side_effect=lambda *args:(events.append('hash'),'a'*64)[1])):
+                self.assertEqual(guard.fingerprint(1000,lambda:100),'a'*64)
+            self.assertEqual(events,['guard','hash','guard'])
+        finally:guard.close()
+
+
+    def test_root_hash_rechecks_deadline_after_final_physical_verification(self):
+        guard=p.NativeReadLocks.acquire(self.dpkg_fd,self.runtime_fd,owner=os.getuid());now=[1];count=0
+        def verifying():
+            nonlocal count
+            count+=1
+            if count==2:now[0]=101
+        try:
+            with (patch.object(guard,'verify',side_effect=verifying),
+                  patch.object(p,'installed_fingerprint',return_value='a'*64)):
+                with self.assertRaises(p.ObservationError) as error:guard.fingerprint(100,lambda:now[0])
+            self.assertEqual(error.exception.reason,'lease_expired')
+        finally:guard.close()
+
+
 if __name__ == '__main__':
     unittest.main()

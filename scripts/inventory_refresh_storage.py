@@ -18,6 +18,36 @@ MAX_MANIFEST = 4 * 1024 * 1024
 MAX_FILES = 8192
 MANIFEST = '_inventory-manifest.json'
 LEASE = '_inventory-lease'
+READER_DIRECTORY = '_inventory-reader'
+MAX_READER_BYTES = 4 * 1024 * 1024
+READER_FILES = ('apt.conf','sources.sources','preferences','empty-main.conf','empty-trusted.gpg','empty-auth.conf')
+
+
+class ReaderProjection:
+    """Immutable noncredential bytes bound to one root-selected publication."""
+    __slots__=('_generation','_policy','_files')
+    def __new__(cls,*args,**kwargs):raise TypeError('Use admitted reader policy rendering')
+    @classmethod
+    def _from_policy(cls,generation,policy,files):
+        token(generation)
+        if (cls is not ReaderProjection or type(policy) is not str or re.fullmatch('[0-9a-f]{64}',policy) is None or
+                type(files) is not tuple or len(files)!=len(READER_FILES) or
+                tuple(name for name,_ in files)!=READER_FILES or
+                any(type(raw) is not bytes for _,raw in files) or
+                sum(len(raw) for _,raw in files)>MAX_READER_BYTES or
+                any(raw for name,raw in files if name.startswith('empty-'))):
+            raise ValueError('Invalid admitted reader projection')
+        value=object.__new__(cls)
+        object.__setattr__(value,'_generation',generation);object.__setattr__(value,'_policy',policy)
+        object.__setattr__(value,'_files',files);return value
+    @property
+    def cache_generation(self):return self._generation
+    @property
+    def policy_generation(self):return self._policy
+    @property
+    def files(self):return self._files
+    def __setattr__(self,*_):raise AttributeError('Reader projection is immutable')
+    def __repr__(self):return '<ReaderProjection admitted-data-redacted>'
 
 
 def name(value):
@@ -167,13 +197,16 @@ class Store(CacheReader):
         finally:
             os.close(fd)
 
-    def publish(self, staging_token, generation_token, policy, checked_at):
+    def publish(self, staging_token, generation_token, policy, checked_at, *, reader_projection=None):
         token(staging_token)
         token(generation_token)
         if (type(policy) is not str or not re.fullmatch('[0-9a-f]{64}', policy) or
                 type(checked_at) is not str or not re.fullmatch(
                     r'[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]{1,6})?Z', checked_at)):
             raise ValueError('Invalid inventory publication evidence')
+        if reader_projection is not None and (type(reader_projection) is not ReaderProjection or
+                reader_projection.cache_generation!=generation_token or reader_projection.policy_generation!=policy):
+            raise ValueError('Reader projection does not bind publication')
         stage = opened(self.fd, 'staging-'+staging_token, self.worker, directory=True)
         directory = None
         try:
@@ -182,6 +215,7 @@ class Store(CacheReader):
                         'policy_generation': policy, 'successful_checked_at': checked_at, 'files': []}
             count = [0, 0]
             self._seal(directory, '', manifest['files'], count, 0)
+            if reader_projection is not None:self._reader(directory,reader_projection,manifest['files'],count)
             data = encode(manifest)
             self._new_file(directory, MANIFEST, data, MAX_MANIFEST)
             self._new_file(directory, LEASE, b'', 0)
@@ -212,12 +246,32 @@ class Store(CacheReader):
                 os.close(directory)
             os.close(stage)
 
+    def _reader(self,directory,projection,files,counts):
+        added=len(projection.files)+2;size=sum(len(raw) for _,raw in projection.files)
+        if counts[0]+added>MAX_FILES or counts[1]+size>MAX_GENERATION:
+            raise ValueError('Reader projection exceeds generation bounds')
+        os.mkdir(READER_DIRECTORY,0o700,dir_fd=directory)
+        reader=opened(directory,READER_DIRECTORY,self.uid,directory=True)
+        try:
+            os.mkdir('empty.d',0o700,dir_fd=reader)
+            empty=opened(reader,'empty.d',self.uid,directory=True)
+            try:
+                os.fchown(empty,self.uid,self.gid);os.fchmod(empty,0o550);os.fsync(empty)
+            finally:os.close(empty)
+            for entry,raw in projection.files:
+                self._new_file(reader,entry,raw,MAX_READER_BYTES)
+                files.append({'path':READER_DIRECTORY+'/'+entry,'size':len(raw),'sha256':hashlib.sha256(raw).hexdigest()})
+            os.fchown(reader,self.uid,self.gid);os.fchmod(reader,0o550);os.fsync(reader)
+            counts[0]+=added;counts[1]+=size
+        finally:os.close(reader)
+
     def _seal(self, directory, prefix, files, counts, depth):
         entries = sorted(os.listdir(directory))
         if depth > 4 or len(entries) > MAX_FILES:
             raise ValueError('Inventory generation exceeds traversal bounds')
         for entry in entries:
             name(entry)
+            if prefix=='' and entry==READER_DIRECTORY:raise ValueError('Worker supplied reserved reader metadata')
             if entry in [MANIFEST, LEASE]:
                 raise ValueError('Worker supplied reserved publication metadata')
             metadata = os.stat(entry, dir_fd=directory, follow_symlinks=False)

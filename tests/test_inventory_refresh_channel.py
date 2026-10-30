@@ -61,6 +61,23 @@ class ChannelTests(unittest.TestCase):
         self.parent.write_release(value)
         return value
 
+    def test_result_replaced_during_read_is_detected_without_retry(self):
+        result=self.root/'results'/'result.json';replacement=self.root/'results'/'replacement'
+        result.write_bytes(b'old-result');result.chmod(0o600)
+        replacement.write_bytes(b'new-result');replacement.chmod(0o600)
+        actual=os.read;replaced=[]
+        def read_then_replace(fd,limit):
+            raw=actual(fd,limit)
+            if raw and not replaced:
+                old=os.fstat(fd);os.replace(replacement,result);after=os.fstat(fd)
+                replaced.append((old.st_ino,old.st_nlink,after.st_nlink,result.stat().st_ino))
+            return raw
+        with patch('inventory_refresh_channel.os.read',side_effect=read_then_replace):
+            with self.assertRaises(ChannelError):self.child._read_file(self.fds[2],'result.json',0o600)
+        self.assertEqual(len(replaced),1)
+        self.assertEqual(replaced[0][1:3],(1,0));self.assertNotEqual(replaced[0][0],replaced[0][3])
+        self.assertEqual(result.read_bytes(),b'new-result')
+
     def test_readonly_control_and_writable_results_cannot_alias_same_directory(self):
         with self.assertRaises(ValueError):
             channel=ObservationChannel(self.fds[1],self.fds[1],owner=os.getuid())

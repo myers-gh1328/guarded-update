@@ -150,6 +150,14 @@ pub fn atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
         .map_err(|_| "Cannot persist state directory".into())
 }
 
+pub fn encode_report(report: &Value) -> Result<Vec<u8>, String> {
+    let bytes = serde_json::to_vec(report).map_err(|_| "Cannot encode inventory")?;
+    if bytes.len() > MAX_REPORT {
+        return Err("Inventory report exceeds 8 MiB encoded limit".into());
+    }
+    Ok(bytes)
+}
+
 pub struct Store {
     pub dir: PathBuf,
     pub schedule: Schedule,
@@ -213,11 +221,36 @@ impl Store {
         Ok(Some(report))
     }
     pub fn replace(&mut self, report: &Value, now: u64) -> Result<(), String> {
-        let bytes = serde_json::to_vec(report).map_err(|_| "Cannot encode inventory")?;
+        let bytes = encode_report(report)?;
+        self.replace_encoded(&bytes, now)
+    }
+    pub fn replace_encoded(&mut self, bytes: &[u8], now: u64) -> Result<(), String> {
         if bytes.len() > MAX_REPORT {
             return Err("Inventory report exceeds 8 MiB encoded limit".into());
         }
-        atomic(&self.dir.join("latest.json"), &bytes)?;
+        let report: Value =
+            serde_json::from_slice(bytes).map_err(|_| "Invalid encoded inventory")?;
+        let sequence = report["sequence"]
+            .as_u64()
+            .filter(|value| *value > 0 && *value <= self.schedule.sequence)
+            .ok_or("Report sequence was not durably reserved")?;
+        if report["enrollment_id"] != self.schedule.enrollment_id {
+            return Err("Report enrollment does not match retained state".into());
+        }
+        if let Some(prior) = self.latest()? {
+            let prior_sequence = prior["sequence"]
+                .as_u64()
+                .ok_or("Latest report sequence invalid")?;
+            if sequence < prior_sequence
+                || sequence == prior_sequence
+                    && read(&self.dir.join("latest.json"), MAX_REPORT)? != bytes
+            {
+                return Err(
+                    "Retained report identity or bytes cannot be replaced by stale content".into(),
+                );
+            }
+        }
+        atomic(&self.dir.join("latest.json"), bytes)?;
         self.schedule.collected_at_secs = now;
         let jitter = u64::from_str_radix(&super::transport::random_hex(2)?, 16)
             .map_err(|_| "Collection jitter unavailable")?
@@ -244,6 +277,8 @@ fn nofollow(options: &mut OpenOptions) {
 }
 pub struct Lock {
     _file: File,
+    directory: PathBuf,
+    poisoned: std::sync::atomic::AtomicBool,
 }
 impl Drop for Lock {
     fn drop(&mut self) {
@@ -255,6 +290,13 @@ impl Drop for Lock {
 }
 impl Lock {
     pub fn acquire(dir: &Path) -> Result<Self, String> {
+        Self::acquire_with(dir, |_| {}, |_, _| {})
+    }
+    fn acquire_with(
+        dir: &Path,
+        after_open: impl FnOnce(&Path),
+        after_lock: impl FnOnce(&Path, &File),
+    ) -> Result<Self, String> {
         protected(dir, true)?;
         let path = dir.join("running.lock");
         let mut options = OpenOptions::new();
@@ -268,10 +310,76 @@ impl Lock {
         let file = options
             .open(&path)
             .map_err(|_| "Inventory lock unavailable")?;
+        after_open(&path);
         protected(&path, false)?;
+        Self::check_identity(&file, &path)?;
         file.try_lock()
             .map_err(|_| "Inventory agent already running")?;
-        Ok(Self { _file: file })
+        // Construct the guard before the second check so failure explicitly
+        // unlocks even if another descriptor inherited this open description.
+        let guard = Self {
+            _file: file,
+            directory: dir.to_owned(),
+            poisoned: std::sync::atomic::AtomicBool::new(false),
+        };
+        after_lock(&path, &guard._file);
+        protected(&path, false)?;
+        Self::check_identity(&guard._file, &path)?;
+        Ok(guard)
+    }
+    /// Sample the original held/named lock identity; not a kernel lock witness.
+    pub(super) fn verify_for(&self, dir: &Path) -> Result<(), String> {
+        use std::sync::atomic::Ordering;
+        if self.poisoned.load(Ordering::SeqCst) {
+            return Err("Inventory lock state uncertain".into());
+        }
+        let valid = dir == self.directory
+            && protected(dir, true).is_ok()
+            && protected(&self.directory.join("running.lock"), false).is_ok()
+            && Self::check_identity(&self._file, &self.directory.join("running.lock")).is_ok();
+        if !valid {
+            self.poisoned.store(true, Ordering::SeqCst);
+            return Err("Inventory lock state uncertain".into());
+        }
+        if self.poisoned.load(Ordering::SeqCst) {
+            return Err("Inventory lock state uncertain".into());
+        }
+        Ok(())
+    }
+    fn check_identity(file: &File, path: &Path) -> Result<(), String> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            unsafe extern "C" {
+                fn geteuid() -> u32;
+            }
+            let held = file.metadata().map_err(|_| "Inventory lock unavailable")?;
+            let named = fs::symlink_metadata(path).map_err(|_| "Inventory lock unavailable")?;
+            let identity = |value: &fs::Metadata| {
+                (
+                    value.dev(),
+                    value.ino(),
+                    value.uid(),
+                    value.mode(),
+                    value.nlink(),
+                )
+            };
+            // SAFETY: geteuid reads the current process identity and takes no arguments.
+            let uid = unsafe { geteuid() };
+            if !held.is_file()
+                || !named.is_file()
+                || named.file_type().is_symlink()
+                || held.uid() != uid
+                || held.mode() & 0o077 != 0
+                || held.nlink() != 1
+                || identity(&held) != identity(&named)
+            {
+                return Err("Inventory lock changed during admission".into());
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = (file, path);
+        Ok(())
     }
 }
 
@@ -303,6 +411,55 @@ pub(super) mod tests {
         }
     }
     #[test]
+    fn encoded_publication_never_rewinds_sequence_changes_scope_or_mutates_bound_bytes() {
+        let temp = TestDir::new();
+        Store::initialize(&temp.0, "epoch").unwrap();
+        let mut store = Store::load(&temp.0, "epoch").unwrap();
+        let first = br#"{"enrollment_id":"epoch","sequence":1,"report_id":"one"}"#;
+        assert!(store.replace_encoded(first, 1).is_err());
+        store.reserve().unwrap();
+        store.replace_encoded(first, 1).unwrap();
+        store.reserve().unwrap();
+        let second = br#"{"enrollment_id":"epoch","sequence":2,"report_id":"two"}"#;
+        store.replace_encoded(second, 2).unwrap();
+        for invalid in [
+            first.as_slice(),
+            br#"{"enrollment_id":"other","sequence":2,"report_id":"two"}"#,
+            br#"{"enrollment_id":"epoch","sequence":3,"report_id":"three"}"#,
+            br#"{"enrollment_id":"epoch","sequence":2,"report_id":"changed"}"#,
+        ] {
+            assert!(store.replace_encoded(invalid, 3).is_err());
+            assert_eq!(
+                read(&temp.0.join("latest.json"), MAX_REPORT).unwrap(),
+                second
+            );
+        }
+        assert_eq!(
+            store
+                .replace_encoded(&vec![b' '; MAX_REPORT + 1], 3)
+                .unwrap_err(),
+            "Inventory report exceeds 8 MiB encoded limit"
+        );
+    }
+    #[test]
+    fn exact_encoded_report_replaces_the_single_latest_body_without_reserialization() {
+        let temp = TestDir::new();
+        Store::initialize(&temp.0, "epoch").unwrap();
+        let mut store = Store::load(&temp.0, "epoch").unwrap();
+        store.reserve().unwrap();
+        let bytes=b"{ \"enrollment_id\": \"epoch\", \"sequence\":1, \"report_id\":\"synthetic-report\", \"collection_request_id\":\"00000000-0000-4000-8000-000000000001\" }";
+        store.replace_encoded(bytes, 100).unwrap();
+        assert_eq!(
+            read(&temp.0.join("latest.json"), MAX_REPORT).unwrap(),
+            bytes
+        );
+        assert_eq!(
+            store.latest().unwrap().unwrap()["report_id"],
+            "synthetic-report"
+        );
+        assert_eq!(fs::read_dir(&temp.0).unwrap().count(), 2);
+    }
+    #[test]
     fn sequence_reservation_survives_interrupted_collection_and_latest_replaces() {
         let temp = TestDir::new();
         Store::initialize(&temp.0, "epoch").unwrap();
@@ -328,6 +485,80 @@ pub(super) mod tests {
         assert_eq!(fs::read_dir(&temp.0).unwrap().count(), 2);
         assert!(Store::initialize(&temp.0, "epoch").is_err());
         assert!(Store::load(&temp.0, "other-epoch").is_err());
+    }
+    #[test]
+    #[cfg(unix)]
+    fn lock_rejects_replacement_between_open_and_named_admission() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = TestDir::new();
+        let result = Lock::acquire_with(
+            &temp.0,
+            |path| {
+                fs::rename(path, temp.0.join("old.lock")).unwrap();
+                fs::write(path, b"").unwrap();
+                fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+            },
+            |_, _| {},
+        );
+        assert!(result.is_err());
+        // The rejected old inode must not retain the advisory lock.
+        let old = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(temp.0.join("old.lock"))
+            .unwrap();
+        assert!(old.try_lock().is_ok());
+        assert!(Lock::acquire(&temp.0).is_ok());
+    }
+    #[test]
+    #[cfg(unix)]
+    fn lock_rejects_replacement_after_flock_and_unlocks_inherited_description() {
+        use std::cell::RefCell;
+        use std::os::unix::fs::PermissionsExt;
+        let temp = TestDir::new();
+        let inherited = RefCell::new(None);
+        let result = Lock::acquire_with(
+            &temp.0,
+            |_| {},
+            |path, file| {
+                *inherited.borrow_mut() = Some(file.try_clone().unwrap());
+                fs::rename(path, temp.0.join("old.lock")).unwrap();
+                fs::write(path, b"").unwrap();
+                fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+            },
+        );
+        assert!(result.is_err());
+        let old = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(temp.0.join("old.lock"))
+            .unwrap();
+        assert!(old.try_lock().is_ok());
+        assert!(Lock::acquire(&temp.0).is_ok());
+        drop(inherited);
+    }
+    #[test]
+    #[cfg(unix)]
+    fn lock_rejects_hardlinked_lock_file() {
+        let temp = TestDir::new();
+        drop(Lock::acquire(&temp.0).unwrap());
+        fs::hard_link(temp.0.join("running.lock"), temp.0.join("alias.lock")).unwrap();
+        assert!(Lock::acquire(&temp.0).is_err());
+    }
+    #[test]
+    #[cfg(unix)]
+    fn lock_replacement_poison_is_absorbing_even_if_original_is_restored() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = TestDir::new();
+        let lock = Lock::acquire(&temp.0).unwrap();
+        let path = temp.0.join("running.lock");
+        fs::rename(&path, temp.0.join("old.lock")).unwrap();
+        fs::write(&path, b"").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(lock.verify_for(&temp.0).is_err());
+        fs::remove_file(&path).unwrap();
+        fs::rename(temp.0.join("old.lock"), &path).unwrap();
+        assert!(lock.verify_for(&temp.0).is_err());
     }
     #[test]
     fn advisory_lock_releases_without_removing_lock_file() {

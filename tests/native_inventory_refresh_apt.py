@@ -9,6 +9,7 @@ from datetime import datetime, timedelta, timezone
 import email.utils
 import errno
 import functools
+import fcntl
 import gzip
 import hashlib
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
@@ -30,9 +31,18 @@ import subprocess
 import sys
 import threading
 import time
+import tempfile
+
+from inventory_refresh_artifact_fixture import verify_archive
+from inventory_refresh_reporter_fixture_files import FixtureSources
+from inventory_refresh_rust_native_admission import RunnerArtifact
+from inventory_refresh_rust_parent_fixture import FixtureBinary
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT/'scripts'))
+from inventory_refresh_resources import _Chain
+from inventory_refresh_cgroup_witness import observe_single_process
+from inventory_refresh_process_snapshot import ProcessProbe
 from inventory_refresh_policy import parse_policy, render_policy, policy_generation, POLICY_ROOT, CACHE_ROOT, RUNTIME_ROOT, STATE_ROOT
 from inventory_refresh_storage import Store
 from inventory_refresh_worker import validate_kernel_identity
@@ -869,8 +879,980 @@ finally:
 """
 
 
-def prove_actual_coordinator_entry_loop():
+
+PROJECTED_READER_CODE=r"""import fcntl,hashlib,json,os,re,stat,subprocess,sys,time,types
+assert len(sys.argv)==6 and re.fullmatch('[0-9a-f]{32}',sys.argv[1]) and re.fullmatch('[0-9a-f]{64}',sys.argv[2])
+assert re.fullmatch('[0-9a-f-]{36}',sys.argv[3]) and re.fullmatch('[0-9]+',sys.argv[4]) and re.fullmatch('[0-9a-f]{32}',sys.argv[5])
+deadline=int(sys.argv[4]);assert 0<deadline<=9007199254740991
+assert open('/proc/sys/kernel/random/boot_id').read().strip()==sys.argv[3]
+previous=None
+def clock():
+ global previous
+ now=time.clock_gettime_ns(time.CLOCK_BOOTTIME)//1000000
+ assert (previous is None or now>=previous) and now<=deadline
+ previous=now;return now
+scan_started=clock()
+fields=dict(line.split(':',1) for line in open('/proc/self/status').read().splitlines())
+assert all(fields[key].split()==['60002']*4 for key in ('Uid','Gid'))
+assert fields['Groups'].split() in ([],['60002']) and fields['NoNewPrivs'].split()==['1']
+assert all(int(fields[key].strip(),16)==0 for key in ('CapInh','CapPrm','CapEff','CapBnd','CapAmb'))
+assert open('/proc/self/cgroup').read()=='0::/command.slice/command-center.slice/command-center-inventory.slice/command-center-inventory-reader-proof.service\n'
+stage='private_inputs'
+for path in ('/etc/command-center-inventory-refresh/policy.json','/etc/command-center-inventory-refresh/policy-commitment.key','/etc/command-center-inventory-refresh/apt/auth.conf'):
+ try:fd=os.open(path,os.O_RDONLY|os.O_NOFOLLOW)
+ except PermissionError:pass
+ else:
+  os.close(fd);raise ValueError('Root private reader boundary failed')
+stage='generation';fds=[];lease=None;dpkg=None
+try:
+ fd=os.open('/',os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW);fds.append(fd)
+ for part in ('var','cache','command-center-inventory-refresh','generation-'+sys.argv[1]):
+  child=os.open(part,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW,dir_fd=fd);fds.append(child);fd=child
+  info=os.fstat(fd);assert stat.S_ISDIR(info.st_mode) and info.st_uid==0 and not info.st_mode&0o022
+ generation=fd;device=os.fstat(generation).st_dev
+ def read(directory,name,limit):
+  fd=os.open(name,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK,dir_fd=directory)
+  try:
+   info=os.fstat(fd);assert stat.S_ISREG(info.st_mode) and info.st_uid==0 and not info.st_mode&0o022 and info.st_nlink==1 and info.st_dev==device and info.st_size<=limit
+   raw=b''
+   while True:
+    part=os.read(fd,min(65536,limit+1-len(raw)))
+    if not part:break
+    raw+=part;assert len(raw)<=limit
+   assert len(raw)==info.st_size;return raw
+  finally:os.close(fd)
+ lease=os.open('_inventory-lease',os.O_RDONLY|os.O_NOFOLLOW,dir_fd=generation)
+ info=os.fstat(lease);assert stat.S_ISREG(info.st_mode) and info.st_uid==0 and not info.st_mode&0o022 and info.st_nlink==1 and info.st_dev==device
+ fcntl.flock(lease,fcntl.LOCK_SH|fcntl.LOCK_NB)
+ stage='manifest'
+ manifest=json.loads(read(generation,'_inventory-manifest.json',4*1024*1024))
+ assert manifest['cache_generation']==sys.argv[1] and manifest['policy_generation']==sys.argv[2]
+ reader=os.open('_inventory-reader',os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW,dir_fd=generation);fds.append(reader)
+ info=os.fstat(reader);assert info.st_uid==0 and not info.st_mode&0o022 and info.st_dev==device
+ stage='config'
+ for name in ('apt.conf','sources.sources','preferences','empty-main.conf','empty-trusted.gpg','empty-auth.conf'):
+  raw=read(reader,name,4*1024*1024);rows=[row for row in manifest['files'] if row['path']=='_inventory-reader/'+name]
+  assert len(rows)==1 and rows[0]['sha256']==hashlib.sha256(raw).hexdigest() and rows[0]['size']==len(raw)
+  assert b'synthetic-proof-password' not in raw and b'password ' not in raw
+ stage='helper_source';source_refs=[]
+ fd=fds[0]
+ for part in ('usr','local','libexec','command-center-inventory-refresh'):
+  child=os.open(part,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW,dir_fd=fd);fds.append(child);source_refs.append((fd,part,child));fd=child
+  info=os.fstat(fd);assert stat.S_ISDIR(info.st_mode) and info.st_uid==0 and not info.st_mode&0o022
+ source='inventory_refresh_observation.py';source_fd=os.open(source,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK,dir_fd=fd)
+ def stable(info):return (info.st_dev,info.st_ino,info.st_uid,info.st_gid,info.st_mode,info.st_nlink,info.st_size,info.st_mtime_ns,info.st_ctime_ns)
+ try:
+  info=os.fstat(source_fd);assert stat.S_ISREG(info.st_mode) and info.st_uid==0 and not info.st_mode&0o022 and info.st_nlink==1 and 0<info.st_size<=65536
+  raw=b''
+  while True:
+   chunk=os.read(source_fd,65537-len(raw))
+   if not chunk:break
+   raw+=chunk;assert len(raw)<=65536
+  assert len(raw)==info.st_size
+  path='/usr/local/libexec/command-center-inventory-refresh/'+source
+  compiled=compile(raw,path,'exec',dont_inherit=True)
+  assert stable(os.fstat(source_fd))==stable(info)==stable(os.stat(source,dir_fd=fd,follow_symlinks=False))
+  for parent,part,child in source_refs:
+   named=os.stat(part,dir_fd=parent,follow_symlinks=False);opened=os.fstat(child)
+   assert stat.S_ISDIR(named.st_mode) and named.st_uid==0 and not named.st_mode&0o022 and (named.st_dev,named.st_ino)==(opened.st_dev,opened.st_ino)
+  name='inventory_refresh_observation';assert name not in sys.modules
+  observation=types.ModuleType(name);observation.__file__=path;sys.modules[name]=observation
+  exec(compiled,observation.__dict__)
+ finally:os.close(source_fd)
+ dpkg=observation._Ancestry.open(fds[0],('var','lib','dpkg'));dpkg.verify()
+ stage='installed_before'
+ installed_before=observation.installed_fingerprint(dpkg.fds[-1],0,deadline,clock)
+ config='/var/cache/command-center-inventory-refresh/generation-'+sys.argv[1]+'/_inventory-reader/apt.conf'
+ env={'PATH':'/usr/sbin:/usr/bin:/sbin:/bin','LC_ALL':'C','LANG':'C','APT_CONFIG':config}
+ stage='query'
+ result=subprocess.run(['/usr/bin/apt-cache','policy','inventory-proof'],env=env,cwd='/',stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,timeout=10)
+ stage='query_result'
+ assert result.returncode==0 and len(result.stdout)<=65536
+ stage='candidate'
+ assert re.search(rb'(?m)^\s*Candidate: 1\.0\s*$',result.stdout)
+ stage='pin'
+ assert re.search(rb'(?m)^\s*(?:\*\*\*\s+)?1\.0\s+123\s*$',result.stdout)
+ stage='installed_after'
+ installed_after=observation.installed_fingerprint(dpkg.fds[-1],0,deadline,clock);dpkg.verify()
+ assert installed_before==installed_after
+ scan_finished=clock()
+ print(json.dumps({'schema_version':1,'observation_nonce':sys.argv[5],'boot_id':sys.argv[3],
+  'cache_generation':sys.argv[1],'policy_generation':sys.argv[2],'scan_started_boottime_ms':scan_started,
+  'scan_finished_boottime_ms':scan_finished,'installed_before_sha256':installed_before,'installed_after_sha256':installed_after},sort_keys=True))
+finally:
+ try:
+  if dpkg is not None:dpkg.close()
+ finally:
+  try:
+   if lease is not None:os.close(lease)
+  finally:
+   for fd in reversed(fds):os.close(fd)
+"""
+
+
+def projected_reader_program():
+    # Controlled stage/kind only: no exception text, APT output or policy bytes.
+    return "import json,sys\nstage='identity'\ntry:\n"+''.join(' '+line+'\n' for line in PROJECTED_READER_CODE.splitlines())+"except BaseException as error:\n allowed=('identity','private_inputs','generation','manifest','config','query','query_result','candidate','pin','helper_source','installed_before','installed_after')\n kind=type(error).__name__\n print('projected_reader_failure='+json.dumps({'stage':stage if stage in allowed else 'unknown','kind':kind if kind in ('AssertionError','OSError','ValueError','PermissionError','FileNotFoundError','TimeoutExpired') else 'unclassified'},sort_keys=True),file=sys.stderr)\n raise SystemExit(74)\n"
+
+
+def prove_projected_reader_query(offer):
+    """Actual non-acquiring apt-cache under the aggregate and restricted UID."""
+    unit='command-center-inventory-reader-proof.service'
+    args=['/usr/bin/systemd-run','--quiet','--wait','--collect','--pipe','--unit='+unit,'--slice='+PARENT_SLICE]
+    for value in ('User=60002','Group=60002','Type=exec','ExitType=main','Restart=no','RemainAfterExit=no',
+        'KillMode=control-group','KillSignal=SIGKILL','TimeoutStopSec=1','RuntimeMaxSec=15','OOMPolicy=kill',
+        'MemoryAccounting=yes','TasksMax=8','NoNewPrivileges=yes','CapabilityBoundingSet=','AmbientCapabilities=',
+        'ProtectSystem=strict','ProtectHome=yes','ProtectControlGroups=yes','PrivateDevices=yes','PrivateTmp=yes','PrivateNetwork=yes'):
+        args+=['-p',value]
+    args+=['/usr/bin/python3','-I','-B','-S','-c',projected_reader_program(),offer['cache_generation'],offer['policy_generation'],offer['boot_id'],str(offer['expires_boottime_ms']),offer['nonce']]
+    result=subprocess.run(args,env=ENV,stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=20)
+    if result.returncode:
+        lines=[line.decode('ascii') for line in result.stderr.splitlines() if line.startswith(b'projected_reader_failure=') and len(line)<=256]
+        raise ValueError('Projected native reader failed: '+str(result.returncode)+' '+(' '.join(lines[:1])))
+    assert len(result.stdout)<=2048
+    return json.loads(result.stdout)
+
+def match_projected_reader_receipt(offer,reader,receipt):
+    fields={'schema_version','observation_nonce','boot_id','cache_generation','policy_generation',
+        'scan_started_boottime_ms','scan_finished_boottime_ms','installed_before_sha256','installed_after_sha256'}
+    assert type(reader) is dict and set(reader)==fields and type(reader['schema_version']) is int and reader['schema_version']==1
+    for field in ('boot_id','cache_generation','policy_generation'):assert reader[field]==offer[field]
+    assert reader['observation_nonce']==offer['nonce'] and all(receipt[key]==value for key,value in offer.items())
+    assert receipt['outcome']=='released'
+    values=[reader['installed_before_sha256'],reader['installed_after_sha256'],receipt['installed_before_sha256'],receipt['installed_after_sha256']]
+    assert all(type(value) is str and re.fullmatch('[0-9a-f]{64}',value) for value in values) and len(set(values))==1
+    times=[reader['scan_started_boottime_ms'],reader['scan_finished_boottime_ms']]
+    assert all(type(value) is int and 0<=value<=9007199254740991 for value in times)
+    assert offer['lock_open_boottime_ms']<=times[0]<=times[1]<=receipt['lock_held_until_boottime_ms']<=receipt['released_boottime_ms']<=offer['expires_boottime_ms']
+    return True
+
+
+def decode_reporter_phase(raw,expected):
+    def require(condition):
+        if not condition:raise ValueError('Invalid restricted reporter phase')
+    require(type(raw) is bytes and 0<len(raw)<=4096 and raw.endswith(b'\n') and raw.count(b'\n')==1)
+    def unique(pairs):
+        value={}
+        for key,item in pairs:require(key not in value);value[key]=item
+        return value
+    try:value=json.loads(raw,object_pairs_hook=unique)
+    except (ValueError,UnicodeError,RecursionError):raise ValueError('Invalid restricted reporter phase') from None
+    require(expected in ('pinned','scan_finished','complete') and type(value) is dict and value.get('phase')==expected)
+    required={'phase','evidence'} if expected=='complete' else {'phase','cache_generation','policy_generation','boot_id'} if expected=='pinned' else {'phase'}
+    require(set(value)==required)
+    if expected=='complete':require(type(value['evidence']) is dict)
+    return value
+
+
+def reporter_request_program():
+    """Trusted native fixture: actual writer, synthetic caller authorization."""
+    prefix=(ROOT/'scripts/inventory_refresh_root_entry.py').read_text().split('\ndef main():',1)[0]
+    modules=('inventory_refresh_protocol','inventory_refresh_receipt','inventory_refresh_state','inventory_refresh_storage',
+        'inventory_refresh_status','inventory_refresh_observation','inventory_refresh_io','inventory_refresh_reader_session','inventory_refresh_reporter_io')
+    body=r'''
+assert len(sys.argv)==3 and sys.argv[1] in ('observation','release') and re.fullmatch('[0-9a-f]{32}',sys.argv[2])
+fields=dict(line.split(':',1) for line in open('/proc/self/status').read().splitlines())
+assert all(fields[key].split()==['60002']*4 for key in ('Uid','Gid'))
+assert fields['Groups'].split() in ([],['60002']) and fields['NoNewPrivs'].split()==['1']
+assert all(int(fields[key].strip(),16)==0 for key in ('CapInh','CapPrm','CapEff','CapBnd','CapAmb'))
+sources=None;writer=None;ancestry=None;root=None
+try:
+ sources=RootSources.fixed();loaded=sources.execute();closing,sources=sources,None;closing.close()
+ root=os.open('/',os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+ ancestry=loaded['inventory_refresh_observation']._Ancestry.open(root,('run','command-center-inventory-refresh'))
+ writer=loaded['inventory_refresh_reporter_io'].ReporterRequestWriter(ancestry.fds[-1],sys.argv[1],60002,60002)
+ ancestry.verify()
+ # Parent fixture ordering supplies synthetic intent, not production admission.
+ writer.publish(sys.argv[2]);ancestry.verify()
+finally:
+ failed=False
+ for owned in (writer,ancestry,sources):
+  if owned is not None:
+   try:owned.close()
+   except BaseException:failed=True
+ if root is not None:
+  try:os.close(root)
+  except OSError:failed=True
+ if failed:raise ValueError('Restricted request actor cleanup unconfirmed')
+'''
+    return prefix+'\nSOURCES='+repr(tuple((name,name+'.py') for name in modules))+'\n'+body
+
+
+def reporter_library_program():
+    # Trusted disposable fixture only: use the actual source-admission/compile
+    # implementation with a fixed reader-only closure, not a production entry.
+    prefix=(ROOT/'scripts/inventory_refresh_root_entry.py').read_text().split('\ndef main():',1)[0]
+    modules=('inventory_refresh_protocol','inventory_refresh_receipt','inventory_refresh_state','inventory_refresh_storage',
+        'inventory_refresh_status','inventory_refresh_observation','inventory_refresh_resources','inventory_refresh_reporter_resources',
+        'inventory_refresh_reader_tools','inventory_refresh_reader_session','inventory_refresh_reporter_io')
+    body=r'''
+import json,subprocess
+assert len(sys.argv)==2 and re.fullmatch('[0-9a-f]{32}',sys.argv[1])
+nonce=sys.argv[1]
+fields=dict(line.split(':',1) for line in open('/proc/self/status').read().splitlines())
+assert all(fields[key].split()==['60002']*4 for key in ('Uid','Gid'))
+assert fields['Groups'].split() in ([],['60002']) and fields['NoNewPrivs'].split()==['1']
+assert all(int(fields[key].strip(),16)==0 for key in ('CapInh','CapPrm','CapEff','CapBnd','CapAmb'))
+assert open('/proc/self/cgroup').read()=='0::/command.slice/command-center.slice/command-center-inventory.slice/command-center-inventory.service\n'
+boot=open('/proc/sys/kernel/random/boot_id').read().strip()
+budget=time.clock_gettime_ns(time.CLOCK_BOOTTIME)//1000000+15000
+previous=None
+def clock():
+ global previous
+ current=time.clock_gettime_ns(time.CLOCK_BOOTTIME)//1000000
+ assert (previous is None or current>=previous) and current<budget
+ assert open('/proc/sys/kernel/random/boot_id').read().strip()==boot
+ previous=current;return boot,current
+sources=None;reader=None;session=None;root=None;chains=[];resources=None
+try:
+ stage='sources';sources=RootSources.fixed();loaded=sources.execute();closing,sources=sources,None;closing.close()
+ stage='resources';resources=loaded['inventory_refresh_reporter_resources'].ReporterResources.fixed()
+ observation=loaded['inventory_refresh_observation'];root=os.open('/',os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+ for parts in (('run','command-center-inventory-refresh','status'),('var','cache','command-center-inventory-refresh'),('var','lib','dpkg')):
+  chains.append(observation._Ancestry.open(root,parts))
+ reader=loaded['inventory_refresh_reporter_io'].StatusReader(chains[0].fds[-1],60002)
+ def public():
+  chains[0].verify()
+  try:value=reader.read()
+  except loaded['inventory_refresh_reporter_io'].ReporterIOError as error:
+   if error.reason!='publication_changed':raise
+   value=None  # Next loop reads a NEW file, never reuses old status.
+  chains[0].verify();return value
+ def document(value):return json.loads(value.encoded()) if value is not None else None
+ while True:
+  clock();initial=document(public())
+  if initial is not None:break
+  time.sleep(.01)
+ stage='pin';session=loaded['inventory_refresh_reader_session'].ReaderSession.pin(
+  loaded['inventory_refresh_storage'].CacheReader(chains[1].fds[-1]),cache_generation=initial['cache_generation'],
+  policy_generation=initial['policy_generation'],successful_checked_at=initial['successful_checked_at'],boot_id=boot,clock=clock)
+ chains[1].verify()
+ print(json.dumps({'phase':'pinned','cache_generation':initial['cache_generation'],'policy_generation':initial['policy_generation'],'boot_id':boot}),flush=True)
+ stage='lease'
+ while True:
+  clock();value=public();current=document(value)
+  if current is not None and current['observation_lease'] is not None and current['observation_lease']['nonce']==nonce:break
+  time.sleep(.01)
+ for chain in chains:chain.verify()
+ # Synthetic seam only: this is NOT a durable reporting RequestJournal proof.
+ stage='scan';session.begin_scan(value,observation_nonce=nonce,dpkg_fd=chains[2].fds[-1],owner=0,admit_scan=lambda _:True)
+ records=session.installed()
+ rows=[line.split('\t') for line in records.splitlines() if line.startswith('installed\t')]
+ assert rows and all(len(row)==4 and all(row[1:]) for row in rows)
+ architecture=session.native_architecture().strip()
+ assert re.fullmatch('[a-z0-9][a-z0-9-]{0,63}',architecture)
+ holds=session.holds().splitlines()
+ assert all(re.fullmatch('[a-z0-9][a-z0-9+.-]{0,255}(?::[a-z0-9][a-z0-9+.-]{0,255})?',name) for name in holds)
+ # Independent native selection reference only, not a second normalizer. Empty
+ # real hold sets stay empty; no package selection is changed for this proof.
+ with open('/var/lib/dpkg/status','rb') as source:selection_bytes=source.read(64*1024*1024+1)
+ assert len(selection_bytes)<=64*1024*1024
+ selected=set()
+ for paragraph in selection_bytes.decode('utf-8').split('\n\n'):
+  fields=dict(line.split(': ',1) for line in paragraph.splitlines() if ': ' in line and not line.startswith((' ','\t')))
+  if fields.get('Status','').split(' ',1)[0]=='hold':selected.add(fields['Package'])
+ assert {name.split(':')[0] for name in holds}==selected
+ result=session.policy(['inventory-proof'])
+ assert re.search(r'(?m)^\s*Candidate: 1\.0\s*$',result)
+ assert re.search(r'(?m)^\s*(?:\*\*\*\s+)?1\.0\s+123\s*$',result)
+ for chain in chains:chain.verify()
+ resources.sample()
+ session.finish_scan()
+ frozen=session.frozen_scan_bounds()
+ print(json.dumps({'phase':'scan_finished'}),flush=True)
+ stage='receipt'
+ while True:
+  clock();value=public();current=document(value)
+  if current is not None and current['observation_receipt'] is not None and current['observation_receipt']['nonce']==nonce:break
+  time.sleep(.01)
+ for chain in chains:chain.verify()
+ resources.sample()
+ stage='finish';evidence=json.loads(session.finish(value));session=None
+ assert all(evidence[key]==value for key,value in frozen.items())
+finally:
+ failed=False
+ for owned in (session,reader,sources,*reversed(chains),resources):
+  if owned is not None:
+   try:owned.close()
+   except BaseException:failed=True
+ if root is not None:
+  try:os.close(root)
+  except OSError:failed=True
+ if failed:stage='cleanup';raise ValueError('Restricted reader cleanup unconfirmed')
+print(json.dumps({'phase':'complete','evidence':evidence}),flush=True)
+'''
+    stages=('setup','sources','resources','pin','lease','scan','receipt','finish','cleanup')
+    wrapped="stage='setup'\ntry:\n"+''.join(' '+line+'\n' for line in body.splitlines())
+    wrapped+="except BaseException:\n stage=stage if stage in "+repr(stages)+" else 'setup'\n sys.stdout.write('{\"phase\":\"failed\",\"stage\":\"'+stage+'\"}\\n');sys.stdout.flush()\n raise SystemExit(74)\n"
+    return prefix+'\nSOURCES='+repr(tuple((name,name+'.py') for name in modules))+'\n'+wrapped
+
+
+def read_reporter_phase(stream,expected,deadline):
+    import select
+    raw=bytearray();poll=select.poll();poll.register(stream.fileno(),select.POLLIN|select.POLLHUP|select.POLLERR)
+    while not raw.endswith(b'\n'):
+        remaining=deadline-time.monotonic()
+        assert remaining>0 and poll.poll(max(1,int(remaining*1000)))
+        byte=os.read(stream.fileno(),1)
+        assert byte and len(raw)<4096
+        raw.extend(byte)
+    for stage in ('setup','sources','resources','pin','lease','scan','receipt','finish','cleanup'):
+        if bytes(raw)==('{"phase":"failed","stage":"'+stage+'"}\n').encode('ascii'):
+            print('Native fixture reporter library stage='+stage,file=sys.stderr)
+            raise ValueError('Restricted reporter fixture failed')
+    return decode_reporter_phase(bytes(raw),expected)
+
+
+def finish_reporter_output(process,deadline):
+    import select
+    remaining=deadline-time.monotonic()
+    assert remaining>0 and process.wait(timeout=remaining)==0
+    remaining=deadline-time.monotonic()
+    poll=select.poll();poll.register(process.stdout.fileno(),select.POLLIN|select.POLLHUP|select.POLLERR)
+    assert remaining>0 and poll.poll(max(1,int(remaining*1000)))
+    assert os.read(process.stdout.fileno(),1)==b''
+
+
+def close_reporter_parent(stream,group):
+    try:stream.close()
+    finally:
+        if group is not None:os.close(group)
+
+
+def parent_mechanics_program():
+    # Synthetic trusted Parent only: prove the actual readonly admission
+    # mechanics, never a production Rust lifecycle or source-bootstrap claim.
+    prefix=(ROOT/'scripts/inventory_refresh_root_entry.py').read_text().split('\ndef main():',1)[0]
+    modules=('inventory_refresh_resources','inventory_refresh_reporter_resources','inventory_refresh_reporter_parent')
+    body=r'''
+import json
+assert len(sys.argv)==1
+sources=None;owner=None
+try:
+ sources=RootSources.fixed();loaded=sources.execute();closing,sources=sources,None;closing.close()
+ owner=loaded['inventory_refresh_reporter_parent'].ReporterParent.fixed()
+ owner.verify();boot,now=owner.clock();owner.verify()
+finally:
+ failed=False
+ for value in (owner,sources):
+  if value is not None:
+   try:value.close()
+   except BaseException:failed=True
+ if failed:raise ValueError('Parent mechanics cleanup unconfirmed')
+print(json.dumps({'phase':'complete','evidence':{'parent_origin_mechanics':True,'boot_id':boot,'boottime_ms':now}}),flush=True)
+'''
+    return prefix+'\nSOURCES='+repr(tuple((name,name+'.py') for name in modules))+'\n'+body
+
+
+def environment_mechanics_program():
+    # Fixed readonly composition proof, not a production runtime or Root scope.
+    prefix=(ROOT/'scripts/inventory_refresh_root_entry.py').read_text().split('\ndef main():',1)[0]
+    modules=('inventory_refresh_protocol','inventory_refresh_receipt','inventory_refresh_state','inventory_refresh_storage',
+        'inventory_refresh_status','inventory_refresh_observation','inventory_refresh_resources','inventory_refresh_reporter_resources',
+        'inventory_refresh_reporter_parent','inventory_refresh_reader_tools','inventory_refresh_reader_session',
+        'inventory_refresh_reporter_io','inventory_refresh_reporter_environment')
+    body=r'''
+import json
+assert len(sys.argv)==1
+sources=None;owner=None
+try:
+ sources=RootSources.fixed();loaded=sources.execute();closing,sources=sources,None;closing.close()
+ owner=loaded['inventory_refresh_reporter_environment'].ReporterEnvironment.fixed()
+ pinned=owner.pin_current();owner.verify();boot,now=owner.clock()
+ assert pinned==owner.pinned_context() and pinned['boot_id']==boot
+finally:
+ failed=False
+ for value in (owner,sources):
+  if value is not None:
+   try:value.close()
+   except BaseException:failed=True
+ if failed:raise ValueError('Environment mechanics cleanup unconfirmed')
+print(json.dumps({'phase':'complete','evidence':{'environment_pin_mechanics':True,'boot_id':boot,'boottime_ms':now,'pinned_context':pinned}}),flush=True)
+'''
+    return prefix+'\nSOURCES='+repr(tuple((name,name+'.py') for name in modules))+'\n'+body
+
+
+def publish_parent_fixture_file(fixture,directory,name,raw,mode):
+    assert (name,mode) in (('command-center-inventory',0o555),('reporter-parent-proof.py',0o444),('reporter.py',0o444))
+    assert type(raw) is bytes and 0<len(raw)<=1024*1024
+    fd=os.open(name,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW|os.O_NONBLOCK,0o600,dir_fd=directory)
+    try:
+        info=os.fstat(fd)
+        fixture['files'].append((directory,name,(info.st_dev,info.st_ino)))
+        assert stat.S_ISREG(info.st_mode) and info.st_nlink==1 and info.st_uid==os.geteuid()
+        offset=0
+        while offset<len(raw):
+            written=os.write(fd,raw[offset:]);assert written>0;offset+=written
+        os.fchmod(fd,mode);os.fsync(fd)
+        final=os.fstat(fd);named=os.stat(name,dir_fd=directory,follow_symlinks=False)
+        assert (final.st_dev,final.st_ino)==(named.st_dev,named.st_ino)==(info.st_dev,info.st_ino)
+        assert final.st_size==len(raw) and final.st_nlink==1 and stat.S_IMODE(final.st_mode)==mode
+    finally:os.close(fd)
+    os.fsync(directory)
+
+
+def retire_parent_fixture(fixture,confirmed_empty):
+    files,fixture['files']=fixture['files'],[]
+    directories,fixture['directories']=fixture['directories'],[]
+    failed=not confirmed_empty
+    try:
+        if confirmed_empty:
+            for directory,name,identity in reversed(files):
+                try:
+                    info=os.stat(name,dir_fd=directory,follow_symlinks=False)
+                    assert stat.S_ISREG(info.st_mode) and info.st_nlink==1 and (info.st_dev,info.st_ino)==identity
+                    os.unlink(name,dir_fd=directory);os.fsync(directory)
+                except BaseException:failed=True
+    finally:
+        for directory in reversed(directories):
+            try:directory.close()
+            except BaseException:failed=True
+    assert not failed,'Synthetic parent fixture cleanup unconfirmed'
+
+
+def parent_fixture_c_source(reporter=False):
+    assert type(reporter) is bool
+    # Two literal CI-only cases, no forwarded program/argument or signal.
+    source=r'''
+#include <unistd.h>
+#include <sys/wait.h>
+#include <errno.h>
+int main(void) {
+ char *args[] = {"/usr/bin/python3", "-I", "-B", "-S", "/usr/local/libexec/command-center-inventory-refresh/reporter-parent-proof.py", 0};
+ char *env[] = {"PATH=/usr/sbin:/usr/bin:/sbin:/bin", "LC_ALL=C", "LANG=C", 0};
+ pid_t child=fork(); if(child<0) return 74;
+ if(child==0) {execve(args[0],args,env);_exit(74);}
+ int status=0;
+ while(waitpid(child,&status,0)<0) {if(errno!=EINTR) return 74;}
+ return WIFEXITED(status)?WEXITSTATUS(status):74;
+}
+'''
+    return source.replace('reporter-parent-proof.py','reporter.py') if reporter else source
+
+
+def install_parent_fixture(program,*,reporter=False):
+    from inventory_refresh_resources import _Chain
+    assert sys.platform=='linux' and os.geteuid()==0 and os.environ.get('GITHUB_ACTIONS')=='true' and type(reporter) is bool
+    name='reporter.py' if reporter else 'reporter-parent-proof.py'
+    fixture={'files':[],'directories':[]}
+    try:
+        binary=_Chain(('usr','local','libexec'));fixture['directories'].append(binary)
+        library=_Chain(('usr','local','libexec','command-center-inventory-refresh'));fixture['directories'].append(library)
+        for directory,filename in ((binary.fds[-1],'command-center-inventory'),(library.fds[-1],name)):
+            try:os.stat(filename,dir_fd=directory,follow_symlinks=False)
+            except FileNotFoundError:pass
+            else:raise AssertionError('Fixed synthetic parent path already exists')
+        source=parent_fixture_c_source(reporter)
+        with tempfile.TemporaryDirectory(prefix='inventory-parent-mechanics-') as temporary:
+            root=Path(temporary);(root/'parent.c').write_text(source)
+            command(['/usr/bin/cc','-Wall','-Wextra','-Werror','-o',str(root/'parent'),str(root/'parent.c')],timeout=15)
+            with (root/'parent').open('rb') as compiled:raw=compiled.read(1024*1024+1)
+            publish_parent_fixture_file(fixture,binary.fds[-1],'command-center-inventory',raw,0o555)
+        publish_parent_fixture_file(fixture,library.fds[-1],name,program.encode(),0o444)
+        return fixture
+    except BaseException:
+        retire_parent_fixture(fixture,True)  # This installer never starts Parent.
+        raise
+
+
+def stage_reporter_artifact_fixture(archive):
+    # Verification is read-only and precedes all protected publication. This
+    # helper never starts a unit, so partial staging can retire with empty=True.
+    verified=verify_archive(ROOT,archive)
+    fixture={'verified':verified,'sources':None,'parent':None,'retirement_attempted':False}
+    try:
+        fixture['sources']=FixtureSources.fixed(verified)
+        fixture['sources'].publish()
+        entry=verified['files']['libexec/command-center-inventory-refresh/reporter.py'].decode('utf-8')
+        fixture['parent']=install_parent_fixture(entry,reporter=True)
+        return fixture
+    except BaseException:
+        retire_reporter_artifact_fixture(fixture,True)
+        raise
+
+
+def retire_reporter_artifact_fixture(fixture,confirmed_empty):
+    assert not fixture.get('retirement_attempted',False),'Reporter artifact fixture already retired or uncertain'
+    fixture['retirement_attempted']=True
+    valid_confirmation=type(confirmed_empty) is bool
+    confirmed_empty=confirmed_empty if valid_confirmation else False
+    parent,fixture['parent']=fixture['parent'],None
+    sources,fixture['sources']=fixture['sources'],None
+    failed=not valid_confirmation
+    try:
+        if parent is not None:retire_parent_fixture(parent,confirmed_empty)
+    except BaseException:failed=True
+    finally:
+        if sources is not None:
+            try:sources.retire(confirmed_empty)
+            except BaseException:failed=True
+    assert not failed,'Reporter artifact fixture retirement unconfirmed'
+
+
+def validate_rust_proof_output(raw,physical_sample=False):
+    assert type(physical_sample) is bool
+    assert type(raw) is bytes and len(raw)<=8192
+    lines=raw.decode('ascii').splitlines()
+    lines=[line for line in lines if line]
+    assert len(lines)==3 and lines[0]=='running 1 test'
+    name='sample' if physical_sample else 'roundtrip'
+    assert lines[1]=='test inventory::reporter_obs::tests::hosted_real_reporter_rust_journal_'+name+' ... ok'
+    assert re.fullmatch(r'test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out; finished in [0-9]+\.[0-9]+s',lines[2])
+
+
+def stage_rust_reporter_artifact_fixture(archive,deadline):
+    # All uncertain partial publications are retained, including before launch.
+    verified=verify_archive(ROOT,archive)
+    fixture={'verified':verified,'artifact':None,'sources':None,'binary':None,'retirement_attempted':False}
+    try:
+        fixture['artifact']=RunnerArtifact.fixed(verified['source_commit'],deadline)
+        fixture['sources']=FixtureSources.fixed(verified,include_entry=True)
+        fixture['sources'].publish()
+        fixture['binary']=FixtureBinary.fixed(fixture['artifact'])
+        fixture['binary'].publish();fixture['binary'].verify_published()
+        return fixture
+    except BaseException:
+        for owner in (fixture['binary'],fixture['sources'],fixture['artifact']):
+            if owner is not None:
+                try:owner.close()
+                except BaseException:pass
+        raise ValueError('Rust reporter fixture staging unconfirmed') from None
+
+
+def retire_rust_reporter_artifact_fixture(fixture,confirmed_empty):
+    assert not fixture.get('retirement_attempted',False),'Rust reporter fixture retirement already attempted'
+    fixture['retirement_attempted']=True
+    valid=type(confirmed_empty) is bool and confirmed_empty
+    if valid:
+        try:
+            fixture['artifact'].verify();fixture['sources'].verify();fixture['binary'].verify_published()
+        except BaseException:valid=False
+    failed=not valid
+    binary,fixture['binary']=fixture['binary'],None
+    sources,fixture['sources']=fixture['sources'],None
+    artifact,fixture['artifact']=fixture['artifact'],None
+    if binary is not None:
+        try:binary.retire(valid)
+        except BaseException:failed=True;valid=False
+    if sources is not None:
+        try:sources.retire(valid)
+        except BaseException:failed=True
+    if artifact is not None:
+        try:artifact.close()
+        except BaseException:failed=True
+    assert not failed,'Rust reporter fixture retirement unconfirmed'
+
+
+def run_reporter_parent_fixture(program):
+    from inventory_refresh_unit_status import PROPERTIES
+    for name in ('inventory_refresh_reporter_parent',):
+        target=LIB_ROOT/(name+'.py');shutil.copyfile(ROOT/'scripts'/(name+'.py'),target);target.chmod(0o444)
+    unit='command-center-inventory.service';description='Synthetic parent admission '+secrets.token_hex(16)
+    expected='/command.slice/command-center.slice/command-center-inventory.slice/'+unit
+    def properties():
+        result=subprocess.run(['/bin/systemctl','show','--property='+','.join(PROPERTIES),unit],env=ENV,
+            stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,timeout=2)
+        assert result.returncode in (0,4) and len(result.stdout)<=4096
+        values={}
+        for line in result.stdout.decode('ascii').splitlines():
+            key,separator,value=line.partition('=');assert separator and key in PROPERTIES and key not in values;values[key]=value
+        assert set(values)==set(PROPERTIES);return values
+    def empty():
+        value=properties()
+        if value['LoadState']!='not-found':
+            assert value['Description']==description and value['ActiveState'] in ('inactive','failed')
+        try:group=os.open('/sys/fs/cgroup'+expected,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+        except FileNotFoundError:return True
+        try:
+            fd=os.open('cgroup.events',os.O_RDONLY|os.O_NOFOLLOW,dir_fd=group)
+            try:assert b'populated 0' in os.read(fd,4096).splitlines()
+            finally:os.close(fd)
+        finally:os.close(group)
+        return True
+    assert properties()['LoadState']=='not-found'
+    fixture=install_parent_fixture(program);process=None
+    try:
+        args=['/usr/bin/systemd-run','--quiet','--wait','--collect','--pipe','--unit='+unit,'--slice='+PARENT_SLICE,'--description='+description]
+        for item in ('User=60002','Group=60002','Type=exec','Restart=no','RemainAfterExit=no','KillMode=control-group',
+            'KillSignal=SIGKILL','TimeoutStopSec=1','RuntimeMaxSec=20','OOMPolicy=kill','TasksMax=8','MemoryAccounting=yes',
+            'NoNewPrivileges=yes','CapabilityBoundingSet=','AmbientCapabilities=','ProtectSystem=strict',
+            'ProtectHome=yes','ProtectControlGroups=yes','ProtectKernelTunables=yes','PrivateDevices=yes','PrivateTmp=yes','PrivateNetwork=yes'):
+            args+=['-p',item]
+        args+=['/usr/local/libexec/command-center-inventory']
+        process=subprocess.Popen(args,env=ENV,stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL)
+        deadline=time.monotonic()+25
+        evidence=read_reporter_phase(process.stdout,'complete',deadline)['evidence']
+        finish_reporter_output(process,deadline)
+        assert evidence['boot_id']==Path('/proc/sys/kernel/random/boot_id').read_text().strip()
+        assert type(evidence['boottime_ms']) is int and 0<=evidence['boottime_ms']<=time.clock_gettime_ns(time.CLOCK_BOOTTIME)//1000000
+        assert empty()
+        return evidence
+    finally:
+        confirmed=False
+        try:
+            if process is not None:process.wait(timeout=25)
+            confirmed=empty()
+        finally:
+            try:retire_parent_fixture(fixture,confirmed)
+            finally:
+                if process is not None:process.stdout.close()
+
+
+def prove_reporter_parent_mechanics():
+    evidence=run_reporter_parent_fixture(parent_mechanics_program())
+    assert set(evidence)=={'parent_origin_mechanics','boot_id','boottime_ms'} and evidence['parent_origin_mechanics'] is True
+
+
+def prove_reporter_environment_mechanics(public):
+    target=LIB_ROOT/'inventory_refresh_reporter_environment.py'
+    shutil.copyfile(ROOT/'scripts/inventory_refresh_reporter_environment.py',target);target.chmod(0o444)
+    before=public();evidence=run_reporter_parent_fixture(environment_mechanics_program())
+    assert set(evidence)=={'environment_pin_mechanics','boot_id','boottime_ms','pinned_context'} and evidence['environment_pin_mechanics'] is True
+    pinned=evidence['pinned_context']
+    assert set(pinned)=={'cache_generation','policy_generation','successful_checked_at','boot_id','pinned_boottime_ms'}
+    assert all(pinned[key]==before[key] for key in ('cache_generation','policy_generation','successful_checked_at'))
+    assert pinned['boot_id']==evidence['boot_id'] and type(pinned['pinned_boottime_ms']) is int and 0<=pinned['pinned_boottime_ms']<=evidence['boottime_ms']
+
+
+def prove_reporter_library_roundtrip(actor,public):
+    """Native library seam; synthetic admission, not executable-client readiness."""
+    from inventory_refresh_unit_status import PROPERTIES
+    for name in ('inventory_refresh_reporter_resources','inventory_refresh_reader_tools','inventory_refresh_reader_session','inventory_refresh_reporter_io'):
+        target=LIB_ROOT/(name+'.py');shutil.copyfile(ROOT/'scripts'/(name+'.py'),target);target.chmod(0o444)
+    unit='command-center-inventory.service';description='Disposable reporter session '+secrets.token_hex(16)
+    nonce='0000000000000007'+'e'*16
+    def properties():
+        result=subprocess.run(['/bin/systemctl','show','--property='+','.join(PROPERTIES),unit],env=ENV,
+            stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,timeout=2)
+        assert result.returncode in (0,4) and len(result.stdout)<=4096
+        value={}
+        for line in result.stdout.decode('ascii').splitlines():
+            key,separator,item=line.partition('=');assert separator and key in PROPERTIES and key not in value;value[key]=item
+        assert set(value)==set(PROPERTIES);return value
+    assert properties()['LoadState']=='not-found'
+    args=['/usr/bin/systemd-run','--quiet','--wait','--collect','--pipe','--unit='+unit,'--slice='+PARENT_SLICE,'--description='+description]
+    for item in ('User=60002','Group=60002','Type=exec','ExitType=main','Restart=no','RemainAfterExit=no',
+        'KillMode=control-group','KillSignal=SIGKILL','TimeoutStopSec=1','RuntimeMaxSec=20','OOMPolicy=kill',
+        'MemoryAccounting=yes','TasksMax=8','NoNewPrivileges=yes','CapabilityBoundingSet=','AmbientCapabilities=',
+        'ProtectSystem=strict','ProtectHome=yes','ProtectControlGroups=yes','PrivateDevices=yes','PrivateTmp=yes','PrivateNetwork=yes'):
+        args+=['-p',item]
+    args+=['/usr/bin/python3','-I','-B','-S','-c',reporter_library_program(),nonce]
+    process=subprocess.Popen(args,env=ENV,stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL)
+    group=None;invocation=None;group_identity=None
+    try:
+        deadline=time.monotonic()+25
+        pinned=read_reporter_phase(process.stdout,'pinned',deadline)
+        before=public()
+        assert pinned['cache_generation']==before['cache_generation'] and pinned['policy_generation']==before['policy_generation']
+        assert pinned['boot_id']==Path('/proc/sys/kernel/random/boot_id').read_text().strip()
+        value=properties()
+        assert value['LoadState']=='loaded' and value['Description']==description and re.fullmatch('[0-9a-f]{32}',value['InvocationID'])
+        expected='/command.slice/command-center.slice/command-center-inventory.slice/'+unit
+        assert value['ControlGroup']==expected
+        invocation=value['InvocationID'];group=os.open('/sys/fs/cgroup'+expected,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+        info=os.fstat(group);group_identity=(info.st_dev,info.st_ino)
+        actor('observation',nonce)
+        read_reporter_phase(process.stdout,'scan_finished',deadline)
+        actor('release',nonce)
+        final=read_reporter_phase(process.stdout,'complete',deadline)['evidence']
+        finish_reporter_output(process,deadline)  # Bounded EOF: no valid-prefix surplus.
+        value=properties()
+        if value['LoadState']!='not-found':
+            assert value['Description']==description and value['InvocationID']==invocation and value['ActiveState'] in ('inactive','failed')
+        try:named=os.stat('/sys/fs/cgroup'+expected,follow_symlinks=False)
+        except FileNotFoundError:pass
+        else:
+            assert (named.st_dev,named.st_ino)==group_identity
+            fd=os.open('cgroup.events',os.O_RDONLY|os.O_NOFOLLOW,dir_fd=group)
+            try:assert b'populated 0' in os.read(fd,4096).splitlines()
+            finally:os.close(fd)
+        receipt=public()['observation_receipt']
+        assert set(final)=={'schema_version','scan_started_boottime_ms','scan_finished_boottime_ms','successful_checked_at','observation_receipt'}
+        assert type(final['schema_version']) is int and final['schema_version']==1 and final['observation_receipt']==receipt and receipt['nonce']==nonce
+        assert final['successful_checked_at']==before['successful_checked_at']
+        for key in ('cache_generation','policy_generation','boot_id'):assert receipt[key]==pinned[key]
+        offer={key:receipt[key] for key in ('nonce','boot_id','cache_generation','policy_generation','lock_open_boottime_ms','expires_boottime_ms')}
+        reader={'schema_version':1,'observation_nonce':nonce,**{key:receipt[key] for key in ('boot_id','cache_generation','policy_generation','installed_before_sha256','installed_after_sha256')},
+            'scan_started_boottime_ms':final['scan_started_boottime_ms'],'scan_finished_boottime_ms':final['scan_finished_boottime_ms']}
+        assert match_projected_reader_receipt(offer,reader,receipt)
+        return receipt
+    finally:
+        try:
+            # The known transient has its own kernel/PID1 deadline. Never let
+            # coordinator cleanup stand in for reporter termination or pin close.
+            process.wait(timeout=25)
+        finally:
+            closing,group=group,None
+            close_reporter_parent(process.stdout,closing)
+
+
+def prove_packaged_reporter_roundtrip(archive,public):
+    """Synthetic-parent mechanics only; no durable Rust or completion claim."""
+    from inventory_refresh_unit_status import PROPERTIES
+    from inventory_refresh_reporter_controller import run_reporter_controller
+    unit='command-center-inventory.service';description='Packaged reporter proof '+secrets.token_hex(16)
+    expected='/command.slice/command-center.slice/command-center-inventory.slice/'+unit
+    def properties():
+        result=subprocess.run(['/bin/systemctl','show','--property='+','.join(PROPERTIES),unit],env=ENV,
+            stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,timeout=2)
+        assert result.returncode in (0,4) and len(result.stdout)<=4096
+        values={}
+        for line in result.stdout.decode('ascii').splitlines():
+            key,separator,value=line.partition('=');assert separator and key in PROPERTIES and key not in values;values[key]=value
+        assert set(values)==set(PROPERTIES);return values
+    assert properties()['LoadState']=='not-found'
+    fixture=stage_reporter_artifact_fixture(archive);process=None;group=None;identity=None;invocation=None;confirmed=False
+    try:
+        args=['/usr/bin/systemd-run','--quiet','--wait','--collect','--pipe','--unit='+unit,'--slice='+PARENT_SLICE,'--description='+description]
+        for item in ('User=60002','Group=60002','Type=exec','Restart=no','RemainAfterExit=no','KillMode=control-group',
+            'KillSignal=SIGKILL','TimeoutStopSec=1','RuntimeMaxSec=20','OOMPolicy=kill','TasksMax=8','MemoryAccounting=yes','NoNewPrivileges=yes','CapabilityBoundingSet=',
+            'AmbientCapabilities=','ProtectSystem=strict','ProtectHome=yes','ProtectControlGroups=yes',
+            'ProtectKernelTunables=yes','PrivateDevices=yes','PrivateTmp=yes','PrivateNetwork=yes',
+            'ReadWritePaths=/run/command-center-inventory-refresh/observation /run/command-center-inventory-refresh/release'):
+            args+=['-p',item]
+        args+=['/usr/local/libexec/command-center-inventory']
+        deadline=time.monotonic()+25
+        process=subprocess.Popen(args,env=ENV,stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL)
+        while True:
+            value=properties()
+            if value['LoadState']=='loaded' and value['InvocationID'] and value['ControlGroup']==expected:
+                assert value['Description']==description and re.fullmatch('[0-9a-f]{32}',value['InvocationID'])
+                invocation=value['InvocationID'];group=os.open('/sys/fs/cgroup'+expected,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+                info=os.fstat(group);identity=(info.st_dev,info.st_ino);break
+            assert value['LoadState'] in ('loaded','not-found') and process.poll() is None and time.monotonic()<deadline
+            time.sleep(.02)
+        fds=(process.stdout.fileno(),process.stdin.fileno());identities=[]
+        for fd,direction in zip(fds,(os.O_RDONLY,os.O_WRONLY)):
+            info=os.fstat(fd);flags=fcntl.fcntl(fd,fcntl.F_GETFL)
+            assert stat.S_ISFIFO(info.st_mode) and flags&os.O_ACCMODE==direction
+            identities.append((info.st_dev,info.st_ino))
+        assert identities[0]!=identities[1]
+        for fd in fds:os.set_blocking(fd,False)
+        before=public();nonce='0000000000000008'+'d'*16
+        context={key:before[key] for key in ('cache_generation','policy_generation','successful_checked_at')}
+        context['boot_id']=Path('/proc/sys/kernel/random/boot_id').read_text().strip()
+        result=run_reporter_controller(process,expected_context=context,read_root_status=public,nonce=nonce,deadline=deadline)
+        result['artifact']={key:fixture['verified'][key] for key in ('source_commit','archive_sha256','entry_sha256')}
+        return result
+    finally:
+        failed=False
+        if process is not None:
+            try:process.wait(timeout=max(0,deadline-time.monotonic()))
+            except BaseException:failed=True
+            for stream in (process.stdin,process.stdout):
+                if stream is not None:
+                    try:stream.close()
+                    except BaseException:failed=True
+        try:
+            value=properties()
+            if invocation is not None:
+                if value['LoadState']!='not-found':
+                    assert value['Description']==description and value['InvocationID']==invocation and value['ActiveState'] in ('inactive','failed')
+                assert group is not None and (os.fstat(group).st_dev,os.fstat(group).st_ino)==identity
+                try:named=os.stat('/sys/fs/cgroup'+expected,follow_symlinks=False)
+                except FileNotFoundError:pass
+                else:
+                    assert (named.st_dev,named.st_ino)==identity
+                    fd=os.open('cgroup.events',os.O_RDONLY|os.O_NOFOLLOW,dir_fd=group)
+                    try:assert b'populated 0' in os.read(fd,4096).splitlines()
+                    finally:os.close(fd)
+                confirmed=not failed
+            elif process is None:confirmed=value['LoadState']=='not-found'
+        except BaseException:failed=True
+        finally:
+            if group is not None:
+                try:os.close(group)
+                except BaseException:failed=True;confirmed=False
+            try:retire_reporter_artifact_fixture(fixture,confirmed)
+            except BaseException:failed=True
+        if failed:raise ValueError('Packaged reporter fixture cleanup unconfirmed')
+
+
+def rust_unit_properties(deadline,properties):
+    # Never signal a Root-owned systemctl child on timeout; preserve uncertainty.
+    import select
+    child=None;failed=False;raw=bytearray()
+    try:
+        child=subprocess.Popen(['/bin/systemctl','show','--property='+','.join(properties),'command-center-inventory.service'],
+            env=ENV,stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL)
+        fd=child.stdout.fileno();os.set_blocking(fd,False);poller=select.poll();poller.register(fd,select.POLLIN|select.POLLHUP|select.POLLERR)
+        while True:
+            remaining=deadline-time.monotonic();assert remaining>0 and poller.poll(max(1,int(remaining*1000)))
+            try:chunk=os.read(fd,4097-len(raw))
+            except BlockingIOError:continue
+            assert time.monotonic()<deadline
+            if not chunk:break
+            raw.extend(chunk);assert len(raw)<=4096
+        remaining=deadline-time.monotonic();assert remaining>0 and child.wait(timeout=remaining) in (0,4) and time.monotonic()<deadline
+    except BaseException:failed=True
+    finally:
+        if child is not None:
+            try:child.stdout.close()
+            except BaseException:failed=True
+    if failed:raise ValueError('Rust unit status unconfirmed')
+    try:
+        values={}
+        for line in bytes(raw).decode('ascii').splitlines():
+            key,separator,value=line.partition('=');assert separator and key in properties and key not in values;values[key]=value
+        assert set(values)==set(properties) and time.monotonic()<deadline
+        return values
+    except BaseException:raise ValueError('Rust unit status unconfirmed') from None
+
+
+def read_rust_barrier_marker(fd,deadline):
+    marker=b'INVENTORY-BARRIER-1\n';received=bytearray();poller=select.poll()
+    poller.register(fd,select.POLLIN|select.POLLHUP|select.POLLERR)
+    while len(received)<len(marker):
+        remaining=deadline-time.monotonic();assert remaining>0 and poller.poll(max(1,int(remaining*1000)))
+        try:chunk=os.read(fd,len(marker)+1-len(received))
+        except BlockingIOError:continue
+        assert chunk and time.monotonic()<deadline;received.extend(chunk);assert marker.startswith(received)
+    assert bytes(received)==marker and time.monotonic()<deadline
+
+
+def write_rust_barrier_ack(fd,deadline):
+    ack=b'ACK-1\n';offset=0;poller=select.poll();poller.register(fd,select.POLLOUT|select.POLLHUP|select.POLLERR)
+    while offset<len(ack):
+        remaining=deadline-time.monotonic();assert remaining>0 and poller.poll(max(1,int(remaining*1000)))
+        try:written=os.write(fd,ack[offset:])
+        except BlockingIOError:continue
+        assert written>0 and written<=len(ack)-offset and time.monotonic()<deadline;offset+=written
+
+
+def sample_rust_unit_processes(unit,description,expected,invocation,identity,deadline,properties):
+    value=properties()
+    assert value['Description']==description and value['InvocationID']==invocation and value['ControlGroup']==expected
+    assert value['ActiveState']=='active' and value['Delegate']=='no' and value['ProtectControlGroups']=='yes' and value['MemoryPressureWatch']=='off'
+    assert re.fullmatch('[1-9][0-9]{0,9}',value['MainPID']);pid=int(value['MainPID'])
+    group_chain=None;probe=None
+    try:
+        group_chain=_Chain(('sys','fs','cgroup')+tuple(expected.strip('/').split('/')))
+        group_chain.verify();held=os.fstat(group_chain.fds[-1]);assert (held.st_dev,held.st_ino)==identity
+        probe=ProcessProbe.fixed(pid,(os.major(held.st_dev),os.minor(held.st_dev)),deadline)
+        start=probe.sample()
+        observe_single_process(group_chain.fds[-2],unit,group_chain.fds[-1],pid,deadline)
+        assert probe.sample()==start;group_chain.verify()
+        again=properties()
+        assert again['Description']==description and again['InvocationID']==invocation and again['ControlGroup']==expected
+        assert again['MainPID']==str(pid) and again['ActiveState']=='active' and again['Delegate']=='no' and again['ProtectControlGroups']=='yes' and again['MemoryPressureWatch']=='off'
+        assert time.monotonic()<deadline
+    finally:
+        try:
+            if probe is not None:probe.close()
+        finally:
+            if group_chain is not None:group_chain.close()
+
+
+def prove_rust_reporter_roundtrip(archive,public,physical_sample=False):
+    """Hosted fixture mechanics; no production or process-set completion witness."""
+    import select
+    from inventory_refresh_unit_status import PROPERTIES
+    assert type(physical_sample) is bool
+    unit='command-center-inventory.service';description='Rust reporter proof '+secrets.token_hex(16)
+    expected='/command.slice/command-center.slice/command-center-inventory.slice/'+unit
+    deadline=time.monotonic()+60
+    def properties():return rust_unit_properties(min(deadline,time.monotonic()+2),PROPERTIES+(('Delegate','ProtectControlGroups','MemoryPressureWatch') if physical_sample else ()))
+    assert properties()['LoadState']=='not-found'
+    fixture=stage_rust_reporter_artifact_fixture(archive,deadline)
+    process=None;group=None;identity=None;invocation=None;confirmed=False;completed=False
+    try:
+        args=['/usr/bin/systemd-run','--quiet','--wait','--collect','--pipe','--unit='+unit,'--slice='+PARENT_SLICE,
+            '--description='+description,'--setenv=GITHUB_ACTIONS=true','--setenv=GUARDED_UPDATE_NATIVE_RUST_PROOF=1']
+        for item in ('User=60002','Group=60002','Type=exec','Restart=no','RemainAfterExit=no','KillMode=control-group',
+            'KillSignal=SIGKILL','TimeoutStopSec=1','RuntimeMaxSec=20','OOMPolicy=kill','TasksMax=8','MemoryAccounting=yes','NoNewPrivileges=yes','CapabilityBoundingSet=',
+            'AmbientCapabilities=','ProtectSystem=strict','ProtectHome=yes','ProtectControlGroups=yes',
+            'ProtectKernelTunables=yes','PrivateDevices=yes','PrivateTmp=yes','PrivateNetwork=yes',
+            'ReadWritePaths=/run/command-center-inventory-refresh/observation /run/command-center-inventory-refresh/release'):
+            args+=['-p',item]
+        if physical_sample:
+            args+=['--setenv=GUARDED_UPDATE_NATIVE_BARRIER_PROOF=1','-p','Delegate=no',
+                '-p','ReadOnlyPaths=/sys/fs/cgroup','-p','MountFlags=private','-p','MemoryPressureWatch=off']
+        test_name=('inventory::reporter_obs::tests::hosted_real_reporter_rust_journal_sample' if physical_sample else
+            'inventory::reporter_obs::tests::hosted_real_reporter_rust_journal_roundtrip')
+        args+=['/usr/local/libexec/command-center-inventory','--exact',test_name,'--ignored','--test-threads=1','--nocapture']
+        fixture['binary'].verify_published();assert time.monotonic()<deadline
+        process=subprocess.Popen(args,env=ENV,stdin=subprocess.PIPE if physical_sample else subprocess.DEVNULL,stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE if physical_sample else subprocess.DEVNULL)
+        while True:
+            value=properties()
+            if value['LoadState']=='loaded' and value['InvocationID'] and value['ControlGroup']==expected:
+                assert value['Description']==description and re.fullmatch('[0-9a-f]{32}',value['InvocationID'])
+                invocation=value['InvocationID'];group=os.open('/sys/fs/cgroup'+expected,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+                info=os.fstat(group);identity=(info.st_dev,info.st_ino);break
+            assert value['LoadState'] in ('loaded','not-found') and process.poll() is None and time.monotonic()<deadline
+            time.sleep(.02)
+        if physical_sample:
+            # The control stream is separate from libtest output and every endpoint
+            # is checked before changing shared open-file-description flags.
+            endpoints=((process.stdin,os.O_WRONLY),(process.stdout,os.O_RDONLY),(process.stderr,os.O_RDONLY));identities=[]
+            for stream,direction in endpoints:
+                info=os.fstat(stream.fileno());flags=fcntl.fcntl(stream.fileno(),fcntl.F_GETFL)
+                assert stat.S_ISFIFO(info.st_mode) and flags&os.O_ACCMODE==direction
+                identities.append((info.st_dev,info.st_ino))
+            assert len(set(identities))==3
+            for stream,_ in endpoints:os.set_blocking(stream.fileno(),False)
+            read_rust_barrier_marker(process.stderr.fileno(),deadline)
+            sample_rust_unit_processes(unit,description,expected,invocation,identity,deadline,properties)
+            write_rust_barrier_ack(process.stdin.fileno(),deadline)
+            process.stdin.close();process.stdin=None
+        fd=process.stdout.fileno();info=os.fstat(fd);flags=fcntl.fcntl(fd,fcntl.F_GETFL)
+        assert stat.S_ISFIFO(info.st_mode) and flags&os.O_ACCMODE==os.O_RDONLY
+        os.set_blocking(fd,False);output=bytearray();poller=select.poll();poller.register(fd,select.POLLIN|select.POLLHUP|select.POLLERR)
+        while True:
+            remaining=deadline-time.monotonic();assert remaining>0 and poller.poll(max(1,int(remaining*1000)))
+            try:chunk=os.read(fd,min(8193-len(output),8193))
+            except BlockingIOError:continue
+            assert time.monotonic()<deadline
+            if not chunk:break
+            output.extend(chunk);assert len(output)<=8192
+        if physical_sample:
+            poller=select.poll();poller.register(process.stderr.fileno(),select.POLLIN|select.POLLHUP|select.POLLERR)
+            remaining=deadline-time.monotonic();assert remaining>0 and poller.poll(max(1,int(remaining*1000)))
+            assert os.read(process.stderr.fileno(),1)==b'' and time.monotonic()<deadline
+        assert process.wait(timeout=max(0,deadline-time.monotonic()))==0 and time.monotonic()<deadline
+        validate_rust_proof_output(bytes(output),physical_sample)
+        status=public();receipt=status['observation_receipt']
+        assert status['observation_lease'] is None and receipt['nonce']=='0000000000000009'+'d'*16 and receipt['outcome']=='released'
+        assert time.monotonic()<deadline
+        completed=True
+        return receipt
+    finally:
+        failed=False
+        if process is not None:
+            try:process.wait(timeout=max(0,deadline-time.monotonic()))
+            except BaseException:failed=True
+            for stream in (process.stdin,process.stdout,process.stderr):
+                if stream is not None:
+                    try:stream.close()
+                    except BaseException:failed=True
+        try:
+            value=properties()
+            if invocation is not None:
+                if value['LoadState']!='not-found':
+                    assert value['Description']==description and value['InvocationID']==invocation and value['ActiveState'] in ('inactive','failed')
+                assert group is not None and (os.fstat(group).st_dev,os.fstat(group).st_ino)==identity
+                try:named=os.stat('/sys/fs/cgroup'+expected,follow_symlinks=False)
+                except FileNotFoundError:pass
+                else:
+                    assert (named.st_dev,named.st_ino)==identity
+                    fd=os.open('cgroup.events',os.O_RDONLY|os.O_NOFOLLOW,dir_fd=group)
+                    try:assert b'populated 0' in os.read(fd,4096).splitlines()
+                    finally:os.close(fd)
+                confirmed=completed and not failed and time.monotonic()<deadline
+        except BaseException:failed=True
+        finally:
+            if group is not None:
+                try:os.close(group)
+                except BaseException:failed=True;confirmed=False
+            try:retire_rust_reporter_artifact_fixture(fixture,confirmed)
+            except BaseException:failed=True
+        if time.monotonic()>=deadline:failed=True
+        if failed:raise ValueError('Rust reporter fixture cleanup unconfirmed')
+
+
+def prove_actual_coordinator_entry_loop(archive,physical_sample=False):
     """GHA-only actual entry, restricted inbox actor and controlled policy refusal."""
+    assert type(physical_sample) is bool
     from inventory_refresh_publisher_profile import publisher_properties
     from inventory_refresh_resources import UNIT,SELF_CGROUP
     from inventory_refresh_unit_status import PROPERTIES,inert
@@ -911,8 +1893,9 @@ def prove_actual_coordinator_entry_loop():
     def public():
         with status_path.open('rb') as status:raw=status.read(65537)
         assert len(raw)<=65536;return json.loads(raw)
-    def actor(capability):
-        result=subprocess.run(list(worker_argv(READER,READER)[:-1])+['-S','-c',REPORTER_INBOX_CODE,capability,nonce],
+    def actor(capability,operation=nonce):
+        code=REPORTER_INBOX_CODE if operation==nonce else reporter_request_program()
+        result=subprocess.run(list(worker_argv(READER,READER)[:-1])+['-S','-c',code,capability,operation],
             env=ENV,stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=5)
         assert result.returncode==0,'Restricted synthetic inbox actor failed'
     def write_policy(data):
@@ -996,6 +1979,7 @@ def prove_actual_coordinator_entry_loop():
             with Store(cache,0,READER,WORKER).lease_current() as lease:
                 assert lease.manifest['cache_generation']==offer['cache_generation']
                 for item in lease.manifest['files']:lease.verify_index(item['path'])
+                reader_proof=prove_projected_reader_query(offer)
         finally:os.close(cache)
         actor('release');limit=time.monotonic()+10
         while True:
@@ -1003,7 +1987,19 @@ def prove_actual_coordinator_entry_loop():
             if receipt is not None and receipt['nonce']==nonce:break
             receipt=None;assert launcher.poll() is None and time.monotonic()<limit;time.sleep(.02)
         assert value['observation_lease'] is None and all(receipt[key]==item for key,item in offer.items())
-        assert receipt['installed_before_sha256']==receipt['installed_after_sha256']
+        assert match_projected_reader_receipt(offer,reader_proof,receipt)
+        receipt=None  # The attempt may replace the last observation before failing.
+        receipt=prove_reporter_library_roundtrip(actor,public)
+        prove_reporter_parent_mechanics()
+        prove_reporter_environment_mechanics(public)
+        packaged=prove_packaged_reporter_roundtrip(archive,public)
+        receipt=packaged['evidence']['observation_receipt']
+        assert receipt['nonce']=='0000000000000008'+'d'*16 and packaged['mechanics_only'] is True
+        # The Rust attempt may publish a newer receipt even when its witness
+        # fails. Do not demand the obsolete OBS8 receipt during failure cleanup.
+        receipt=None
+        receipt=prove_rust_reporter_roundtrip(archive,public,physical_sample)
+        assert receipt['nonce']=='0000000000000009'+'d'*16
         invalidate_policy()
         assert launcher.wait(timeout=35)==74
         final=confirm_inert();assert final['ExecMainCode']=='1' and final['ExecMainStatus']=='74' and final['Result']=='exit-code'
@@ -1022,8 +2018,22 @@ def prove_actual_coordinator_entry_loop():
         finally:
             if group is not None:os.close(group)
     assert proved
-    return {'fixed_coordinator_entry_loop_and_controlled_policy_refusal_verified':True,
-        'restricted_reporter_actual_entry_observation_receipt_verified':True}
+    result={'fixed_coordinator_entry_loop_and_controlled_policy_refusal_verified':True,
+        'restricted_reporter_actual_entry_observation_receipt_verified':True,
+        'projected_reader_policy_native_query_verified':True,
+        'restricted_reporter_fingerprint_matches_root_receipt_verified':True,
+        'restricted_reporter_session_root_status_roundtrip_verified':True,
+        'restricted_reporter_current_readonly_resource_admission_verified':True,
+        'restricted_reporter_parent_origin_clock_mechanics_verified':True,
+        'restricted_reporter_protected_environment_pin_mechanics_verified':True,
+        'restricted_reporter_artifact_dialogue_roundtrip_mechanics_verified':True,
+        'restricted_rust_parent_real_reporter_journal_mechanics_verified':True,
+        'restricted_rust_parent_report_body_hash_mechanics_verified':True,
+        'restricted_rust_parent_input_to_body_consistency_verified':True,
+        'restricted_reporter_artifact':packaged['artifact'],
+        'restricted_reporter_request_writer_roundtrip_verified':True}
+    result['restricted_rust_parent_sampled_process_profile_verified']=physical_sample
+    return result
 
 def is_live_worker(raw,*,parent=None):
     try:
@@ -1265,6 +2275,8 @@ def _run_worker(policy, number, *, stopped_child=False, policy_guard=None,journa
 
 def main():
     assert sys.platform == 'linux' and os.geteuid() == 0 and os.environ.get('GITHUB_ACTIONS') == 'true'
+    assert len(sys.argv)==2
+    archive=Path(sys.argv[1])
     for path in [Path(POLICY_ROOT), Path(CACHE_ROOT), Path(RUNTIME_ROOT), Path(STATE_ROOT), LIB_ROOT]:
         assert not path.exists(), 'Refuse to adopt an existing helper installation'
     unit_files = [Path('/run/systemd/system')/name for name in [PARENT_SLICE, WORKER_SLICE]]
@@ -1367,7 +2379,7 @@ def main():
                 'trust': {'keys': [{'id': 'fixture', 'format': 'gpg',
                                     'content_base64': base64.b64encode(signing_key).decode()}],
                           'tls_ca_base64': base64.b64encode(certificate_path.read_bytes()).decode()},
-                'pins': [], 'proxy': {'http': 'DIRECT', 'https': 'DIRECT'},
+                'pins': [{'package':'inventory-proof','match':{'version':'1.0'},'priority':123}], 'proxy': {'http': 'DIRECT', 'https': 'DIRECT'},
                 'auth': [{'machine': uri, 'login': 'fixture', 'password': password}]}
             if missing:
                 extra = dict(value['sources'][0], id='missing', uri=uri+'/missing')
@@ -1449,7 +2461,9 @@ for path in sys.argv[2:]:
         recovered,_,_=run_worker(good,8,policy_guard=private_policy_guard)
         assert recovered==0, 'Owned failed refresh unit was not acknowledged for the next job'
         assert (Path(CACHE_ROOT)/'current.json').read_bytes()==previous
-        resource_proof.update(prove_actual_coordinator_entry_loop())
+        barrier_marker=os.environ.get('GUARDED_UPDATE_NATIVE_BARRIER_PROOF')
+        assert barrier_marker in (None,'1')
+        resource_proof.update(prove_actual_coordinator_entry_loop(archive,barrier_marker=='1'))
         proof = {'schema_version': 1, 'scope': 'fixed_worker_trusted_policy',
             'synthetic_repository_only': True, 'target_repository_fit_proven': False,
             'coordinator_exercised': False, 'apt_refresh_exercised': True,

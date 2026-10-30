@@ -11,6 +11,7 @@ import sys
 from inventory_refresh_channel import ObservationChannel
 from inventory_refresh_dispatch import RootDispatcher
 from inventory_refresh_io import Inbox,StatusPublisher
+from inventory_refresh_maintenance_fence import present as maintenance_present
 from inventory_refresh_observation import _Ancestry
 from inventory_refresh_observation_transaction import ObservationTransaction
 from inventory_refresh_observer import kernel_clock
@@ -48,12 +49,25 @@ class FixedRuntime:
 
     @classmethod
     def fixed(cls):
+        return cls._construct(None)
+
+    @classmethod
+    def _with_maintenance_for_test(cls,maintenance):
+        """Exercise ownership ordering; not registered for production startup."""
+        if maintenance is None:raise ValueError('Inventory runtime unavailable')
+        maintenance.verify()
+        return cls._construct(maintenance)
+
+    @classmethod
+    def _construct(cls,maintenance):
         if (cls is not FixedRuntime or sys.platform!='linux' or
                 os.getresuid()!=(0,0,0) or os.getresgid()!=(0,0,0)):
             raise ValueError('Inventory runtime unavailable')
         value=object.__new__(cls)
         value._owned=[];value._state=None;value._lock=None;value._held=False
         value._journal=None;value._closed=False;value._failed=False;value._dispatcher=None
+        value._maintenance=maintenance
+        marker_check=False
         try:
             # Admission precedes all private policy/cache contents/account lookup.
             value._resources=RuntimeResources.fixed();value._own(value._resources)
@@ -62,6 +76,10 @@ class FixedRuntime:
             worker,reporter=accounts
             value._state=_state();value._journal=Journal(value._state.fds[-1])
             value._lock=value._journal.exclusive();value._lock.__enter__();value._held=True
+            marker_check=True
+            if maintenance_present(value._state.fds[-1],0,value._state.verify):
+                raise ValueError('Inventory runtime maintenance pending')
+            marker_check=False
             if value._journal.startup_ready() is not True:
                 raise ValueError('Inventory runtime requires reconciled durable state')
             value._writers=WriterExclusion.fixed(worker.pw_uid);value._own(value._writers)
@@ -82,7 +100,7 @@ class FixedRuntime:
             value._refresh._current(kernel_clock()[0])
             return value
         except BaseException:
-            value._fence()
+            if not marker_check:value._fence()
             try:value.close()
             except BaseException:pass
             raise ValueError('Inventory runtime admission unconfirmed') from None
@@ -97,6 +115,7 @@ class FixedRuntime:
 
     def _check(self):
         if self._closed or not self._held:raise ValueError('Inventory runtime closed')
+        if self._maintenance is not None:self._maintenance.verify()
         self._journal._locked();self._resources.sample();self._policy.recheck();self._state.verify()
         if _identities(_accounts())!=self._identities:raise ValueError('Inventory runtime accounts changed')
         if self._journal.snapshot()['unconfirmed']:raise ValueError('Inventory runtime unconfirmed')
@@ -110,6 +129,17 @@ class FixedRuntime:
             try:self.close()
             except BaseException:pass
             raise ValueError('Inventory runtime dispatch unconfirmed') from None
+
+    def drain(self):
+        """Enter one-way logical drain while retaining runtime ownership."""
+        if self._closed:raise ValueError('Inventory runtime closed')
+        try:
+            self._check();result=self._dispatcher.drain();self._check();return result
+        except BaseException:
+            self._fence()
+            try:self.close()
+            except BaseException:pass
+            raise ValueError('Inventory runtime drain unconfirmed') from None
 
     def close(self):
         if self._closed:
@@ -128,5 +158,11 @@ class FixedRuntime:
         if self._state is not None:
             state,self._state=self._state,None
             try:state.close()
+            except BaseException:self._failed=True
+        # A failed teardown must not release the cooperative exclusion early.
+        # Retain its descriptor until process exit; this is not cleanup proof.
+        if self._maintenance is not None and not self._failed:
+            maintenance,self._maintenance=self._maintenance,None
+            try:maintenance.close()
             except BaseException:self._failed=True
         if self._failed:raise ValueError('Inventory runtime shutdown unconfirmed')

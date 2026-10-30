@@ -48,6 +48,145 @@ class RefreshStateTests(unittest.TestCase):
                 'lock_held_until_boottime_ms':125,'released_boottime_ms':126,'outcome':'released',
                 'installed_before_sha256':'d'*64,'installed_after_sha256':'d'*64}
 
+    def test_counter_snapshot_is_locked_read_only_and_preserves_distinct_floors(self):
+        self.initialize()
+        with self.assertRaises(ValueError):self.journal.counter_snapshot()
+        with self.journal.exclusive():
+            state=self.journal.snapshot()
+            for name,value in (('refresh',4),('observation',7),('release',9)):
+                state['capabilities'][name]['high_water']=value
+            self.journal._save(state)
+            before=(self.directory/'control.json').read_bytes()
+            result=self.journal.counter_snapshot()
+            self.assertEqual(result,{'schema_version':1,'root_epoch':'a'*32,'refresh_high_water':4,
+                'observation_high_water':7,'release_high_water':9})
+            result['refresh_high_water']=999
+            self.assertEqual(self.journal.counter_snapshot()['refresh_high_water'],4)
+            self.assertEqual((self.directory/'control.json').read_bytes(),before)
+
+    def test_counter_proposal_durably_admits_only_the_exact_current_floor(self):
+        self.initialize()
+        with self.journal.exclusive():
+            state=self.journal.snapshot()
+            state['capabilities']['observation']['high_water']=4
+            state['capabilities']['release']['high_water']=7
+            self.journal._save(state)
+            nonce='0000000000000008'+'a'*16
+            self.assertEqual(self.journal.admit_counter_proposal('a'*32,'observation',nonce,self.boot,100,'b'*64),'new')
+            saved=self.journal.snapshot()
+            self.assertEqual(saved['capabilities']['observation']['high_water'],8)
+            self.assertEqual(saved['capabilities']['observation']['active']['correlator'],nonce)
+            self.assertEqual(saved['capabilities']['observation']['active']['phase'],'received')
+            self.assertTrue(self.journal.start('observation',nonce,self.boot,101,policy='b'*64))
+            self.assertEqual(self.journal.receive('release',nonce,self.boot,102,'b'*64),'new')
+            self.assertEqual(self.journal.snapshot()['capabilities']['release']['high_water'],8)
+
+    def test_counter_proposal_rejects_invalid_stale_overflow_and_active_without_writes(self):
+        self.initialize()
+        with self.assertRaises(ValueError):self.journal.admit_counter_proposal('a'*32,'refresh',self.nonce,self.boot,100,'b'*64)
+        with self.journal.exclusive():
+            before=(self.directory/'control.json').read_bytes()
+            for epoch,capability,nonce,boot,now,policy in (
+                ('b'*32,'refresh',self.nonce,self.boot,100,'b'*64),
+                ('a'*32,'release',self.nonce,self.boot,100,'b'*64),
+                ('a'*32,'refresh','0000000000000002'+'a'*16,self.boot,100,'b'*64),
+                ('a'*32,'refresh',self.nonce,'bad',100,'b'*64),
+                ('a'*32,'refresh',self.nonce,self.boot,True,'b'*64),
+                ('a'*32,'refresh',self.nonce,self.boot,100,'bad')):
+                with self.subTest(capability=capability,boot=boot),self.assertRaises(ValueError):
+                    self.journal.admit_counter_proposal(epoch,capability,nonce,boot,now,policy)
+                self.assertEqual((self.directory/'control.json').read_bytes(),before)
+            state=self.journal.snapshot();state['capabilities']['refresh']['high_water']=2**53-1
+            self.journal._save(state);before=(self.directory/'control.json').read_bytes()
+            with self.assertRaises(ValueError):self.journal.admit_counter_proposal('a'*32,'refresh',self.nonce,self.boot,100,'b'*64)
+            self.assertEqual((self.directory/'control.json').read_bytes(),before)
+
+    def test_counter_proposal_is_revocable_and_release_uses_same_nonce(self):
+        self.initialize()
+        with self.journal.exclusive():
+            self.journal.admit_counter_proposal('a'*32,'observation',self.nonce,self.boot,100,'b'*64)
+            before=(self.directory/'control.json').read_bytes()
+            with self.assertRaises(ValueError):self.journal.admit_counter_proposal('a'*32,'refresh',self.nonce,self.boot,100,'b'*64)
+            self.assertEqual((self.directory/'control.json').read_bytes(),before)
+            later='0000000000000002'+'b'*16
+            self.assertEqual(self.journal.receive('observation',later,self.boot,101,'b'*64),'new')
+            with self.assertRaises(ValueError):self.journal.start('observation',self.nonce,self.boot,102,policy='b'*64)
+            self.assertTrue(self.journal.start('observation',later,self.boot,102,policy='b'*64))
+            self.assertEqual(self.journal.receive('release',later,self.boot,103,'b'*64),'new')
+            self.assertEqual(self.journal.snapshot()['capabilities']['release']['high_water'],2)
+
+    def test_counter_proposal_uncertain_fsync_returns_no_success_and_poisoned_view(self):
+        self.initialize()
+        with self.journal.exclusive():
+            with patch.object(self.p.os,'fsync',side_effect=OSError('synthetic I/O')):
+                with self.assertRaises(OSError):self.journal.admit_counter_proposal('a'*32,'refresh',self.nonce,self.boot,100,'b'*64)
+            with self.assertRaises(ValueError):self.journal.counter_snapshot()
+
+    def test_counter_proposal_lost_reply_remains_received_and_replay_is_not_new(self):
+        self.initialize()
+        with self.journal.exclusive():
+            self.journal.admit_counter_proposal('a'*32,'refresh',self.nonce,self.boot,100,'b'*64)
+        reopened=self.p.Journal(self.fd,owner=os.getuid())
+        with reopened.exclusive():
+            self.assertTrue(reopened.startup_ready())
+            before=(self.directory/'control.json').read_bytes()
+            with self.assertRaises(ValueError):reopened.admit_counter_proposal('a'*32,'refresh',self.nonce,self.boot,100,'b'*64)
+            self.assertEqual(reopened.receive('refresh',self.nonce,self.boot,100,'b'*64),'existing')
+            self.assertEqual((self.directory/'control.json').read_bytes(),before)
+
+    def test_counter_proposal_post_replace_fsync_failure_does_not_return_success(self):
+        self.initialize()
+        real_fsync=os.fsync
+        calls=[]
+        def fail_directory(fd):
+            calls.append(fd)
+            if len(calls)==2:raise OSError('synthetic directory barrier failure')
+            return real_fsync(fd)
+        with self.journal.exclusive():
+            with patch.object(self.p.os,'fsync',side_effect=fail_directory):
+                with self.assertRaises(OSError):self.journal.admit_counter_proposal('a'*32,'refresh',self.nonce,self.boot,100,'b'*64)
+            with self.assertRaises(ValueError):self.journal.snapshot()
+        reopened=self.p.Journal(self.fd,owner=os.getuid())
+        with reopened.exclusive():
+            self.assertTrue(reopened.startup_ready())
+            state=reopened.snapshot()
+            self.assertEqual(state['capabilities']['refresh']['active']['correlator'],self.nonce)
+            with self.assertRaises(ValueError):reopened.admit_counter_proposal('a'*32,'refresh',self.nonce,self.boot,100,'b'*64)
+
+    def test_counter_snapshot_rejects_active_or_unconfirmed_state(self):
+        self.initialize()
+        with self.journal.exclusive():
+            self.journal.receive('refresh',self.nonce,self.boot,100,'b'*64)
+            before=(self.directory/'control.json').read_bytes()
+            with self.assertRaises(ValueError):self.journal.counter_snapshot()
+            self.assertEqual((self.directory/'control.json').read_bytes(),before)
+            self.journal.fence_external()
+            before=(self.directory/'control.json').read_bytes()
+            with self.assertRaises(ValueError):self.journal.counter_snapshot()
+            self.assertEqual((self.directory/'control.json').read_bytes(),before)
+
+    def test_counter_snapshot_rejects_torn_invalid_or_mismatched_state(self):
+        self.initialize()
+        with self.journal.exclusive():
+            path=self.directory/'control.json'
+            original=path.read_bytes()
+            value=json.loads(original)
+            invalid=[]
+            wrong_epoch=dict(value,epoch='b'*32)
+            invalid.append(json.dumps(wrong_epoch).encode())
+            for number in (True,2**53):
+                item=json.loads(original)
+                item['capabilities']['observation']['high_water']=number
+                invalid.append(json.dumps(item).encode())
+            invalid.extend((b'{',b'{"schema_version":3,"schema_version":3}'))
+            for raw in invalid:
+                path.write_bytes(raw)
+                with self.subTest(raw=raw[:20]),self.assertRaises(ValueError):self.journal.counter_snapshot()
+                self.assertEqual(path.read_bytes(),raw)
+            path.write_bytes(original)
+            (self.directory/'initialized-epoch').write_bytes(b'broken')
+            with self.assertRaises(ValueError):self.journal.counter_snapshot()
+
     def test_external_publication_uncertainty_preserves_success_but_blocks_admission(self):
         self.initialize()
         with self.journal.exclusive():

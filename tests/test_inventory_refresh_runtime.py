@@ -27,6 +27,8 @@ class RuntimeTests(unittest.TestCase):
         self.resource_factory=add('inventory_refresh_runtime.RuntimeResources.fixed',side_effect=lambda:(self.events.append('resources_open'),self.resources)[1])
         self.policy_factory=add('inventory_refresh_runtime.PolicyGuard.fixed',side_effect=lambda:(self.events.append('policy_open'),f.policy)[1])
         add('inventory_refresh_runtime._state',return_value=self.state)
+        actual_maintenance_present=module.maintenance_present
+        add('inventory_refresh_runtime.maintenance_present',side_effect=lambda fd,owner,verify:actual_maintenance_present(fd,os.getuid(),verify))
         add('inventory_refresh_runtime._accounts',return_value=self.accounts)
         add('inventory_refresh_runtime.Journal',return_value=f.journal)
         add('inventory_refresh_runtime.Store',return_value=f.store)
@@ -55,6 +57,237 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(self.runtime.step()['state'],'ready')
         self.assertIs(self.runtime._dispatcher._journal,self.f.journal)
         self.assertEqual(self.f.status()['cache_generation'],'c'*32)
+
+    def test_existing_maintenance_marker_rejects_without_journal_write(self):
+        marker=self.f.root/'state'/'maintenance.pending';marker.write_bytes(b'partial')
+        state_before={p.name:p.read_bytes() for p in (self.f.root/'state').iterdir() if p.is_file()}
+        self.f.journal.fence_external=Mock()
+        with self.assertRaises(ValueError):module.FixedRuntime.fixed()
+        self.f.journal.fence_external.assert_not_called()
+        state_after={p.name:p.read_bytes() for p in (self.f.root/'state').iterdir() if p.is_file()}
+        self.assertEqual(state_after,state_before)
+        module.WriterExclusion.fixed.assert_not_called()
+        module.Inbox.fixed.assert_not_called()
+        for inbox in self.inboxes.values():inbox.read.assert_not_called()
+
+    def test_dangling_marker_and_marker_io_error_reject_without_journal_write(self):
+        marker=self.f.root/'state'/'maintenance.pending';marker.symlink_to('missing')
+        state_before={p.name:p.read_bytes() for p in (self.f.root/'state').iterdir() if p.is_file()}
+        self.f.journal.fence_external=Mock()
+        with self.assertRaises(ValueError):module.FixedRuntime.fixed()
+        self.assertTrue(marker.is_symlink())
+        marker.unlink()
+        with patch.object(module,'maintenance_present',side_effect=OSError('uncertain')):
+            with self.assertRaises(ValueError):module.FixedRuntime.fixed()
+        self.f.journal.fence_external.assert_not_called()
+        state_after={p.name:p.read_bytes() for p in (self.f.root/'state').iterdir() if p.is_file()}
+        self.assertEqual(state_after,state_before)
+        module.WriterExclusion.fixed.assert_not_called()
+        module.Inbox.fixed.assert_not_called()
+        for inbox in self.inboxes.values():inbox.read.assert_not_called()
+
+    def test_runtime_drain_latches_without_releasing_root_lock(self):
+        self.runtime=module.FixedRuntime.fixed()
+        self.runtime._observation._clock=self.f.clock
+        self.assertEqual(self.runtime.drain()['state'],'drained')
+        self.assertEqual(self.runtime.step()['state'],'drained')
+        self.assertNotIn('lock_exit',self.events)
+        self.assertFalse(self.f.journal.snapshot()['unconfirmed'])
+
+    def test_maintenance_guard_is_held_through_runtime_close(self):
+        import subprocess
+        from inventory_refresh_maintenance_lock import MaintenanceLock
+        path=self.f.root/'maintenance';path.mkdir(mode=0o700)
+        (path/'maintenance.lock').write_bytes(b'');(path/'maintenance.lock').chmod(0o644)
+        directory=os.open(path,os.O_RDONLY|os.O_DIRECTORY)
+        guard=MaintenanceLock.from_directory(directory,'participant',os.getuid(),os.getgid())
+        program="import fcntl,os,sys\nfd=os.open(sys.argv[1],os.O_RDONLY)\ntry:\n fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)\nexcept BlockingIOError: sys.exit(42)\nfinally: os.close(fd)"
+        def contender():
+            child=subprocess.Popen([sys.executable,'-I','-B','-S','-c',program,str(path/'maintenance.lock')],
+                stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+            return child.wait(timeout=5)
+        original_close=self.state.close.side_effect
+        def state_close():
+            self.assertEqual(contender(),42)
+            original_close()
+        self.state.close.side_effect=state_close
+        try:
+            self.runtime=module.FixedRuntime._with_maintenance_for_test(guard)
+            self.assertEqual(contender(),42)
+            self.runtime.close();self.runtime.close()
+            self.assertEqual(contender(),0)
+        finally:
+            os.close(directory)
+
+    def test_failed_runtime_close_does_not_release_maintenance_guard(self):
+        guard=Mock();self.runtime=module.FixedRuntime._with_maintenance_for_test(guard)
+        self.state.close.side_effect=ValueError('uncertain')
+        with self.assertRaises(ValueError):self.runtime.close()
+        with self.assertRaises(ValueError):self.runtime.close()
+        guard.close.assert_not_called()
+
+    def test_changed_maintenance_guard_fences_runtime_and_is_retained(self):
+        guard=Mock();self.runtime=module.FixedRuntime._with_maintenance_for_test(guard)
+        guard.verify.side_effect=ValueError('changed')
+        with self.assertRaises(ValueError):self.runtime.step()
+        self.assertTrue(self.f.journal.snapshot()['unconfirmed'])
+        guard.close.assert_not_called()
+
+    def test_maintenance_guard_close_failure_remains_absorbing(self):
+        guard=Mock();guard.close.side_effect=ValueError('uncertain')
+        self.runtime=module.FixedRuntime._with_maintenance_for_test(guard)
+        with self.assertRaises(ValueError):self.runtime.close()
+        with self.assertRaises(ValueError):self.runtime.close()
+        guard.close.assert_called_once()
+
+    def test_maintenance_is_retained_on_runtime_construction_failure(self):
+        for target in ('resources','policy','journal'):
+            with self.subTest(target=target):
+                guard=Mock()
+                factory={'resources':self.resource_factory,'policy':self.policy_factory,
+                         'journal':self.f.journal.startup_ready}[target]
+                # startup_ready is normally a bound method rather than a mock.
+                if target=='journal':
+                    with patch.object(self.f.journal,'startup_ready',return_value=False):
+                        with self.assertRaises(ValueError):module.FixedRuntime._with_maintenance_for_test(guard)
+                else:
+                    old=factory.side_effect;factory.side_effect=ValueError('uncertain')
+                    try:
+                        with self.assertRaises(ValueError):module.FixedRuntime._with_maintenance_for_test(guard)
+                    finally:factory.side_effect=old
+                guard.close.assert_not_called()
+
+    def test_runtime_drain_keeps_active_request_and_fences_context_failure(self):
+        self.runtime=module.FixedRuntime.fixed()
+        self.runtime._observation._clock=self.f.clock
+        self.f.journal.receive('refresh','0000000000000002'+'a'*16,self.f.boot,200,self.f.policy.generation)
+        self.assertEqual(self.runtime.drain()['state'],'draining')
+        self.assertNotIn('lock_exit',self.events)
+        self.accounts[0].pw_uid=503
+        with self.assertRaises(ValueError):self.runtime.drain()
+        self.assertTrue(self.f.journal.snapshot()['unconfirmed'])
+        self.assertIn('lock_exit',self.events)
+
+    def test_runtime_drain_fences_after_context_changes(self):
+        self.runtime=module.FixedRuntime.fixed();self.runtime._observation._clock=self.f.clock
+        original=self.runtime._check;calls=[]
+        def changed():
+            calls.append(1)
+            if len(calls)>1:raise ValueError('changed')
+            return original()
+        self.runtime._check=Mock(side_effect=changed)
+        with self.assertRaises(ValueError):self.runtime.drain()
+        self.assertGreaterEqual(len(calls),2)
+        self.assertTrue(self.f.journal.snapshot()['unconfirmed'])
+        self.assertIn('lock_exit',self.events)
+
+    def test_runtime_drain_retains_real_journal_lock_until_close(self):
+        import subprocess
+        self.f.lock.__exit__(None,None,None)
+        self.f.journal.exclusive=self.original_exclusive
+        self.runtime=module.FixedRuntime.fixed();self.runtime._observation._clock=self.f.clock
+        from inventory_refresh_state import Journal
+        other=Journal(self.f.fds[0],owner=os.getuid())
+        program="import fcntl,os,sys\nfd=os.open(sys.argv[1],os.O_RDWR|os.O_NOFOLLOW)\ntry:\n fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)\nexcept BlockingIOError: sys.exit(42)\nfinally: os.close(fd)"
+        def contender():
+            child=subprocess.Popen([sys.executable,'-I','-B','-S','-c',program,str(self.f.root/'state/control.lock')],
+                stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+            return child.wait(timeout=5)
+        try:
+            self.assertEqual(self.runtime.drain()['state'],'drained')
+            with self.assertRaises(OSError):
+                with other.exclusive():pass
+            self.assertEqual(contender(),42)
+            self.runtime.close()
+            with other.exclusive():pass
+            self.assertEqual(contender(),0)
+        finally:
+            self.runtime.close()
+            self.f.lock=self.f.journal.exclusive();self.f.lock.__enter__()
+
+    def test_two_process_maintenance_handoff_after_logical_drain(self):
+        import select,subprocess
+        from inventory_refresh_maintenance_lock import MaintenanceAdmission,MaintenanceContended
+        path=self.f.root/'maintenance';path.mkdir(mode=0o700)
+        for name in ('maintenance.lock','admission.lock'):
+            (path/name).write_bytes(b'');(path/name).chmod(0o644)
+        directory=os.open(path,os.O_RDONLY|os.O_DIRECTORY)
+        self.f.lock.__exit__(None,None,None);self.f.journal.exclusive=self.original_exclusive
+        guard=MaintenanceAdmission.participant(directory,os.getuid(),os.getgid())
+        self.runtime=module.FixedRuntime._with_maintenance_for_test(guard)
+        self.runtime._observation._clock=self.f.clock
+        program="import os,sys\nsys.path.insert(0,sys.argv[1])\nfrom inventory_refresh_maintenance_lock import MaintenanceAdmission\nd=os.open(sys.argv[2],os.O_RDONLY|os.O_DIRECTORY)\ng=MaintenanceAdmission.maintenance(d,os.getuid(),os.getgid())\nos.write(1,b'g')\nwhile True:\n c=os.read(0,1)\n if c==b't': os.write(1,b'a' if g.try_lifetime() else b'w')\n elif c==b'q': g.close();os.close(d);break\n else: os._exit(78)"
+        child=subprocess.Popen([sys.executable,'-I','-B','-S','-c',program,str(Path(module.__file__).parent),str(path)],
+            stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL)
+        def response():
+            self.assertTrue(select.select([child.stdout],[],[],5)[0]);return os.read(child.stdout.fileno(),1)
+        try:
+            self.assertEqual(response(),b'g')
+            with self.assertRaises(MaintenanceContended):
+                MaintenanceAdmission.participant(directory,os.getuid(),os.getgid())
+            child.stdin.write(b't');child.stdin.flush();self.assertEqual(response(),b'w')
+            self.assertEqual(self.runtime.drain()['state'],'drained')
+            child.stdin.write(b't');child.stdin.flush();self.assertEqual(response(),b'w')
+            self.runtime.close()
+            child.stdin.write(b't');child.stdin.flush();self.assertEqual(response(),b'a')
+            child.stdin.write(b'q');child.stdin.close();child.stdin=None
+            self.assertEqual(child.wait(timeout=5),0)
+            participant=MaintenanceAdmission.participant(directory,os.getuid(),os.getgid());participant.close()
+        finally:
+            if child.stdin is not None:child.stdin.close()
+            child.stdout.close();os.close(directory)
+            self.runtime.close();self.f.lock=self.f.journal.exclusive();self.f.lock.__enter__()
+
+    def test_maintenance_cannot_acquire_lifetime_while_active_request_drains(self):
+        from inventory_refresh_maintenance_lock import MaintenanceAdmission,MaintenanceContended
+        path=self.f.root/'maintenance';path.mkdir(mode=0o700)
+        for name in ('maintenance.lock','admission.lock'):
+            (path/name).write_bytes(b'');(path/name).chmod(0o644)
+        directory=os.open(path,os.O_RDONLY|os.O_DIRECTORY)
+        guard=MaintenanceAdmission.participant(directory,os.getuid(),os.getgid())
+        self.runtime=module.FixedRuntime._with_maintenance_for_test(guard)
+        self.runtime._observation._clock=self.f.clock
+        owner=MaintenanceAdmission.maintenance(directory,os.getuid(),os.getgid())
+        try:
+            self.f.journal.receive('refresh','0000000000000002'+'a'*16,self.f.boot,200,self.f.policy.generation)
+            self.assertEqual(self.runtime.drain()['state'],'draining')
+            self.assertFalse(owner.try_lifetime())
+            with self.assertRaises(MaintenanceContended):
+                MaintenanceAdmission.participant(directory,os.getuid(),os.getgid())
+        finally:
+            owner.close()
+            try:self.runtime.close()
+            except ValueError:pass
+            # Failed runtime shutdown deliberately retains its shared guard.
+            try:guard.close()
+            except ValueError:pass
+            os.close(directory)
+
+    def test_maintenance_control_drains_actual_runtime_before_lifetime(self):
+        import threading,time
+        from inventory_refresh_maintenance_lock import MaintenanceAdmission
+        import inventory_refresh_maintenance_control as control
+        path=self.f.root/'maintenance';path.mkdir(mode=0o700)
+        for name in ('maintenance.lock','admission.lock'):
+            (path/name).write_bytes(b'');(path/name).chmod(0o644)
+        directory=os.open(path,os.O_RDONLY|os.O_DIRECTORY)
+        self.f.lock.__exit__(None,None,None);self.f.journal.exclusive=self.original_exclusive
+        guard=MaintenanceAdmission.participant(directory,os.getuid(),os.getgid())
+        self.runtime=module.FixedRuntime._with_maintenance_for_test(guard)
+        self.runtime._observation._clock=self.f.clock
+        owner=MaintenanceAdmission.maintenance(directory,os.getuid(),os.getgid())
+        request_read,request_write=os.pipe();reply_read,reply_write=os.pipe();errors=[]
+        def serve():
+            try:control.serve(self.runtime,request_read,reply_write,time.monotonic()+3)
+            except ValueError:errors.append(1)
+        thread=threading.Thread(target=serve);thread.start()
+        try:
+            self.assertTrue(control.request(owner,request_write,reply_read,time.monotonic()+3))
+            thread.join(3);self.assertFalse(thread.is_alive());self.assertEqual(errors,[])
+            self.assertTrue(self.runtime._closed);owner.close()
+        finally:
+            os.close(directory);self.runtime.close()
+            self.f.lock=self.f.journal.exclusive();self.f.lock.__enter__()
 
     def test_false_startup_barrier_refuses_dispatch_without_initialization(self):
         self.f.journal.startup_ready=Mock(return_value=False);self.f.journal.initialize=Mock()
