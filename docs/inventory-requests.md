@@ -88,9 +88,9 @@ journal, or retained manual or collection work defers that collection and
 reports an error on check-in; retained uploads and check-ins continue. The fence
 does not change the journal or initialize missing counters. A genuinely absent
 journal and pending file retain the existing scheduling behavior. This is a
-conservative transition: terminal failed or expired deliveries with no start
-acknowledgement or work evidence no longer block collection, and their tombstones
-remain intact. Any completed, acknowledged or uncertain work still prevents a
+conservative transition: unacknowledged received deliveries and terminal failed
+or expired deliveries with no work evidence no longer block collection; their
+request metadata remains intact. Any completed, acknowledged or uncertain work still prevents a
 daily collection until a later reconciliation implementation can safely clear it. The
 fence does not prove processes have stopped or enable device requests.
 

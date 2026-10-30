@@ -1292,14 +1292,17 @@ pub(super) fn runtime_collection_fence(
     Ok([&journal.journal.manual, &journal.journal.collection]
         .iter()
         .any(|domain| {
-            domain.active.is_some()
+            domain
+                .active
+                .as_ref()
+                .is_some_and(|entry| !active_never_started(entry))
                 || domain
                     .last_terminal
                     .as_ref()
                     .is_some_and(|entry| !terminal_never_started(entry))
         }))
 }
-fn terminal_never_started(entry: &Entry) -> bool {
+fn no_start_authority(entry: &Entry) -> bool {
     let empty = match &entry.proof {
         Proof::Manual(proof) => {
             proof.helper.is_none()
@@ -1309,13 +1312,7 @@ fn terminal_never_started(entry: &Entry) -> bool {
         }
         Proof::Collection(proof) => proof.scan.is_none(),
     };
-    matches!(
-        entry.terminal,
-        Some(CanonicalStatus::Failed | CanonicalStatus::Expired)
-    ) && matches!(
-        entry.pending_status,
-        ClientStatus::Received | ClientStatus::Failed
-    ) && entry.acknowledged_nonce.is_none()
+    entry.acknowledged_nonce.is_none()
         && !entry.submitted
         && entry.native_attempt.is_none()
         && entry.report.is_none()
@@ -1323,6 +1320,20 @@ fn terminal_never_started(entry: &Entry) -> bool {
         && !entry.no_work_acknowledged
         && entry.attempts == 1
         && empty
+}
+fn active_never_started(entry: &Entry) -> bool {
+    entry.terminal.is_none()
+        && entry.pending_status == ClientStatus::Received
+        && no_start_authority(entry)
+}
+fn terminal_never_started(entry: &Entry) -> bool {
+    matches!(
+        entry.terminal,
+        Some(CanonicalStatus::Failed | CanonicalStatus::Expired)
+    ) && matches!(
+        entry.pending_status,
+        ClientStatus::Received | ClientStatus::Failed
+    ) && no_start_authority(entry)
 }
 impl<'a> RequestJournal<'a> {
     pub fn initialize(
@@ -2280,6 +2291,13 @@ mod tests {
         journal
             .admit(delivery(1), 1, &clock(1000), "aaaaaaaaaaaaaaaa", &session())
             .unwrap();
+        let status = journal.pending(Capability::Collection).unwrap().unwrap();
+        journal
+            .canonical(
+                Capability::Collection,
+                &canonical(&status, CanonicalStatus::Delivered, None),
+            )
+            .unwrap();
         let before = std::fs::read(fixture.dir.join("requests.json")).unwrap();
         assert!(runtime_collection_fence(&fixture.dir, BOOT, &fixture.lock).unwrap());
         assert_eq!(
@@ -2359,7 +2377,7 @@ mod tests {
             journal
                 .admit(delivery, 1, &clock(1000), "aaaaaaaaaaaaaaaa", &session())
                 .unwrap();
-            assert!(runtime_collection_fence(&fixture.dir, BOOT, &fixture.lock).unwrap());
+            assert!(!runtime_collection_fence(&fixture.dir, BOOT, &fixture.lock).unwrap());
             let status = journal.pending(cap).unwrap().unwrap();
             journal
                 .canonical(cap, &canonical(&status, CanonicalStatus::Failed, None))
@@ -2495,6 +2513,41 @@ mod tests {
             std::fs::read(fixture.dir.join("requests.json")).unwrap(),
             before
         );
+    }
+    #[test]
+    fn unacknowledged_active_delivery_remains_startable_only_after_durable_ack() {
+        for cap in [Capability::Manual, Capability::Collection] {
+            let fixture = Fixture::new();
+            let mut journal = fixture.open();
+            let delivery = if cap == Capability::Manual {
+                manual_delivery(1)
+            } else {
+                delivery(1)
+            };
+            journal
+                .admit(delivery, 1, &clock(1000), "aaaaaaaaaaaaaaaa", &session())
+                .unwrap();
+            assert!(journal.begin(cap, &clock(1001), &session()).is_err());
+            let before = std::fs::read(fixture.dir.join("requests.json")).unwrap();
+            assert!(!runtime_collection_fence(&fixture.dir, BOOT, &fixture.lock).unwrap());
+            assert_eq!(
+                std::fs::read(fixture.dir.join("requests.json")).unwrap(),
+                before
+            );
+            drop(journal);
+            let mut journal = fixture.open();
+            assert!(!runtime_collection_fence(&fixture.dir, BOOT, &fixture.lock).unwrap());
+            assert!(journal.begin(cap, &clock(1001), &session()).is_err());
+            let pending = journal.pending(cap).unwrap().unwrap();
+            journal
+                .canonical(cap, &canonical(&pending, CanonicalStatus::Delivered, None))
+                .unwrap();
+            assert!(runtime_collection_fence(&fixture.dir, BOOT, &fixture.lock).unwrap());
+            drop(journal);
+            let mut reopened = fixture.open();
+            assert!(runtime_collection_fence(&fixture.dir, BOOT, &fixture.lock).unwrap());
+            assert!(reopened.begin(cap, &clock(1001), &session()).is_ok());
+        }
     }
     fn native_without_attached_scan<'a>(
         fixture: &'a Fixture,

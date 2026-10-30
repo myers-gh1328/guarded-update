@@ -539,83 +539,88 @@ mod tests {
     }
     #[cfg(target_os = "linux")]
     #[test]
-    fn sync_allows_daily_collection_after_never_started_terminal_request() {
+    fn sync_allows_daily_collection_for_never_started_requests() {
         use requests::{
             Canonical, CanonicalRequest, CanonicalStatus, Capability, Clock, CollectionDelivery,
             CounterSeeds, Delivery, Negotiated, RequestJournal,
         };
-        let dir = state::tests::TestDir::new();
-        let mut config = config(&dir.0);
-        config.enrollment_id = "00000000-0000-4000-8000-000000000001".into();
-        Store::initialize(&dir.0, &config.enrollment_id).unwrap();
-        let lock = Lock::acquire(&dir.0).unwrap();
-        RequestJournal::initialize(
-            &dir.0,
-            &config.enrollment_id,
-            CounterSeeds {
-                helper: 5,
-                observation: 7,
-            },
-            &lock,
-        )
-        .unwrap();
-        let mut journal = RequestJournal::open(&dir.0, &config.enrollment_id, &lock).unwrap();
-        let request_id = "00000000-0000-4000-8000-000000000002";
-        let session =
-            Negotiated::new(&[Capability::Collection], &[Capability::Collection], true).unwrap();
-        journal
-            .admit(
-                Delivery::Collection(CollectionDelivery {
-                    request_id: request_id.into(),
-                    delivery_sequence: 1,
-                    not_before: "2026-01-01T00:00:00.000Z".into(),
-                    source_revision: 1,
-                }),
-                1,
-                &Clock {
-                    boot_id: config.enrollment_id.clone(),
-                    boottime_ms: 1000,
-                    unix_ms: 1_767_225_600_000,
+        for terminal in [false, true] {
+            let dir = state::tests::TestDir::new();
+            let mut config = config(&dir.0);
+            config.enrollment_id = "00000000-0000-4000-8000-000000000001".into();
+            Store::initialize(&dir.0, &config.enrollment_id).unwrap();
+            let lock = Lock::acquire(&dir.0).unwrap();
+            RequestJournal::initialize(
+                &dir.0,
+                &config.enrollment_id,
+                CounterSeeds {
+                    helper: 5,
+                    observation: 7,
                 },
-                "aaaaaaaaaaaaaaaa",
-                &session,
+                &lock,
             )
             .unwrap();
-        let status = journal.pending(Capability::Collection).unwrap().unwrap();
-        journal
-            .canonical(
-                Capability::Collection,
-                &Canonical {
-                    schema_version: 1,
-                    request: CanonicalRequest {
+            let mut journal = RequestJournal::open(&dir.0, &config.enrollment_id, &lock).unwrap();
+            let request_id = "00000000-0000-4000-8000-000000000002";
+            let session =
+                Negotiated::new(&[Capability::Collection], &[Capability::Collection], true)
+                    .unwrap();
+            journal
+                .admit(
+                    Delivery::Collection(CollectionDelivery {
                         request_id: request_id.into(),
                         delivery_sequence: 1,
-                        status: CanonicalStatus::Failed,
-                        reason: None,
-                        report_id: None,
-                        report_sha256: None,
-                        operation_nonce: status.operation_nonce,
+                        not_before: "2026-01-01T00:00:00.000Z".into(),
+                        source_revision: 1,
+                    }),
+                    1,
+                    &Clock {
+                        boot_id: config.enrollment_id.clone(),
+                        boottime_ms: 1000,
+                        unix_ms: 1_767_225_600_000,
                     },
-                    receipt: None,
-                },
-            )
-            .unwrap();
-        let before = std::fs::read(dir.0.join("requests.json")).unwrap();
-        drop(journal);
-        drop(lock);
-        let network = FakeNetwork {
-            offline: false,
-            calls: RefCell::new(vec![]),
-        };
-        assert!(sync(&config, &FailedCollector, &network, 100000).is_err());
-        assert_eq!(
-            Store::load(&dir.0, &config.enrollment_id)
-                .unwrap()
-                .schedule
-                .sequence,
-            1
-        );
-        assert_eq!(std::fs::read(dir.0.join("requests.json")).unwrap(), before);
+                    "aaaaaaaaaaaaaaaa",
+                    &session,
+                )
+                .unwrap();
+            if terminal {
+                let status = journal.pending(Capability::Collection).unwrap().unwrap();
+                journal
+                    .canonical(
+                        Capability::Collection,
+                        &Canonical {
+                            schema_version: 1,
+                            request: CanonicalRequest {
+                                request_id: request_id.into(),
+                                delivery_sequence: 1,
+                                status: CanonicalStatus::Failed,
+                                reason: None,
+                                report_id: None,
+                                report_sha256: None,
+                                operation_nonce: status.operation_nonce,
+                            },
+                            receipt: None,
+                        },
+                    )
+                    .unwrap();
+            }
+            let before = std::fs::read(dir.0.join("requests.json")).unwrap();
+            drop(journal);
+            drop(lock);
+            let network = FakeNetwork {
+                offline: false,
+                calls: RefCell::new(vec![]),
+            };
+            assert!(sync(&config, &FailedCollector, &network, 100000).is_err());
+            assert_eq!(
+                Store::load(&dir.0, &config.enrollment_id)
+                    .unwrap()
+                    .schedule
+                    .sequence,
+                1
+            );
+            assert_eq!(std::fs::read(dir.0.join("requests.json")).unwrap(), before);
+        }
     }
     #[test]
     fn fenced_collection_still_attempts_retained_upload() {
