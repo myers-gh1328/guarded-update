@@ -391,18 +391,25 @@ def run(archive):
     parent_chain = group_chain = fixture = artifact = binary = journal = inbox = probe = launcher = None
     failed = False
     completed = False
+    stage = 'unit_status'
     try:
         if unit_status(min(deadline, time.monotonic() + 3))['LoadState'] != 'not-found': raise ValueError(ERROR)
+        stage = 'account'
         create_account(deadline)
+        stage = 'archive'
         verified = verify_archive(root, archive)
+        stage = 'artifact'
         artifact = RunnerArtifact.fixed(verified['source_commit'], deadline)
+        stage = 'binary'
         binary = FixtureBinary.fixed(artifact)
         binary.publish()
         binary.verify_published()
+        stage = 'fixture'
         parent_chain = _Chain(('run',))
         parent_chain.verify()
         fixture = Fixture.create(parent_chain.fds[-1], 0, 60002, deadline)
         parent_chain.verify()
+        stage = 'journal'
         journal = Journal(fixture.state)
         inbox = Inbox(fixture.root, 'observation', 60002, 60002)
         description = 'Synthetic cross-UID inventory CAS ' + secrets.token_hex(16)
@@ -428,6 +435,7 @@ def run(archive):
                 '--test-threads=1', '--nocapture']
             artifact.verify(); binary.verify_published(); fixture.verify(); parent_chain.verify()
             if time.monotonic() >= deadline: raise ValueError(ERROR)
+            stage = 'launch'
             launcher = subprocess.Popen(args, env=ENV, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             endpoints = ((launcher.stdin, os.O_WRONLY), (launcher.stdout, os.O_RDONLY), (launcher.stderr, os.O_RDONLY))
             identities = []
@@ -440,6 +448,7 @@ def run(archive):
             for stream, _ in endpoints: os.set_blocking(stream.fileno(), False)
             verified_endpoints = tuple((stream, direction, identity) for (stream, direction), identity in zip(endpoints, identities))
             verify_endpoints(verified_endpoints)
+            stage = 'unit_pin'
             while True:
                 status = unit_status(min(deadline, time.monotonic() + 3))
                 if status['LoadState'] == 'loaded' and status['InvocationID'] and status['ControlGroup'] == expected_group:
@@ -448,33 +457,42 @@ def run(archive):
                     raise ValueError(ERROR)
                 time.sleep(.02)
             invocation, pid = validate_live_identity(status, description, expected_group)
+            stage = 'group_pin'
             group_chain = _Chain(('sys', 'fs', 'cgroup', 'command.slice', 'command-center.slice',
                 'command-center-inventory.slice', UNIT))
             group_chain.verify()
             held = os.fstat(group_chain.fds[-1])
             probe = ProcessProbe.fixed(pid, (os.major(held.st_dev), os.minor(held.st_dev)), deadline)
+            stage = 'marker'
             marker = read_marker(launcher.stderr.fileno(), deadline, lambda: verify_endpoints(verified_endpoints))
+            stage = 'process_sample'
             start = probe.sample()
             observe_single_process(group_chain.fds[-2], UNIT, group_chain.fds[-1], pid, deadline)
             fixture.verify(); parent_chain.verify(); group_chain.verify()
+            stage = 'cas'
             accept_after_marker(marker, fixture, journal, inbox)
+            stage = 'process_recheck'
             if probe.sample() != start: raise ValueError(ERROR)
             observe_single_process(group_chain.fds[-2], UNIT, group_chain.fds[-1], pid, deadline)
             again = unit_status(min(deadline, time.monotonic() + 3))
             validate_live_identity(again, description, expected_group, invocation, pid)
             fixture.verify(); parent_chain.verify(); group_chain.verify()
             probe.close(); probe = None
+            stage = 'ack'
             write_ack(launcher.stdin.fileno(), deadline, lambda: verify_endpoints(verified_endpoints))
             launcher.stdin.close(); launcher.stdin = None
+            stage = 'completion'
             output = read_completion(launcher.stdout.fileno(), launcher.stderr.fileno(), deadline,
                 lambda: verify_endpoints(verified_endpoints[1:]))
             remaining = deadline - time.monotonic()
             if remaining <= 0 or launcher.wait(timeout=remaining) != 0: raise ValueError(ERROR)
             validate_test_output(output)
+            stage = 'unit_final'
             final = unit_status(min(deadline, time.monotonic() + 3))
             if (final['Description'] != description or final['InvocationID'] != invocation or
                 final['ActiveState'] not in ('inactive', 'failed') or final['Result'] != 'success' or
                 final['ExecMainCode'] != '1' or final['ExecMainStatus'] != '0'): raise ValueError(ERROR)
+            stage = 'group_empty'
             group_chain.verify()
             empty_group(group_chain.fds[-2], UNIT, group_chain.fds[-1], deadline)
             fixture.verify(); parent_chain.verify(); artifact.verify(); binary.verify_published()
@@ -482,6 +500,7 @@ def run(archive):
     except BaseException:
         failed = True
     finally:
+        if completed: stage = 'cleanup'
         if launcher is not None:
             for stream in (launcher.stdin, launcher.stdout, launcher.stderr):
                 if stream is not None:
@@ -491,7 +510,9 @@ def run(archive):
             if owned is not None:
                 try: owned.close()
                 except BaseException: failed = True
-    if failed or not completed or time.monotonic() >= deadline: raise ValueError(ERROR)
+    if failed or not completed or time.monotonic() >= deadline:
+        print('Synthetic cross-UID stage=' + stage, file=sys.stderr)
+        raise ValueError(ERROR)
     return {'synthetic_cross_uid_journal_cas_received_unstarted': True,
             'production_authority': False, 'all_producer_cleanup_proven': False}
 

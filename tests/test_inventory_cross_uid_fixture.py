@@ -1,5 +1,7 @@
 """The synthetic cross-UID fixture accepts exactly one bounded binding shape."""
 import importlib.util
+import contextlib
+import io
 import os
 from pathlib import Path
 import tempfile
@@ -18,6 +20,16 @@ from inventory_refresh_io import Inbox
 
 
 class BindingTest(unittest.TestCase):
+    def test_failure_reports_only_fixed_stage_and_never_reaches_setup(self):
+        output = io.StringIO()
+        with patch.object(MODULE.sys, 'platform', 'linux'), patch.object(MODULE.os, 'geteuid', return_value=0), \
+             patch.dict(MODULE.os.environ, {'GITHUB_ACTIONS': 'true'}), \
+             patch.object(MODULE, 'unit_status', side_effect=ValueError('secret detail')), \
+             patch.object(MODULE, 'create_account') as account, contextlib.redirect_stderr(output):
+            with self.assertRaises(ValueError): MODULE.run('ignored')
+        account.assert_not_called()
+        self.assertEqual(output.getvalue(), 'Synthetic cross-UID stage=unit_status\n')
+
     def test_account_setup_timeout_does_not_signal_root_child(self):
         child = Mock()
         child.wait.side_effect = subprocess.TimeoutExpired('groupadd', 1)
