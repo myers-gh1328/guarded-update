@@ -70,5 +70,24 @@ class FenceTests(unittest.TestCase):
             stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
         self.assertEqual(child.wait(timeout=5),74);self.assertTrue(self.present())
 
+    def test_public_directory_requires_exact_read_only_access_profile(self):
+        os.fchmod(self.directory,0o755)
+        fence._public_directory(self.directory,os.getuid(),os.getgid(),lambda:None)
+        with self.assertRaises(ValueError):fence._public_directory(self.directory,os.getuid()+1,os.getgid(),lambda:None)
+        with self.assertRaises(ValueError):fence._public_directory(self.directory,os.getuid(),os.getgid()+1,lambda:None)
+        for mode in (0o700,0o775,0o777):
+            os.fchmod(self.directory,mode)
+            with self.assertRaises(ValueError):fence._public_directory(self.directory,os.getuid(),os.getgid(),lambda:None)
+
+    def test_public_publisher_rejects_nonroot_before_open(self):
+        account=type('Account',(),{'pw_uid':12345,'pw_gid':12345})()
+        with (patch.object(fence.sys,'platform','linux'),patch.object(fence.pwd,'getpwnam',return_value=account),
+              patch.object(fence.os,'geteuid',return_value=12345),patch.object(fence.os,'getegid',return_value=12345),
+              patch.object(fence.os,'getresuid',return_value=(12345,12345,12345),create=True),
+              patch.object(fence.os,'getresgid',return_value=(12345,12345,12345),create=True),
+              patch.object(fence.os,'open') as opened):
+            with self.assertRaises(ValueError):fence._fixed_public('create')
+        opened.assert_not_called()
+
 
 if __name__=='__main__':unittest.main()

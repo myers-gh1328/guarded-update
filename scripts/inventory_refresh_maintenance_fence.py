@@ -8,6 +8,7 @@ future owner must perform no dependent effect before confirmed publication and
 must reconcile uncertain startup separately rather than trust absence.
 """
 import os
+import pwd
 import stat
 import sys
 from inventory_refresh_observation import _Ancestry
@@ -89,6 +90,46 @@ def _fixed(operation):
         if operation=='present':result=present(ancestry.fds[-1],0,ancestry.verify)
         elif operation=='create':result=create(ancestry.fds[-1],0,0,ancestry.verify)
         else:raise ValueError(ERROR)
+    except BaseException:failed=True
+    finally:
+        if ancestry is not None:
+            try:ancestry.close()
+            except BaseException:failed=True
+        if root is not None:
+            try:os.close(root)
+            except OSError:failed=True
+    if failed:raise ValueError(ERROR)
+    return result
+
+
+def _public_directory(directory,owner,group,verify):
+    identity=_directory(directory,owner,verify)
+    if identity[4]!=group or stat.S_IMODE(identity[2])!=0o755:raise ValueError(ERROR)
+    return identity
+
+
+def _fixed_public(operation):
+    """Sample or publish one public marker; no launch or startup authority.
+
+    This alternate location is not registered. A future migration must check
+    both it and the private marker, never silently move or discard either.
+    """
+    if sys.platform!='linux' or operation not in ('present','create'):raise ValueError(ERROR)
+    root=None;ancestry=None;result=None;failed=False
+    try:
+        uid=os.geteuid();gid=os.getegid();account=pwd.getpwnam('ccinventory')
+        if (account.pw_uid<=0 or account.pw_gid<=0 or
+            (uid,gid) not in ((0,0),(account.pw_uid,account.pw_gid)) or
+            (operation=='create' and (uid,gid)!=(0,0)) or
+            os.getresuid()!=(uid,uid,uid) or os.getresgid()!=(gid,gid,gid)):
+            raise ValueError(ERROR)
+        root=os.open('/',os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW|os.O_NONBLOCK)
+        ancestry=_Ancestry.open(root,('var','lib','command-center-inventory-maintenance'))
+        def verify():
+            ancestry.verify();_public_directory(ancestry.fds[-1],0,0,lambda:None)
+        verify()
+        if operation=='present':result=present(ancestry.fds[-1],0,verify)
+        else:result=create(ancestry.fds[-1],0,0,verify)
     except BaseException:failed=True
     finally:
         if ancestry is not None:
