@@ -36,6 +36,17 @@ mod reporter_obs;
 mod reporter_pipe;
 #[cfg(all(
     test,
+    target_os = "linux",
+    any(
+        target_arch = "arm",
+        target_arch = "aarch64",
+        target_arch = "x86",
+        target_arch = "x86_64"
+    )
+))]
+mod reporter_request_fixture;
+#[cfg(all(
+    test,
     any(
         target_os = "macos",
         all(
