@@ -109,5 +109,95 @@ class MaintenanceLockTest(unittest.TestCase):
         with self.assertRaises(ValueError):guard.verify()
         with self.assertRaises(ValueError):guard.close()
 
+    def test_admission_blocks_new_participants_during_drain(self):
+        (self.path/'admission.lock').write_bytes(b'');(self.path/'admission.lock').chmod(0o644)
+        participant=module.MaintenanceAdmission.participant(self.parent,os.geteuid(),os.getegid())
+        owner=module.MaintenanceAdmission.maintenance(self.parent,os.geteuid(),os.getegid())
+        self.assertFalse(owner.try_lifetime())
+        with self.assertRaises(module.MaintenanceContended):
+            module.MaintenanceAdmission.participant(self.parent,os.geteuid(),os.getegid())
+        participant.close()
+        self.assertTrue(owner.try_lifetime())
+        owner.close()
+
+    def test_paused_admission_and_competing_maintenance(self):
+        (self.path/'admission.lock').write_bytes(b'');(self.path/'admission.lock').chmod(0o644)
+        gate=module.MaintenanceLock.from_directory(self.parent,'participant',os.geteuid(),os.getegid(),name=module.GATE)
+        with self.assertRaises(module.MaintenanceContended):
+            module.MaintenanceAdmission.maintenance(self.parent,os.geteuid(),os.getegid())
+        lifetime=self.guard('participant');gate.close()
+        owner=module.MaintenanceAdmission.maintenance(self.parent,os.geteuid(),os.getegid())
+        with self.assertRaises(module.MaintenanceContended):
+            module.MaintenanceAdmission.maintenance(self.parent,os.geteuid(),os.getegid())
+        self.assertFalse(owner.try_lifetime());lifetime.close()
+        self.assertTrue(owner.try_lifetime());owner.close()
+
+    def test_gate_cannot_be_exported_and_replacement_is_absorbing(self):
+        (self.path/'admission.lock').write_bytes(b'');(self.path/'admission.lock').chmod(0o644)
+        gate=module.MaintenanceLock.from_directory(self.parent,'participant',os.geteuid(),os.getegid(),name=module.GATE)
+        with self.assertRaises(ValueError):gate.inheritable_fd()
+        with self.assertRaises(ValueError):gate.close()
+        owner=module.MaintenanceAdmission.maintenance(self.parent,os.geteuid(),os.getegid())
+        (self.path/'admission.lock').rename(self.path/'old-gate')
+        (self.path/'admission.lock').write_bytes(b'');(self.path/'admission.lock').chmod(0o644)
+        with self.assertRaises(ValueError):owner.try_lifetime()
+        with self.assertRaises(ValueError):owner.close()
+        # Close the deliberately retained test descriptor after asserting unknown.
+        for fd in owner._gate._fds:os.close(fd)
+        owner._gate._fds=[]
+
+    def test_gate_blocks_new_participant_in_a_separate_process(self):
+        (self.path/'admission.lock').write_bytes(b'');(self.path/'admission.lock').chmod(0o644)
+        owner=module.MaintenanceAdmission.maintenance(self.parent,os.geteuid(),os.getegid())
+        program="import os,sys\nsys.path.insert(0,sys.argv[1])\nfrom inventory_refresh_maintenance_lock import MaintenanceAdmission,MaintenanceContended\nd=os.open(sys.argv[2],os.O_RDONLY|os.O_DIRECTORY)\ntry:\n g=MaintenanceAdmission.participant(d,os.getuid(),os.getgid())\nexcept MaintenanceContended: sys.exit(42)\ng.close();os.close(d)"
+        def contender():
+            child=subprocess.Popen([sys.executable,'-I','-B','-S','-c',program,str(Path(module.__file__).parent),str(self.path)],
+                stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+            return child.wait(timeout=5)
+        self.assertEqual(contender(),42);owner.close();self.assertEqual(contender(),0)
+
+    def test_separate_process_admission_pause_and_owner_crash(self):
+        (self.path/'admission.lock').write_bytes(b'');(self.path/'admission.lock').chmod(0o644)
+        program="import os,sys\nsys.path.insert(0,sys.argv[1])\nfrom inventory_refresh_maintenance_lock import MaintenanceLock,GATE\nd=os.open(sys.argv[2],os.O_RDONLY|os.O_DIRECTORY)\ng=MaintenanceLock.from_directory(d,sys.argv[3],os.getuid(),os.getgid(),name=GATE)\nos.write(1,b'ready\\n');sys.stdin.buffer.read(1);os._exit(77)"
+        def start(mode):
+            child=subprocess.Popen([sys.executable,'-I','-B','-S','-c',program,str(Path(module.__file__).parent),str(self.path),mode],
+                stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL)
+            self.assertTrue(select.select([child.stdout],[],[],5)[0]);self.assertEqual(child.stdout.readline(),b'ready\n')
+            return child
+        def finish(child):
+            child.stdin.write(b'x');child.stdin.close();child.stdin=None
+            self.assertEqual(child.wait(timeout=5),77);child.stdout.close()
+        paused=start('participant')
+        with self.assertRaises(module.MaintenanceContended):
+            module.MaintenanceAdmission.maintenance(self.parent,os.geteuid(),os.getegid())
+        finish(paused)
+        exclusive=start('maintenance')
+        with self.assertRaises(module.MaintenanceContended):
+            module.MaintenanceAdmission.maintenance(self.parent,os.geteuid(),os.getegid())
+        with self.assertRaises(module.MaintenanceContended):
+            module.MaintenanceAdmission.participant(self.parent,os.geteuid(),os.getegid())
+        finish(exclusive)
+        owner=module.MaintenanceAdmission.maintenance(self.parent,os.geteuid(),os.getegid());owner.close()
+
+    def test_uncertain_lifetime_does_not_release_gate(self):
+        (self.path/'admission.lock').write_bytes(b'');(self.path/'admission.lock').chmod(0o644)
+        owner=module.MaintenanceAdmission.maintenance(self.parent,os.geteuid(),os.getegid())
+        self.assertTrue(owner.try_lifetime())
+        with patch.object(owner._lifetime,'close',side_effect=ValueError('uncertain')):
+            with self.assertRaises(ValueError):owner.close()
+            with self.assertRaises(ValueError):owner.close()
+        with self.assertRaises(module.MaintenanceContended):
+            module.MaintenanceAdmission.participant(self.parent,os.geteuid(),os.getegid())
+        owner._lifetime.close();owner._gate.close()
+
+    def test_lifetime_failure_is_not_reported_as_contention(self):
+        (self.path/'admission.lock').write_bytes(b'');(self.path/'admission.lock').chmod(0o644)
+        owner=module.MaintenanceAdmission.maintenance(self.parent,os.geteuid(),os.getegid())
+        (self.path/'maintenance.lock').unlink()
+        with self.assertRaises(ValueError) as raised:owner.try_lifetime()
+        self.assertNotIsInstance(raised.exception,module.MaintenanceContended)
+        with self.assertRaises(ValueError):owner.close()
+        owner._gate.close()
+
 
 if __name__=='__main__':unittest.main()
