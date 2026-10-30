@@ -128,6 +128,41 @@ Crashes before or after either durable write, lost replies, reboot, duplicate
 clients and supersession must retain uncertainty rather than retry a launch.
 No journal seeding or runtime activation follows from this proposed flow.
 
+### Enrollment and Root epoch binding
+
+The current Linux provisioning workflow generates the reporting key on the
+device, hands its public half to the operator, and receives an enrollment UUID
+after that key and device identity are registered with Command Center. The
+Root-owned `initialized-enrollment` file is currently a historical recovery
+marker: provisioning checks whether it exists, not that its contents match the
+active server enrollment. It does not bind the reporting key to the helper epoch.
+
+A proposed first-binding ceremony would use an authenticated operator and
+trusted provisioning controller to compare one server observation of the active
+device, fleet, boundary, enrollment, key ID and public-key fingerprint with the
+device-generated public key and expected registration. It would run only in maintenance after preventing service and timer
+restart, proving the owned process sets empty, and acquiring the Root and agent
+journal locks in a separately reviewed order. Before publishing, it would
+revalidate the protected Root journal epoch, enrollment marker, agent schedule
+and reporting key. Agent-owned key bytes require an explicit ownership and lock
+boundary; the private key must not be exported.
+
+The proposed record is a separate, fixed Root-owned, read-only binding of the
+device, enrollment, key ID, key fingerprint and Root epoch. Initial publication must use
+exclusive nofollow creation, verified bytes and metadata, file and directory
+durability barriers, and no-replace publication under protected ancestry. A
+partial write, changed input, uncertain close or durability barrier is not
+success. A lost reply after publication requires full current-state validation
+and explicit recovery; merely finding identical bytes does not repair prior
+uncertainty. Existing journal counters and reports must not be reset.
+
+This ceremony is not implemented. Rotation and re-enrollment remain fail-closed
+until their own two-phase procedure preserves counter history and proves old
+work stopped. The server observation is only current at its observation point;
+the policy for later revocation, key replacement and offline operation remains
+to be defined. A Root-owned record alone does not authenticate a client or
+grant request execution authority.
+
 Linux sync inspects an existing request journal under its inventory lock before
 starting a daily collection. A pending journal replacement, invalid or unreadable
 journal, or retained manual or collection work defers that collection and
