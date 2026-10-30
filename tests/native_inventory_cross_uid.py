@@ -263,6 +263,20 @@ def empty_group(parent, name, group, deadline):
         raise ValueError(ERROR) from None
 
 
+def group_category(parent, name, group, deadline):
+    """Failure-only point sample; never an emptiness or reachability claim."""
+    try:
+        if time.monotonic() >= deadline: return 'unavailable'
+        held = os.fstat(group)
+        try: named = os.stat(name, dir_fd=parent, follow_symlinks=False)
+        except FileNotFoundError:
+            return 'missing' if time.monotonic() < deadline else 'unavailable'
+        if time.monotonic() >= deadline: return 'unavailable'
+        return 'same' if (held.st_dev, held.st_ino, held.st_mode) == (named.st_dev, named.st_ino, named.st_mode) else 'changed'
+    except (OSError, ValueError):
+        return 'unavailable'
+
+
 def read_completion(stdout, stderr, deadline, verify=lambda: None):
     """Read both pipes concurrently; stderr must have no bytes after the marker."""
     poller = select.poll()
@@ -664,8 +678,13 @@ def run(archive):
                 raise
             stage = 'group_empty'
             reference.verify()
-            group_chain.verify()
+            try: group_chain.verify()
+            except BaseException:
+                stage = 'group_chain_' + group_category(group_chain.fds[-2], UNIT, group_chain.fds[-1], deadline)
+                raise
+            stage = 'group_observation'
             empty_group(group_chain.fds[-2], UNIT, group_chain.fds[-1], deadline)
+            stage = 'postcheck'
             fixture.verify(); parent_chain.verify(); artifact.verify(); binary.verify_published()
             reference.verify()
             completed = True

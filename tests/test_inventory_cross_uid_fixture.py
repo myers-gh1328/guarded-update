@@ -204,6 +204,21 @@ class BindingTest(unittest.TestCase):
                 os.close(group)
                 os.close(parent)
 
+    def test_cgroup_diagnostic_emits_only_fixed_categories(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            parent = os.open(temporary, os.O_RDONLY | os.O_DIRECTORY)
+            os.mkdir('unit', dir_fd=parent)
+            group = os.open('unit', os.O_RDONLY | os.O_DIRECTORY, dir_fd=parent)
+            try:
+                self.assertEqual(MODULE.group_category(parent, 'unit', group, time.monotonic() + 5), 'same')
+                os.rename('unit', 'old', src_dir_fd=parent, dst_dir_fd=parent)
+                self.assertEqual(MODULE.group_category(parent, 'unit', group, time.monotonic() + 5), 'missing')
+                os.mkdir('unit', dir_fd=parent)
+                self.assertEqual(MODULE.group_category(parent, 'unit', group, time.monotonic() + 5), 'changed')
+                self.assertEqual(MODULE.group_category(parent, 'unit', group, time.monotonic() - 1), 'unavailable')
+            finally:
+                os.close(group); os.close(parent)
+
     def test_marker_must_be_exact_and_bounded(self):
         for raw, valid in [(b'INVENTORY-BARRIER-1\n', True), (b'wrong\n', False),
                            (b'INVENTORY-BARRIER-1\nextra', False)]:
