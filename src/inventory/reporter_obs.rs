@@ -762,6 +762,216 @@ mod tests {
     const BOOT: &str = "00000000-0000-4000-8000-000000000001";
     const REPORT: &str = "00000000-0000-4000-8000-000000000002";
     const REQUEST: &str = "00000000-0000-4000-8000-000000000003";
+    #[test]
+    fn actual_agent_and_root_journals_agree_on_unstarted_counter_admission() {
+        assert!(real_two_journal_counter_roundtrip("success").unwrap());
+    }
+    #[test]
+    fn actual_agent_and_root_journal_failures_remain_unfinished() {
+        for mode in ["wrong_epoch", "wrong_floor", "fsync", "lost_reply"] {
+            assert!(!real_two_journal_counter_roundtrip(mode).unwrap(), "{mode}");
+        }
+        assert!(real_two_journal_counter_roundtrip("setup_failure").is_err());
+    }
+    fn real_two_journal_counter_roundtrip(mode: &str) -> Result<bool> {
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::{Command, Stdio};
+        use std::time::{Duration, Instant};
+        // The child uses a private same-UID fixture, not a Root authority.
+        const CHILD: &str = r#"
+import json,os,sys
+sys.path.insert(0,sys.argv[1])
+from inventory_refresh_state import Journal
+fd=os.open(sys.argv[2],os.O_RDONLY|os.O_DIRECTORY)
+try:
+    j=Journal(fd,owner=os.getuid())
+    with j.exclusive():
+        j.initialize('a'*32)
+        mode=sys.argv[3]
+        assert mode in ('success','wrong_epoch','wrong_floor','fsync','lost_reply','setup_failure')
+        value=j.snapshot();value['capabilities']['observation']['high_water']=8 if mode=='wrong_floor' else 7
+        value['capabilities']['release']['high_water']=7;j._save(value)
+        raw=sys.stdin.buffer.readline(1025)
+        assert len(raw)<=1024 and raw.endswith(b'\n')
+        def unique(pairs):
+            result={}
+            for key,value in pairs:
+                assert key not in result
+                result[key]=value
+            return result
+        command=json.loads(raw,object_pairs_hook=unique)
+        assert type(command) is dict and set(command)=={'schema_version','nonce'} and type(command['schema_version']) is int and command['schema_version']==1
+        nonce=command['nonce']
+        if mode=='fsync':
+            original=os.fsync;calls=[]
+            def fail_after_replace(descriptor):
+                calls.append(descriptor)
+                if len(calls)==2:raise OSError('synthetic barrier failure')
+                original(descriptor)
+            os.fsync=fail_after_replace
+        try:
+            assert j.admit_counter_proposal('b'*32 if mode=='wrong_epoch' else 'a'*32,'observation',nonce,'00000000-0000-4000-8000-000000000001',1001,'b'*64)=='new'
+        except ValueError:
+            assert mode in ('wrong_epoch','wrong_floor')
+            phase=mode
+        except OSError:
+            assert mode=='fsync' and len(calls)==2
+            phase='fsync'
+        else:
+            assert mode in ('success','lost_reply')
+            if mode=='lost_reply':sys.exit(24)
+            phase='received'
+        result={'schema_version':1,'phase':phase,'epoch':'a'*32,'nonce':nonce}
+        sys.stdout.buffer.write((json.dumps(result,separators=(',',':'))+'\n').encode());sys.stdout.buffer.flush()
+finally:os.close(fd)
+"#;
+        let fixture = Fixture::new();
+        let session = negotiated();
+        let mut journal = fixture.ready(&session);
+        let intent = journal
+            .admit_native_collection(REPORT, 1, 1, &clock(1001), "bbbbbbbbbbbbbbbb", &session)
+            .map_err(|_| ERROR.to_owned())?;
+        let nonce = intent.observation_nonce().to_owned();
+        let raw = std::fs::read(fixture.dir.join("requests.json")).map_err(|_| ERROR.to_owned())?;
+        let persisted: Value = serde_json::from_slice(&raw).map_err(|_| ERROR.to_owned())?;
+        require(
+            persisted["collection"]["active"]["submitted"] == true
+                && persisted["collection"]["active"]["native_attempt"]["observation_nonce"]
+                    == nonce,
+        )?;
+        let root_dir = std::fs::canonicalize(std::env::temp_dir())
+            .map_err(|_| ERROR.to_owned())?
+            .join(format!(
+                "inventory-root-cas-{}",
+                super::super::transport::report_id().map_err(|_| ERROR.to_owned())?
+            ));
+        std::fs::create_dir(&root_dir).map_err(|_| ERROR.to_owned())?;
+        std::fs::set_permissions(&root_dir, std::fs::Permissions::from_mode(0o700))
+            .map_err(|_| ERROR.to_owned())?;
+        let scripts = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        #[cfg(target_os = "linux")]
+        let python = "/usr/bin/python3";
+        #[cfg(target_os = "macos")]
+        let python = "/opt/homebrew/bin/python3";
+        let mut child = Command::new(python)
+            .args(["-I", "-B", "-S", "-c", CHILD])
+            .arg(scripts)
+            .arg(&root_dir)
+            .arg(mode)
+            .env_clear()
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|_| ERROR.to_owned())?;
+        fn reap(
+            child: &mut std::process::Child,
+            deadline: Instant,
+        ) -> Option<std::process::ExitStatus> {
+            loop {
+                match child.try_wait() {
+                    Ok(Some(status)) if Instant::now() < deadline => return Some(status),
+                    Ok(Some(_)) | Err(_) => return None,
+                    Ok(None) if Instant::now() < deadline => {
+                        std::thread::sleep(Duration::from_millis(2))
+                    }
+                    Ok(None) => return None,
+                }
+            }
+        }
+        let input = child.stdin.take();
+        let output = child.stdout.take();
+        // Partial setup and implicit descriptor drops never prove closure. Retain
+        // fixture state even if the owned child happens to exit in time.
+        let mut pipes = match (input, output) {
+            (Some(input), Some(output)) if mode != "setup_failure" => {
+                match super::super::reporter_pipe::PipePair::new(input, output, deadline) {
+                    Ok(pipes) => pipes,
+                    Err(_) => {
+                        let _ = reap(&mut child, deadline);
+                        return Err(ERROR.into());
+                    }
+                }
+            }
+            (input, output) => {
+                drop(input);
+                drop(output);
+                let _ = reap(&mut child, deadline);
+                return Err(ERROR.into());
+            }
+        };
+        let mut phase_seen = None;
+        let operation = (|| -> Result<()> {
+            let published = journal
+                .publish_native_observation(intent, &clock(1002), &session, |sent| {
+                    let mut frame = serde_json::to_vec(&json!({"schema_version":1,"nonce":sent}))
+                        .map_err(|_| ERROR.to_owned())?;
+                    frame.push(b'\n');
+                    pipes.write_frame(&frame).map_err(|_| ERROR.to_owned())
+                })
+                .map_err(|_| ERROR.to_owned())?;
+            let frame = pipes.read_frame().map_err(|_| ERROR.to_owned())?;
+            let response = parse_frame(&frame).map_err(|_| ERROR.to_owned())?;
+            require(
+                response.as_object().is_some_and(|obj| obj.len() == 4)
+                    && response["schema_version"] == 1
+                    && response["epoch"] == "a".repeat(32)
+                    && response["nonce"] == nonce
+                    && published.observation_nonce() == nonce,
+            )?;
+            phase_seen = response["phase"].as_str().map(str::to_owned);
+            require(phase_seen.as_deref() == Some("received"))?;
+            Ok(())
+        })();
+        let eof = pipes.require_eof().is_ok();
+        let closed = pipes.close().is_ok();
+        let exit = reap(&mut child, deadline);
+        let unfinished = journal
+            .recover_collection(None)
+            .map_err(|_| ERROR.to_owned())?
+            == super::super::requests::CollectionRecovery::Unfinished;
+        require(unfinished && closed)?;
+        if Instant::now() < deadline && exit.is_some() {
+            let root_raw = super::super::state::read(&root_dir.join("control.json"), 65536)
+                .map_err(|_| ERROR.to_owned())?;
+            let root: Value = serde_json::from_slice(&root_raw).map_err(|_| ERROR.to_owned())?;
+            let active = &root["capabilities"]["observation"]["active"];
+            if matches!(mode, "success" | "fsync" | "lost_reply") {
+                require(active["correlator"] == nonce && active["started_boottime_ms"].is_null())?;
+            } else {
+                require(active.is_null())?;
+            }
+        } else {
+            return Err(ERROR.into());
+        }
+        drop(journal);
+        let mut reopened = RequestJournal::open(&fixture.dir, BOOT, &fixture.lock)
+            .map_err(|_| ERROR.to_owned())?;
+        require(
+            reopened
+                .admit_native_collection(REPORT, 1, 1, &clock(1003), "cccccccccccccccc", &session)
+                .is_err(),
+        )?;
+        if mode != "success" {
+            require(operation.is_err())?;
+            if mode == "lost_reply" {
+                require(
+                    phase_seen.is_none() && exit.is_some_and(|status| status.code() == Some(24)),
+                )?;
+            } else {
+                require(
+                    eof && phase_seen.as_deref() == Some(mode)
+                        && exit.is_some_and(|status| status.success()),
+                )?;
+            }
+            return Ok(false);
+        }
+        operation?;
+        require(eof && exit.is_some_and(|status| status.success()) && Instant::now() < deadline)?;
+        std::fs::remove_dir_all(root_dir).map_err(|_| ERROR.to_owned())?;
+        Ok(true)
+    }
     struct InputEvent {
         program: String,
         args: Vec<String>,
