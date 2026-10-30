@@ -13,6 +13,17 @@ import native_inventory_maintenance_public as native
 
 
 class PublicMarkerNativeTests(unittest.TestCase):
+    def test_reporter_parent_profile_is_exact_and_rejects_extra_files(self):
+        with tempfile.TemporaryDirectory() as path:
+            directory=os.open(path,os.O_RDONLY|os.O_DIRECTORY)
+            contents={name:name.encode() for name in native.PARENT_SOURCE_NAMES}
+            try:
+                stage=native.MarkerSources(directory,contents,os.getuid(),os.getgid(),profile='parent')
+                stage.publish();stage.verify()
+                (Path(path)/'shadow.py').write_bytes(b'foreign')
+                with self.assertRaises(ValueError):stage.verify()
+                stage.close()
+            finally:os.close(directory)
     def test_two_sources_publish_exclusively_and_revalidate(self):
         with tempfile.TemporaryDirectory() as path:
             directory=os.open(path,os.O_RDONLY|os.O_DIRECTORY)

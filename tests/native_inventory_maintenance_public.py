@@ -13,6 +13,7 @@ ERROR='Synthetic public maintenance marker unavailable'
 LIB='/usr/local/libexec/command-center-inventory-refresh'
 ENV={'PATH':'/usr/sbin:/usr/bin:/sbin:/bin','LC_ALL':'C'}
 SOURCE_NAMES=('inventory_refresh_maintenance_fence.py','inventory_refresh_observation.py')
+PARENT_SOURCE_NAMES=('inventory_refresh_resources.py','inventory_refresh_reporter_resources.py','inventory_refresh_reporter_parent.py')
 PROGRAM=r'''import os,sys
 sys.path.insert(0,'/usr/local/libexec/command-center-inventory-refresh')
 import inventory_refresh_maintenance_fence as fence
@@ -50,14 +51,16 @@ def _metadata(info):
 
 
 class MarkerSources:
-    """Two exact archive files; partial state is never retired here."""
-    def __init__(self,directory,contents,uid,gid):
+    """One fixed archive-file profile; partial state is never retired here."""
+    def __init__(self,directory,contents,uid,gid,*,profile='marker'):
         self.fd=os.dup(directory);self.uid=uid;self.gid=gid;self.contents=contents
         self.closed=False;self.failed=False;self.close_failed=False;self.published=False;self.records={}
         try:
             info=os.fstat(self.fd);self.identity=(info.st_dev,info.st_ino,info.st_mode,info.st_uid,info.st_gid)
+            if type(profile) is not str or profile not in ('marker','parent'):raise ValueError(ERROR)
+            self.names=SOURCE_NAMES if profile=='marker' else PARENT_SOURCE_NAMES
             if (not stat.S_ISDIR(info.st_mode) or (info.st_uid,info.st_gid)!=(uid,gid) or info.st_mode&0o022 or
-                type(contents) is not dict or set(contents)!=set(SOURCE_NAMES) or
+                type(contents) is not dict or set(contents)!=set(self.names) or
                 any(type(data) is not bytes or not 0<len(data)<=65536 for data in contents.values())):raise ValueError(ERROR)
         except BaseException:
             try:os.close(self.fd)
@@ -73,7 +76,7 @@ class MarkerSources:
         try:
             self._directory()
             if os.listdir(self.fd):raise ValueError(ERROR)
-            for name in SOURCE_NAMES:
+            for name in self.names:
                 self._directory()
                 if set(os.listdir(self.fd))!=set(self.records):raise ValueError(ERROR)
                 fd=None;identity=None
@@ -105,8 +108,8 @@ class MarkerSources:
         try:
             if self.failed or not self.published:raise ValueError(ERROR)
             self._directory()
-            if set(os.listdir(self.fd))!=set(SOURCE_NAMES):raise ValueError(ERROR)
-            for name in SOURCE_NAMES:
+            if set(os.listdir(self.fd))!=set(self.names):raise ValueError(ERROR)
+            for name in self.names:
                 fd=None;identity=None
                 try:
                     fd=os.open(name,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK,dir_fd=self.fd)
