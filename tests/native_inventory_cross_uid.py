@@ -247,6 +247,40 @@ def parse_binding(raw):
     return dict(BINDING)
 
 
+def ensure_libexec(parent, owner, deadline):
+    """Admit or exclusively create libexec under a caller-pinned parent."""
+    child = None
+    failed = False
+    try:
+        if type(owner) is not int or type(deadline) not in (float, int) or not math.isfinite(deadline) or time.monotonic() >= deadline:
+            raise ValueError(ERROR)
+        before = os.fstat(parent)
+        identity = (before.st_dev, before.st_ino, before.st_mode, before.st_uid, before.st_gid)
+        if not stat.S_ISDIR(before.st_mode) or before.st_uid != owner or before.st_mode & 0o022: raise ValueError(ERROR)
+        try:
+            os.stat('libexec', dir_fd=parent, follow_symlinks=False)
+        except FileNotFoundError:
+            os.mkdir('libexec', 0o755, dir_fd=parent)
+            if time.monotonic() >= deadline: raise ValueError(ERROR)
+            os.fsync(parent)
+        child = os.open('libexec', os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
+        held = os.fstat(child)
+        named = os.stat('libexec', dir_fd=parent, follow_symlinks=False)
+        after = os.fstat(parent)
+        if (not stat.S_ISDIR(held.st_mode) or held.st_uid != owner or held.st_mode & 0o022 or
+            (held.st_dev, held.st_ino, held.st_mode, held.st_uid, held.st_gid) !=
+            (named.st_dev, named.st_ino, named.st_mode, named.st_uid, named.st_gid) or
+            (after.st_dev, after.st_ino, after.st_mode, after.st_uid, after.st_gid) != identity):
+            raise ValueError(ERROR)
+    except BaseException:
+        failed = True
+    finally:
+        if child is not None:
+            try: os.close(child)
+            except OSError: failed = True
+    if failed or time.monotonic() >= deadline: raise ValueError(ERROR)
+
+
 class Fixture:
     """Exclusive borrowed-parent fixture; all filesystem contents are retained.
 
@@ -400,9 +434,19 @@ def run(archive):
         verified = verify_archive(root, archive)
         stage = 'artifact'
         artifact = RunnerArtifact.fixed(verified['source_commit'], deadline)
-        stage = 'binary'
+        stage = 'libexec'
+        libexec_parent = _Chain(('usr', 'local'))
+        try:
+            libexec_parent.verify()
+            ensure_libexec(libexec_parent.fds[-1], 0, deadline)
+            libexec_parent.verify()
+        finally:
+            libexec_parent.close()
+        stage = 'binary_constructor'
         binary = FixtureBinary.fixed(artifact)
+        stage = 'binary_publish'
         binary.publish()
+        stage = 'binary_verify'
         binary.verify_published()
         stage = 'fixture'
         parent_chain = _Chain(('run',))

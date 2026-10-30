@@ -20,6 +20,64 @@ from inventory_refresh_io import Inbox
 
 
 class BindingTest(unittest.TestCase):
+    def test_libexec_creation_is_exclusive_and_preserves_uncertain_paths(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            parent = os.open(temporary, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                MODULE.ensure_libexec(parent, os.geteuid(), time.monotonic() + 5)
+                self.assertTrue((Path(temporary) / 'libexec').is_dir())
+                MODULE.ensure_libexec(parent, os.geteuid(), time.monotonic() + 5)
+                (Path(temporary) / 'libexec').chmod(0o777)
+                with self.assertRaises(ValueError): MODULE.ensure_libexec(parent, os.geteuid(), time.monotonic() + 5)
+                (Path(temporary) / 'libexec').chmod(0o755)
+                (Path(temporary) / 'libexec').rmdir()
+                os.symlink('missing', Path(temporary) / 'libexec')
+                with self.assertRaises(ValueError): MODULE.ensure_libexec(parent, os.geteuid(), time.monotonic() + 5)
+                (Path(temporary) / 'libexec').unlink()
+                with patch.object(MODULE.os, 'fsync', side_effect=OSError('injected')):
+                    with self.assertRaises(ValueError): MODULE.ensure_libexec(parent, os.geteuid(), time.monotonic() + 5)
+                self.assertTrue((Path(temporary) / 'libexec').is_dir())
+            finally:
+                os.close(parent)
+
+    def test_libexec_replacement_fails_and_keeps_both_directories(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            parent = os.open(temporary, os.O_RDONLY | os.O_DIRECTORY)
+            path = Path(temporary) / 'libexec'
+            path.mkdir()
+            real_open = os.open
+            def replace_after_open(name, flags, *args, **kwargs):
+                fd = real_open(name, flags, *args, **kwargs)
+                if name == 'libexec':
+                    path.rename(Path(temporary) / 'old-libexec')
+                    path.mkdir()
+                return fd
+            try:
+                with patch.object(MODULE.os, 'open', side_effect=replace_after_open):
+                    with self.assertRaises(ValueError): MODULE.ensure_libexec(parent, os.geteuid(), time.monotonic() + 5)
+                self.assertTrue(path.is_dir())
+                self.assertTrue((Path(temporary) / 'old-libexec').is_dir())
+            finally:
+                os.close(parent)
+
+    def test_libexec_close_failure_cannot_report_success(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            parent = os.open(temporary, os.O_RDONLY | os.O_DIRECTORY)
+            (Path(temporary) / 'libexec').mkdir()
+            real_close = os.close
+            calls = []
+            def fail_after_close(fd):
+                calls.append(fd)
+                real_close(fd)
+                raise OSError('injected')
+            try:
+                with patch.object(MODULE.os, 'close', side_effect=fail_after_close):
+                    with self.assertRaises(ValueError): MODULE.ensure_libexec(parent, os.geteuid(), time.monotonic() + 5)
+                self.assertEqual(len(calls), 1)
+                self.assertTrue((Path(temporary) / 'libexec').is_dir())
+            finally:
+                real_close(parent)
+
     def test_failure_reports_only_fixed_stage_and_never_reaches_setup(self):
         output = io.StringIO()
         with patch.object(MODULE.sys, 'platform', 'linux'), patch.object(MODULE.os, 'geteuid', return_value=0), \
