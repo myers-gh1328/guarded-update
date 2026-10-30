@@ -1105,8 +1105,8 @@ def clock():
  previous=current;return boot,current
 sources=None;reader=None;session=None;root=None;chains=[];resources=None
 try:
- sources=RootSources.fixed();loaded=sources.execute();closing,sources=sources,None;closing.close()
- resources=loaded['inventory_refresh_reporter_resources'].ReporterResources.fixed()
+ stage='sources';sources=RootSources.fixed();loaded=sources.execute();closing,sources=sources,None;closing.close()
+ stage='resources';resources=loaded['inventory_refresh_reporter_resources'].ReporterResources.fixed()
  observation=loaded['inventory_refresh_observation'];root=os.open('/',os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
  for parts in (('run','command-center-inventory-refresh','status'),('var','cache','command-center-inventory-refresh'),('var','lib','dpkg')):
   chains.append(observation._Ancestry.open(root,parts))
@@ -1123,18 +1123,19 @@ try:
   clock();initial=document(public())
   if initial is not None:break
   time.sleep(.01)
- session=loaded['inventory_refresh_reader_session'].ReaderSession.pin(
+ stage='pin';session=loaded['inventory_refresh_reader_session'].ReaderSession.pin(
   loaded['inventory_refresh_storage'].CacheReader(chains[1].fds[-1]),cache_generation=initial['cache_generation'],
   policy_generation=initial['policy_generation'],successful_checked_at=initial['successful_checked_at'],boot_id=boot,clock=clock)
  chains[1].verify()
  print(json.dumps({'phase':'pinned','cache_generation':initial['cache_generation'],'policy_generation':initial['policy_generation'],'boot_id':boot}),flush=True)
+ stage='lease'
  while True:
   clock();value=public();current=document(value)
   if current is not None and current['observation_lease'] is not None and current['observation_lease']['nonce']==nonce:break
   time.sleep(.01)
  for chain in chains:chain.verify()
  # Synthetic seam only: this is NOT a durable reporting RequestJournal proof.
- session.begin_scan(value,observation_nonce=nonce,dpkg_fd=chains[2].fds[-1],owner=0,admit_scan=lambda _:True)
+ stage='scan';session.begin_scan(value,observation_nonce=nonce,dpkg_fd=chains[2].fds[-1],owner=0,admit_scan=lambda _:True)
  records=session.installed()
  rows=[line.split('\t') for line in records.splitlines() if line.startswith('installed\t')]
  assert rows and all(len(row)==4 and all(row[1:]) for row in rows)
@@ -1159,13 +1160,14 @@ try:
  session.finish_scan()
  frozen=session.frozen_scan_bounds()
  print(json.dumps({'phase':'scan_finished'}),flush=True)
+ stage='receipt'
  while True:
   clock();value=public();current=document(value)
   if current is not None and current['observation_receipt'] is not None and current['observation_receipt']['nonce']==nonce:break
   time.sleep(.01)
  for chain in chains:chain.verify()
  resources.sample()
- evidence=json.loads(session.finish(value));session=None
+ stage='finish';evidence=json.loads(session.finish(value));session=None
  assert all(evidence[key]==value for key,value in frozen.items())
 finally:
  failed=False
@@ -1176,10 +1178,13 @@ finally:
  if root is not None:
   try:os.close(root)
   except OSError:failed=True
- if failed:raise ValueError('Restricted reader cleanup unconfirmed')
+ if failed:stage='cleanup';raise ValueError('Restricted reader cleanup unconfirmed')
 print(json.dumps({'phase':'complete','evidence':evidence}),flush=True)
 '''
-    return prefix+'\nSOURCES='+repr(tuple((name,name+'.py') for name in modules))+'\n'+body
+    stages=('setup','sources','resources','pin','lease','scan','receipt','finish','cleanup')
+    wrapped="stage='setup'\ntry:\n"+''.join(' '+line+'\n' for line in body.splitlines())
+    wrapped+="except BaseException:\n stage=stage if stage in "+repr(stages)+" else 'setup'\n sys.stdout.write('{\"phase\":\"failed\",\"stage\":\"'+stage+'\"}\\n');sys.stdout.flush()\n raise SystemExit(74)\n"
+    return prefix+'\nSOURCES='+repr(tuple((name,name+'.py') for name in modules))+'\n'+wrapped
 
 
 def read_reporter_phase(stream,expected,deadline):
@@ -1191,6 +1196,10 @@ def read_reporter_phase(stream,expected,deadline):
         byte=os.read(stream.fileno(),1)
         assert byte and len(raw)<4096
         raw.extend(byte)
+    for stage in ('setup','sources','resources','pin','lease','scan','receipt','finish','cleanup'):
+        if bytes(raw)==('{"phase":"failed","stage":"'+stage+'"}\n').encode('ascii'):
+            print('Native fixture reporter library stage='+stage,file=sys.stderr)
+            raise ValueError('Restricted reporter fixture failed')
     return decode_reporter_phase(bytes(raw),expected)
 
 
@@ -1979,6 +1988,7 @@ def prove_actual_coordinator_entry_loop(archive,physical_sample=False):
             receipt=None;assert launcher.poll() is None and time.monotonic()<limit;time.sleep(.02)
         assert value['observation_lease'] is None and all(receipt[key]==item for key,item in offer.items())
         assert match_projected_reader_receipt(offer,reader_proof,receipt)
+        receipt=None  # The attempt may replace the last observation before failing.
         receipt=prove_reporter_library_roundtrip(actor,public)
         prove_reporter_parent_mechanics()
         prove_reporter_environment_mechanics(public)

@@ -135,6 +135,22 @@ class PublisherHarnessTests(unittest.TestCase):
         node=next(node for node in tree.body if isinstance(node,ast.FunctionDef) and node.name=='prove_actual_coordinator_entry_loop')
         self.assertIn('restricted_rust_parent_sampled_process_profile_verified',ast.unparse(node))
 
+    def test_library_failure_frame_is_diagnostic_only(self):
+        tree=ast.parse((Path(__file__).parent/'native_inventory_refresh_apt.py').read_bytes())
+        node=next(node for node in tree.body if isinstance(node,ast.FunctionDef) and node.name=='read_reporter_phase')
+        scope={'os':os,'time':time,'sys':sys,'decode_reporter_phase':lambda raw,expected:(_ for _ in ()).throw(ValueError('invalid'))}
+        exec(compile(ast.Module(body=[node],type_ignores=[]),'<phase-read>','exec'),scope)
+        for frame,expected_log in ((b'{"phase":"failed","stage":"finish"}\n','Native fixture reporter library stage=finish\n'),
+            (b'{"phase":"failed","stage":"secret"}\n',''),(b'{"phase":"failed","stage":"finish","stage":"finish"}\n',''),
+            (b'{"phase":"failed","stage":"finish"}\nextra\n','Native fixture reporter library stage=finish\n')):
+            read_fd,write_fd=os.pipe();stream=os.fdopen(read_fd,'rb',buffering=0);output=io.StringIO()
+            try:
+                os.write(write_fd,frame)
+                with contextlib.redirect_stderr(output):
+                    with self.assertRaises(ValueError):scope['read_reporter_phase'](stream,'complete',time.monotonic()+1)
+                self.assertEqual(output.getvalue(),expected_log)
+            finally:stream.close();os.close(write_fd)
+
     def test_native_harness_imports_without_running_main(self):
         root=Path(__file__).parent.parent
         result=subprocess.run([sys.executable,'-B','-c',
@@ -149,6 +165,7 @@ class PublisherHarnessTests(unittest.TestCase):
         self.assertLess(code.index('prove_packaged_reporter_roundtrip'),code.index('prove_rust_reporter_roundtrip'))
         self.assertIn('restricted_rust_parent_real_reporter_journal_mechanics_verified',code)
         self.assertIn('receipt = None\n        receipt = prove_rust_reporter_roundtrip',code)
+        self.assertIn('receipt = None\n        receipt = prove_reporter_library_roundtrip',code)
 
     def test_rust_barrier_control_frames_are_bounded(self):
         tree=ast.parse((Path(__file__).parent/'native_inventory_refresh_apt.py').read_bytes())
@@ -464,8 +481,8 @@ class PublisherHarnessTests(unittest.TestCase):
         factory=next(node for node in tree.body if isinstance(node,ast.FunctionDef) and node.name=='reporter_library_program')
         scope={'ROOT':Path(__file__).resolve().parents[1]};exec(compile(ast.Module(body=[factory],type_ignores=[]),'<factory>','exec'),scope)
         body=ast.parse(scope['reporter_library_program']())
-        cleanup=next(node for node in body.body if isinstance(node,ast.Try) and node.finalbody)
-        output=body.body[-1]
+        cleanup=next(node for node in ast.walk(body) if isinstance(node,ast.Try) and node.finalbody and 'Restricted reader cleanup unconfirmed' in ast.unparse(node))
+        output=next(node for node in ast.walk(body) if isinstance(node,ast.Expr) and isinstance(node.value,ast.Call) and 'phase' in ast.unparse(node) and 'complete' in ast.unparse(node))
         owned=SimpleNamespace(close=Mock(side_effect=OSError('synthetic close failure')))
         reader=Mock();chain=Mock();resources=Mock();scope={'session':owned,'reader':reader,'sources':None,'chains':[chain],'root':None,'resources':resources,
             'evidence':{'synthetic':True},'json':json}
