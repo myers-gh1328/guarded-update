@@ -168,6 +168,31 @@ jobs:
           path: native-reporter-physical-sample-proof.json
           if-no-files-found: error
 
+  inventory-held-fd-parent:
+    name: Synthetic held-FD ReporterParent admission
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Test held-FD supervisor contracts
+        run: python3 -B -m unittest discover -s tests -p 'test_inventory_refresh_native_exec_parent.py' -v
+      - name: Build inactive metadata helper archive
+        run: python3 -I -B -S scripts/package-inventory-helper.py "$RUNNER_TEMP/inventory-helper-source"
+      - name: Build isolated unprivileged Rust parent fixture
+        run: python3 -I -B -S tests/native_inventory_refresh_rust_build.py
+      - name: Verify held-FD ReporterParent admission
+        run: |
+          archive_commit="$(git --no-replace-objects rev-parse --verify 'HEAD^{commit}')"
+          sudo --preserve-env=GITHUB_ACTIONS python3 -B tests/native_inventory_exec_parent.py "$RUNNER_TEMP/inventory-helper-source/helper-$archive_commit/command-center-inventory-metadata-helper.tar.gz" > native-held-fd-parent-proof.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-held-fd-parent-proof
+          path: native-held-fd-parent-proof.json
+          if-no-files-found: error
+
   inventory-cross-uid-cas:
     name: Synthetic cross-UID journal admission (${{ matrix.mode }})
     runs-on: ubuntu-24.04-arm
