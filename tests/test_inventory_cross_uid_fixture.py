@@ -272,6 +272,12 @@ class BindingTest(unittest.TestCase):
             changed = dict(status); changed[field] = value
             with self.subTest(field=field), self.assertRaises(ValueError):
                 MODULE.validate_live_identity(changed, 'test', '/fixture', 'a' * 32, 42)
+        with self.assertRaises(MODULE.PinError) as inactive:
+            MODULE.validate_live_identity(dict(status, ActiveState='inactive'), 'test', '/fixture')
+        self.assertEqual(inactive.exception.reason, 'unit_identity_active_inactive')
+        with self.assertRaises(MODULE.PinError) as pid:
+            MODULE.validate_live_identity(dict(status, MainPID='0'), 'test', '/fixture')
+        self.assertEqual(pid.exception.reason, 'unit_identity_pid')
 
     def test_exact_fixture_binding_only(self):
         good = b'{"schema_version":1,"epoch":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","enrollment":"00000000-0000-4000-8000-000000000001","nonce":"0000000000000008dddddddddddddddd","policy":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}'

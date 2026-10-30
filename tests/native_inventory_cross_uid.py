@@ -97,17 +97,25 @@ def validate_live_identity(status, description, group, invocation=None, pid=None
     try:
         current = status['InvocationID']
         process = status['MainPID']
-        if (status['LoadState'] != 'loaded' or status['ActiveState'] != 'active' or
-            status['Description'] != description or status['ControlGroup'] != group or
-            not re.fullmatch('[0-9a-f]{32}', current) or not re.fullmatch('[1-9][0-9]{0,9}', process) or
-            status['Delegate'] != 'no' or status['ProtectControlGroups'] != 'yes' or
-            status['MemoryPressureWatch'] != 'off' or
-            (invocation is not None and current != invocation) or
-            (pid is not None and process != str(pid))):
-            raise ValueError(ERROR)
+        if status['LoadState'] != 'loaded': raise PinError('unit_identity_load')
+        active = status['ActiveState']
+        if active != 'active':
+            category = active if active in ('activating', 'inactive', 'failed', 'deactivating') else 'other'
+            raise PinError('unit_identity_active_' + category)
+        if status['Description'] != description: raise PinError('unit_identity_description')
+        if status['ControlGroup'] != group: raise PinError('unit_identity_cgroup')
+        if not re.fullmatch('[0-9a-f]{32}', current) or (invocation is not None and current != invocation):
+            raise PinError('unit_identity_invocation')
+        if not re.fullmatch('[1-9][0-9]{0,9}', process) or (pid is not None and process != str(pid)):
+            raise PinError('unit_identity_pid')
+        if status['Delegate'] != 'no': raise PinError('unit_identity_delegate')
+        if status['ProtectControlGroups'] != 'yes': raise PinError('unit_identity_protect')
+        if status['MemoryPressureWatch'] != 'off': raise PinError('unit_identity_pressure')
         return current, int(process)
+    except PinError:
+        raise
     except (KeyError, TypeError, ValueError):
-        raise ValueError(ERROR) from None
+        raise PinError('unit_identity_fields') from None
 
 
 def validate_test_output(raw):
@@ -519,7 +527,10 @@ def run(archive):
                 if decision == 'ready': break
                 time.sleep(.02)
             stage = 'unit_pin_identity'
-            invocation, pid = validate_live_identity(status, description, expected_group)
+            try: invocation, pid = validate_live_identity(status, description, expected_group)
+            except PinError as error:
+                stage = error.reason
+                raise
             stage = 'group_pin'
             group_chain = _Chain(('sys', 'fs', 'cgroup', 'command.slice', 'command-center.slice',
                 'command-center-inventory.slice', UNIT))
