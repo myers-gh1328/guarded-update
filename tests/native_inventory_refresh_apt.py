@@ -2028,6 +2028,7 @@ def prove_actual_coordinator_entry_loop(archive,physical_sample=False):
         'restricted_reporter_protected_environment_pin_mechanics_verified':True,
         'restricted_reporter_artifact_dialogue_roundtrip_mechanics_verified':True,
         'restricted_rust_parent_real_reporter_journal_mechanics_verified':True,
+        'restricted_rust_parent_report_body_hash_mechanics_verified':True,
         'restricted_reporter_artifact':packaged['artifact'],
         'restricted_reporter_request_writer_roundtrip_verified':True}
     result['restricted_rust_parent_sampled_process_profile_verified']=physical_sample

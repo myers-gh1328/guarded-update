@@ -164,6 +164,7 @@ class PublisherHarnessTests(unittest.TestCase):
         code=ast.unparse(node)
         self.assertLess(code.index('prove_packaged_reporter_roundtrip'),code.index('prove_rust_reporter_roundtrip'))
         self.assertIn('restricted_rust_parent_real_reporter_journal_mechanics_verified',code)
+        self.assertIn('restricted_rust_parent_report_body_hash_mechanics_verified',code)
         self.assertIn('receipt = None\n        receipt = prove_rust_reporter_roundtrip',code)
         self.assertIn('receipt = None\n        receipt = prove_reporter_library_roundtrip',code)
 

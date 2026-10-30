@@ -1576,6 +1576,40 @@ command(10,'await_receipt');response(10,'await_receipt','prepared',evidence=dict
                     .is_some_and(|scan| scan.finished_boottime_ms.is_none())
                 && prepared.scanning.offer.nonce == "0000000000000009dddddddddddddddd",
         )?;
+        // Exercise the production body encoder on the actual normalized scan.
+        // The Root receipt authenticates its own observation, not these bytes.
+        // Neither the body nor its hash is persisted, uploaded, or made ready.
+        let proof_scan = prepared.scanning.proof.scan.as_ref().ok_or(ERROR)?;
+        require(REQUEST != REPORT && proof_scan.report_id == REPORT)?;
+        let body = super::super::lifecycle::encode_collection_report(
+            "00000000-0000-4000-8000-000000000004",
+            &prepared.scanning.request_id,
+            proof_scan,
+            prepared.scan.clone(),
+        )
+        .map_err(|_| ERROR.to_owned())?;
+        let decoded: serde_json::Value =
+            serde_json::from_slice(&body).map_err(|_| ERROR.to_owned())?;
+        require(
+            decoded["enrollment_id"] == "00000000-0000-4000-8000-000000000004"
+                && decoded["collection_request_id"] == REQUEST
+                && decoded["report_id"] == REPORT
+                && decoded["sequence"] == proof_scan.sequence
+                && decoded["source_revision"] == proof_scan.source_revision
+                && decoded["scan"] == prepared.scan,
+        )?;
+        let digest = tools.sha256(&body).map_err(|_| ERROR.to_owned())?;
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .ok_or(ERROR)?;
+        let independent = tools.run_with_timeout(
+            "/usr/bin/python3",
+            &["-I", "-B", "-S", "-c", "import hashlib,sys;sys.stdout.write(hashlib.sha256(sys.stdin.buffer.read()).hexdigest())"],
+            &body,
+            64,
+            remaining,
+        ).map_err(|_| ERROR.to_owned())?;
+        require(independent.as_slice() == digest.as_bytes() && Instant::now() < deadline)?;
         prepared.scanning.session.check()?;
         let boot = prepared.scanning.session.context.boot_id.clone();
         let last = prepared.scanning.session.last;
