@@ -1,0 +1,51 @@
+"""Private rooted-path samples; never production mount-admission evidence."""
+import os
+from pathlib import Path
+import sys
+import tempfile
+import time
+import unittest
+from unittest.mock import patch
+sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'scripts'))
+import inventory_refresh_mount_resolver as resolver
+
+
+class MountResolverTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp=tempfile.TemporaryDirectory();self.root=Path(self.tmp.name)
+        (self.root/'a'/'b').mkdir(parents=True)
+        self.fd=os.open(self.root,os.O_RDONLY|os.O_DIRECTORY)
+    def tearDown(self):os.close(self.fd);self.tmp.cleanup()
+    def sample(self,path='/a/b',reader=lambda fd:7):
+        return resolver.resolve(self.fd,path,time.monotonic()+1,reader)
+    def test_exact_held_path_returns_sampled_mount_id(self):self.assertEqual(self.sample(),7)
+    def test_unsafe_paths_and_symlinks_fail(self):
+        (self.root/'link').symlink_to('a',target_is_directory=True)
+        for path in ('a/b','/a/../b','/a//b','/link/b','/a/b/',('/x'*33),'/'+'x'*256):
+            with self.assertRaises(ValueError):self.sample(path)
+    def test_replacement_and_mount_id_change_fail(self):
+        calls=[]
+        def replaced(fd):
+            calls.append(1)
+            if len(calls)==1:
+                (self.root/'a'/'b').rename(self.root/'a'/'old');(self.root/'a'/'b').mkdir()
+            return 7
+        with self.assertRaises(ValueError):self.sample(reader=replaced)
+        calls.clear()
+        def changing(fd):calls.append(1);return len(calls)
+        with self.assertRaises(ValueError):self.sample(reader=changing)
+    def test_deadline_and_close_failure_are_unknown(self):
+        with self.assertRaises(ValueError):resolver.resolve(self.fd,'/a/b',time.monotonic()-1,lambda fd:7)
+        actual=os.close;calls=[]
+        def uncertain(fd):calls.append(fd);actual(fd);raise OSError('uncertain')
+        with patch.object(resolver.os,'close',side_effect=uncertain):
+            with self.assertRaises(ValueError):self.sample()
+        self.assertEqual(len(calls),3)
+    @unittest.skipUnless(sys.platform=='linux','Linux procfs mount IDs required')
+    def test_actual_linux_rooted_mount_id(self):
+        from inventory_refresh_resources import _mount_id
+        # This fixture intentionally follows its own kernel /proc/self/root magiclink.
+        root=os.open('/proc/self/root',os.O_RDONLY|os.O_DIRECTORY)
+        target=os.open('/sys',os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+        try:self.assertEqual(resolver.resolve(root,'/sys',time.monotonic()+3,_mount_id),_mount_id(target))
+        finally:os.close(target);os.close(root)
