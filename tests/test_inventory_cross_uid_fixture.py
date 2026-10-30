@@ -20,24 +20,39 @@ from inventory_refresh_io import Inbox
 
 
 class BindingTest(unittest.TestCase):
+    def test_loaded_slice_config_must_be_exact_and_inactive(self):
+        status = {'LoadState':'loaded', 'ActiveState':'inactive', 'Description':'fixture',
+                  'InvocationID':'', 'ControlGroup':'', 'Delegate':'no',
+                  'FragmentPath':'/run/systemd/system/command-center-inventory.slice', 'DropInPaths':''}
+        MODULE.validate_slice_config(status, 'fixture')
+        for field, value in [('FragmentPath','/etc/systemd/system/foreign'), ('DropInPaths','/tmp/foreign'),
+                             ('ActiveState','active'), ('InvocationID','a' * 32), ('ControlGroup','/other')]:
+            changed = dict(status); changed[field] = value
+            with self.subTest(field=field), self.assertRaises(ValueError): MODULE.validate_slice_config(changed, 'fixture')
+
+    def test_loaded_slice_listing_rejects_duplicates_malformed_and_target(self):
+        good = b'-.slice loaded active active Root Slice\nsystem.slice loaded active active System Slice\n'
+        MODULE.require_slice_not_loaded(good)
+        for bad in [good + b'system.slice loaded active active duplicate\n',
+                    good + b'command-center-inventory.slice loaded inactive dead Test\n',
+                    b'bad malformed\n', good.rstrip(b'\n'), b'', b'x' * 65537]:
+            with self.subTest(bad=bad[-32:]), self.assertRaises(ValueError): MODULE.require_slice_not_loaded(bad)
+
     def test_slice_preflight_rejects_loaded_unit_and_existing_cgroup(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = os.open(temporary, os.O_RDONLY | os.O_DIRECTORY)
-            empty = {'LoadState':'not-found', 'ActiveState':'inactive', 'InvocationID':'', 'ControlGroup':''}
             try:
-                MODULE.require_slice_absent(empty, root, os.geteuid(), time.monotonic() + 5)
-                with self.assertRaises(MODULE.PinError) as loaded:
-                    MODULE.require_slice_absent(dict(empty, LoadState='loaded'), root, os.geteuid(), time.monotonic() + 5)
-                self.assertEqual(loaded.exception.reason, 'slice_absent_loaded')
+                MODULE.require_cgroup_absent(root, os.geteuid(), time.monotonic() + 5)
                 (Path(temporary) / 'command.slice' / 'command-center.slice' / MODULE.SLICE).mkdir(parents=True)
                 with self.assertRaises(MODULE.PinError) as existing:
-                    MODULE.require_slice_absent(empty, root, os.geteuid(), time.monotonic() + 5)
+                    MODULE.require_cgroup_absent(root, os.geteuid(), time.monotonic() + 5)
                 self.assertEqual(existing.exception.reason, 'slice_absent_cgroup')
             finally: os.close(root)
 
     def test_slice_identity_and_manager_timeout_fail_closed(self):
         status = {'LoadState':'loaded', 'ActiveState':'active', 'Description':'fixture',
-                  'InvocationID':'a' * 32, 'ControlGroup':'/slice', 'Delegate':'no'}
+                  'InvocationID':'a' * 32, 'ControlGroup':'/slice', 'Delegate':'no',
+                  'FragmentPath':'/run/systemd/system/command-center-inventory.slice', 'DropInPaths':''}
         self.assertEqual(MODULE.validate_slice_identity(status, 'fixture', '/slice'), 'a' * 32)
         for field, value in [('InvocationID','b' * 32), ('ControlGroup','/other'),
                              ('ActiveState','inactive'), ('Delegate','yes')]:
@@ -214,6 +229,7 @@ class BindingTest(unittest.TestCase):
         output = io.StringIO()
         with patch.object(MODULE.sys, 'platform', 'linux'), patch.object(MODULE.os, 'geteuid', return_value=0), \
              patch.dict(MODULE.os.environ, {'GITHUB_ACTIONS': 'true'}), \
+             patch.object(MODULE, 'check_loaded_slices'), \
              patch.object(MODULE, 'unit_status', side_effect=ValueError('secret detail')), \
              patch.object(MODULE, 'create_account') as account, contextlib.redirect_stderr(output):
             with self.assertRaises(ValueError): MODULE.run('ignored')
@@ -398,6 +414,17 @@ class BindingTest(unittest.TestCase):
         for bad in [raw + b'MainPID=42\n', raw + b'Unexpected=x\n', raw.replace(b'MainPID=42\n', b''), raw + b'x' * 4097]:
             with self.subTest(bad=bad[-32:]), self.assertRaises(ValueError):
                 MODULE.parse_unit_status(bad)
+
+    def test_slice_listing_timeout_never_signals_child(self):
+        read_fd, write_fd = os.pipe()
+        os.close(write_fd)
+        child = Mock()
+        child.stdout = os.fdopen(read_fd, 'rb', buffering=0)
+        child.wait.side_effect = subprocess.TimeoutExpired('systemctl', 1)
+        with patch.object(MODULE.subprocess, 'Popen', return_value=child):
+            with self.assertRaises(ValueError): MODULE.check_loaded_slices(time.monotonic() + 5)
+        child.kill.assert_not_called(); child.terminate.assert_not_called()
+        self.assertTrue(child.stdout.closed)
 
     def test_live_identity_rejects_invocation_pid_and_profile_drift(self):
         status = {'LoadState':'loaded', 'ActiveState':'active', 'Description':'test',

@@ -29,7 +29,8 @@ UNIT_PROPERTIES = ('LoadState', 'ActiveState', 'Description', 'InvocationID', 'C
                    'ProtectControlGroups', 'MemoryPressureWatch')
 UNIT = 'command-center-inventory.service'
 SLICE = 'command-center-inventory.slice'
-SLICE_PROPERTIES = ('LoadState', 'ActiveState', 'Description', 'InvocationID', 'ControlGroup', 'Delegate')
+SLICE_PROPERTIES = ('LoadState', 'ActiveState', 'Description', 'InvocationID', 'ControlGroup', 'Delegate',
+                    'FragmentPath', 'DropInPaths')
 ENV = {'PATH': '/usr/sbin:/usr/bin:/sbin:/bin', 'LC_ALL': 'C', 'PYTHONDONTWRITEBYTECODE': '1'}
 
 
@@ -242,11 +243,65 @@ def parse_status(raw, properties):
 def parse_unit_status(raw): return parse_status(raw, UNIT_PROPERTIES)
 
 
+def require_slice_not_loaded(raw):
+    """Parse the bounded fixed systemctl listing without looking up the slice."""
+    if type(raw) is not bytes or len(raw) > 65536 or not raw.endswith(b'\n'): raise ValueError(ERROR)
+    try:
+        names = set()
+        lines = raw.decode('ascii').splitlines()
+        if len(lines) > 512: raise ValueError(ERROR)
+        for line in lines:
+            if len(line) > 1024: raise ValueError(ERROR)
+            fields = line.split(None, 4)
+            if (len(fields) < 4 or not re.fullmatch(r'[A-Za-z0-9@_.:\\\\-]+\.slice', fields[0]) or
+                any(not re.fullmatch('[A-Za-z0-9-]+', field) for field in fields[1:4]) or fields[0] in names):
+                raise ValueError(ERROR)
+            names.add(fields[0])
+        if not names or SLICE in names: raise ValueError(ERROR)
+    except (UnicodeDecodeError, ValueError):
+        raise ValueError(ERROR) from None
+
+
+def check_loaded_slices(deadline):
+    """Bounded listing; do not look up the target or signal the Root child."""
+    child = None
+    failed = False
+    raw = bytearray()
+    try:
+        if time.monotonic() >= deadline: raise ValueError(ERROR)
+        child = subprocess.Popen(['/bin/systemctl', 'list-units', '--all', '--type=slice', '--plain',
+                                  '--no-legend', '--no-pager', '--full'], env=ENV,
+                                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        fd = child.stdout.fileno()
+        os.set_blocking(fd, False)
+        poller = select.poll(); poller.register(fd, select.POLLIN | select.POLLHUP | select.POLLERR)
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or not poller.poll(max(1, int(remaining * 1000))): raise ValueError(ERROR)
+            try: chunk = os.read(fd, 65537 - len(raw))
+            except BlockingIOError: continue
+            if time.monotonic() >= deadline: raise ValueError(ERROR)
+            if not chunk: break
+            raw.extend(chunk)
+            if len(raw) > 65536: raise ValueError(ERROR)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0 or child.wait(timeout=remaining) != 0: raise ValueError(ERROR)
+    except BaseException:
+        failed = True
+    finally:
+        if child is not None:
+            try: child.stdout.close()
+            except BaseException: failed = True
+    if failed or time.monotonic() >= deadline: raise ValueError(ERROR)
+    require_slice_not_loaded(bytes(raw))
+
+
 def validate_slice_identity(status, description, group, invocation=None):
     try:
         current = status['InvocationID']
         if (status['LoadState'] != 'loaded' or status['ActiveState'] != 'active' or
             status['Description'] != description or status['ControlGroup'] != group or status['Delegate'] != 'no' or
+            status['FragmentPath'] != '/run/systemd/system/' + SLICE or status['DropInPaths'] or
             not re.fullmatch('[0-9a-f]{32}', current) or current == '0' * 32 or (invocation is not None and current != invocation)):
             raise ValueError(ERROR)
         return current
@@ -254,23 +309,25 @@ def validate_slice_identity(status, description, group, invocation=None):
         raise ValueError(ERROR) from None
 
 
-def require_slice_absent(status, cgroup_root, owner, deadline):
-    """Under caller-pinned trusted ancestry, reject an existing slice or cgroup."""
+def validate_slice_config(status, description):
+    try:
+        if (status['LoadState'] != 'loaded' or status['ActiveState'] != 'inactive' or
+            status['Description'] != description or status['InvocationID'] or status['ControlGroup'] or
+            status['Delegate'] != 'no' or status['FragmentPath'] != '/run/systemd/system/' + SLICE or
+            status['DropInPaths']):
+            raise ValueError(ERROR)
+    except (KeyError, TypeError, ValueError):
+        raise ValueError(ERROR) from None
+
+
+def require_cgroup_absent(cgroup_root, owner, deadline):
+    """Under caller-pinned trusted ancestry, reject an existing slice cgroup."""
     fds = []
     refs = []
     failed = False
     reason = 'slice_absent_unavailable'
     try:
         if time.monotonic() >= deadline: raise ValueError(ERROR)
-        if status['LoadState'] != 'not-found':
-            reason = 'slice_absent_loaded'
-            raise ValueError(ERROR)
-        if status['ActiveState'] != 'inactive':
-            reason = 'slice_absent_active'
-            raise ValueError(ERROR)
-        if status['InvocationID'] or status['ControlGroup']:
-            reason = 'slice_absent_identity'
-            raise ValueError(ERROR)
         base = os.fstat(cgroup_root)
         if not stat.S_ISDIR(base.st_mode) or base.st_uid != owner or base.st_mode & 0o022: raise ValueError(ERROR)
         parent = cgroup_root
@@ -710,16 +767,16 @@ def run(archive):
     fixture = artifact = binary = journal = inbox = probe = launcher = reference = bus = None
     failed = False
     completed = False
-    stage = 'unit_status'
+    stage = 'slice_loaded_list'
     try:
+        check_loaded_slices(min(deadline, time.monotonic() + 3))
+        stage = 'unit_status'
         if unit_status(min(deadline, time.monotonic() + 3))['LoadState'] != 'not-found': raise ValueError(ERROR)
         stage = 'slice_cgroup_root'
         cgroup_base = _Chain(('sys', 'fs', 'cgroup'))
         cgroup_base.verify()
-        stage = 'slice_status'
-        initial_slice = slice_status(min(deadline, time.monotonic() + 3))
         stage = 'slice_absent'
-        try: require_slice_absent(initial_slice, cgroup_base.fds[-1], 0, deadline)
+        try: require_cgroup_absent(cgroup_base.fds[-1], 0, deadline)
         except PinError as error:
             stage = error.reason
             raise
@@ -729,10 +786,16 @@ def run(archive):
         unit_file_chain.verify()
         slice_description = 'Synthetic inventory slice ' + secrets.token_hex(16)
         stage = 'slice_file'
+        check_loaded_slices(min(deadline, time.monotonic() + 3))
+        require_cgroup_absent(cgroup_base.fds[-1], 0, deadline)
+        cgroup_base.verify(); unit_file_chain.verify()
         slice_file = SliceFile.create(unit_file_chain.fds[-1], 0, slice_description, deadline)
         slice_file.verify(); unit_file_chain.verify()
         stage = 'slice_reload'
         manager_command('reload', deadline)
+        slice_file.verify(); unit_file_chain.verify(); cgroup_base.verify()
+        stage = 'slice_config'
+        validate_slice_config(slice_status(min(deadline, time.monotonic() + 3)), slice_description)
         slice_file.verify(); unit_file_chain.verify(); cgroup_base.verify()
         stage = 'slice_start'
         manager_command('start', deadline)
