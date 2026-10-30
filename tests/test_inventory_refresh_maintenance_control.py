@@ -1,16 +1,56 @@
 """Bounded synthetic drain control; no peer or process-set authority."""
 import os
 from pathlib import Path
+import select
+import subprocess
 import sys
+import tempfile
 import threading
 import time
 import unittest
 from unittest.mock import Mock,patch
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'scripts'))
 import inventory_refresh_maintenance_control as control
+from inventory_refresh_maintenance_lock import MaintenanceAdmission,MaintenanceContended
 
 
 class ControlTests(unittest.TestCase):
+    def test_cross_process_actual_runtime_control_and_failures(self):
+        child_script=Path(__file__).with_name('inventory_maintenance_control_child.py')
+        for mode in ('success','active','lost'):
+            with self.subTest(mode=mode):
+                path=Path(tempfile.mkdtemp(prefix='maintenance-control-'))
+                for name in ('maintenance.lock','admission.lock'):
+                    (path/name).write_bytes(b'');(path/name).chmod(0o644)
+                directory=os.open(path,os.O_RDONLY|os.O_DIRECTORY)
+                ready_read,ready_write=os.pipe();request_read,request_write=os.pipe();reply_read,reply_write=os.pipe()
+                child=subprocess.Popen([sys.executable,'-I','-B','-S',str(child_script),str(path),str(ready_write),str(request_read),str(reply_write),mode],
+                    pass_fds=(ready_write,request_read,reply_write),stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,
+                    env={'PATH':'/usr/bin:/bin','LC_ALL':'C','TMPDIR':tempfile.gettempdir()})
+                for fd in (ready_write,request_read,reply_write):os.close(fd)
+                self.assertTrue(select.select([ready_read],[],[],5)[0]);self.assertEqual(os.read(ready_read,2),b'r');os.close(ready_read)
+                owner=MaintenanceAdmission.maintenance(directory,os.getuid(),os.getgid())
+                with self.assertRaises(MaintenanceContended):
+                    MaintenanceAdmission.participant(directory,os.getuid(),os.getgid())
+                contender_code="import os,sys\nsys.path.insert(0,sys.argv[1])\nfrom inventory_refresh_maintenance_lock import MaintenanceAdmission,MaintenanceContended\nd=os.open(sys.argv[2],os.O_RDONLY|os.O_DIRECTORY)\ntry: MaintenanceAdmission.participant(d,os.getuid(),os.getgid())\nexcept MaintenanceContended: sys.exit(42)\nsys.exit(1)"
+                contender=subprocess.Popen([sys.executable,'-I','-B','-S','-c',contender_code,str(Path(control.__file__).parent),str(path)],
+                    stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+                self.assertEqual(contender.wait(timeout=5),42)
+                with patch.object(owner,'try_lifetime',wraps=owner.try_lifetime) as attempt:
+                    if mode=='success':
+                        self.assertTrue(control.request(owner,request_write,reply_read,time.monotonic()+5))
+                        attempt.assert_called_once()
+                    else:
+                        with self.assertRaises(ValueError):control.request(owner,request_write,reply_read,time.monotonic()+5)
+                        attempt.assert_not_called()
+                        with self.assertRaises(MaintenanceContended):
+                            MaintenanceAdmission.participant(directory,os.getuid(),os.getgid())
+                self.assertEqual(child.wait(timeout=5),0 if mode=='success' else 24)
+                # Fixture teardown only; not a production reconciliation decision.
+                owner.close();os.close(directory)
+                for name in ('maintenance.lock','admission.lock'):(path/name).unlink()
+                path.rmdir()
+
     def test_drain_and_close_precede_success(self):
         request_read,request_write=os.pipe();reply_read,reply_write=os.pipe()
         events=[];runtime=Mock();runtime.drain.side_effect=lambda:(events.append('drain') or {'state':'drained','poll':None,'release':None})
