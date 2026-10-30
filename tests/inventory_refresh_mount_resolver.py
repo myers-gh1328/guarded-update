@@ -40,3 +40,26 @@ def resolve(root,path,deadline,mount_id):
             except BaseException:failed=True
     if failed or time.monotonic()>=deadline:raise ValueError('Mount sample unavailable')
     return result
+
+
+def classify(root,rows,deadline,mount_id):
+    """Classify point samples only; different never proves a mount is hidden."""
+    try:
+        assert type(rows) is list and 0<len(rows)<=512 and type(deadline) in (int,float) and math.isfinite(deadline)
+        seen=set();candidates=[]
+        for row in rows:
+            assert time.monotonic()<deadline and type(row) is dict
+            identifier=row.get('id');path=row.get('path');filesystem=row.get('fs');options=row.get('options')
+            assert type(identifier) is int and 0<identifier<2**64 and identifier not in seen
+            seen.add(identifier)
+            assert type(path) is str and 0<len(path)<=1024 and type(filesystem) is bytes and type(options) is set
+            assert all(type(item) is bytes for item in options) and (b'ro' in options)!=(b'rw' in options)
+            if filesystem==b'cgroup2' and b'rw' in options:candidates.append((identifier,path))
+        assert 0<len(candidates)<=64
+        matching=False
+        for identifier,path in candidates:
+            actual=resolve(root,path,deadline,mount_id)
+            if actual==identifier:matching=True
+        assert time.monotonic()<deadline
+        return 'matching' if matching else 'different'
+    except BaseException:return 'unavailable'

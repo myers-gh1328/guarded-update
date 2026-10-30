@@ -49,3 +49,15 @@ class MountResolverTests(unittest.TestCase):
         target=os.open('/sys',os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
         try:self.assertEqual(resolver.resolve(root,'/sys',time.monotonic()+3,_mount_id),_mount_id(target))
         finally:os.close(target);os.close(root)
+
+    def test_writable_row_classification_is_diagnostic_and_ambiguity_absorbs(self):
+        def row(identifier,path='/a/b',options=None):
+            return {'id':identifier,'path':path,'fs':b'cgroup2','options':{b'rw'} if options is None else options}
+        deadline=time.monotonic()+1
+        self.assertEqual(resolver.classify(self.fd,[row(7)],deadline,lambda fd:7),'matching')
+        self.assertEqual(resolver.classify(self.fd,[row(8)],deadline,lambda fd:7),'different')
+        self.assertEqual(resolver.classify(self.fd,[row(7),row(8)],deadline,lambda fd:7),'matching')
+        self.assertEqual(resolver.classify(self.fd,[row(7),row(8,'/missing')],deadline,lambda fd:7),'unavailable')
+        self.assertEqual(resolver.classify(self.fd,[row(7),row(7)],deadline,lambda fd:7),'unavailable')
+        self.assertEqual(resolver.classify(self.fd,[row(True)],deadline,lambda fd:7),'unavailable')
+        self.assertEqual(resolver.classify(self.fd,[row(7,options={b'ro'})],deadline,lambda fd:7),'unavailable')
