@@ -85,10 +85,10 @@ class ProcessSnapshotTests(unittest.TestCase):
             fd=os.open(root,os.O_RDONLY|os.O_DIRECTORY);output=io.StringIO()
             try:
                 owner=ProcessProbe._from_directory(fd,123,(0,27),time.monotonic()+2,owner=os.getuid())
-                def diagnostic(*args):owner._mount_detail='file_procs';owner._mount_metadata=('sample','root','other','yes','no','no','absent');return 'matching'
+                def diagnostic(*args):owner._mount_detail='file_procs';owner._mount_metadata=('sample','root','other','yes','no','no','absent');owner._mount_origin=('sample','cgroup_procs','other');return 'matching'
                 with patch.object(owner,'mount_diagnostic',side_effect=diagnostic),patch('inventory_refresh_process_snapshot.os.geteuid',return_value=0),patch.dict(os.environ,{'GITHUB_ACTIONS':'true'}),contextlib.redirect_stderr(output):
                     with self.assertRaises(ValueError):owner.sample()
-                self.assertEqual(output.getvalue(),'Native fixture mount comparison=matching\nNative fixture mount object=file_procs\nNative fixture mount metadata=root,other,yes,no,no,absent\nNative fixture process probe stage=profile_mount_writable_root\n')
+                self.assertEqual(output.getvalue(),'Native fixture mount comparison=matching\nNative fixture mount object=file_procs\nNative fixture mount metadata=root,other,yes,no,no,absent\nNative fixture mount origin=cgroup_procs,other\nNative fixture process probe stage=profile_mount_writable_root\n')
                 owner.close()
             finally:os.close(fd)
 

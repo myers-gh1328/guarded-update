@@ -128,3 +128,30 @@ def classify_metadata(root,rows,deadline,mount_id,uid,gid):
         assert count and len(matched)==1 and time.monotonic()<deadline
         return ('sample',*matched[0])
     except BaseException:return ('unavailable',)
+
+
+CONTROL_NAMES={name:name.replace('.','_') for name in (
+    'cgroup.procs','cgroup.threads','cgroup.subtree_control','cgroup.freeze','cgroup.kill','cgroup.events',
+    'cgroup.stat','cgroup.controllers','cgroup.max.depth','cgroup.max.descendants',
+    'memory.max','memory.high','memory.reclaim','memory.current','memory.events',
+    'pids.max','pids.current','cpu.max','cpu.weight','io.max','io.weight')}
+
+
+def classify_origin(root,rows,deadline,mount_id):
+    """Compare sampled mount IDs and emit only fixed target/source name classes."""
+    try:
+        assert type(rows) is list and 0<len(rows)<=512
+        seen=set();matched=[];count=0
+        for row in rows:
+            assert type(row) is dict and type(row.get('id')) is int and 0<row['id']<2**64 and row['id'] not in seen
+            seen.add(row['id']);options=row.get('options');path=row.get('path');source=row.get('root');filesystem=row.get('fs')
+            assert type(path) is str and type(source) is str and type(filesystem) is bytes and type(options) is set
+            assert all(type(item) is bytes for item in options) and (b'ro' in options)!=(b'rw' in options) and time.monotonic()<deadline
+            if filesystem==b'cgroup2' and b'rw' in options:
+                count+=1;assert count<=64
+                actual=resolve(root,path,deadline,mount_id)
+                if actual==row['id']:
+                    matched.append((CONTROL_NAMES.get(path.rsplit('/',1)[-1],'other'),CONTROL_NAMES.get(source.rsplit('/',1)[-1],'other')))
+        assert count and len(matched)==1 and time.monotonic()<deadline
+        return ('sample',*matched[0])
+    except BaseException:return ('unavailable',)

@@ -82,6 +82,15 @@ class MountResolverTests(unittest.TestCase):
             self.assertEqual(resolver.resolve(root,'/sys/fs/cgroup/cgroup.procs',time.monotonic()+3,_mount_id),_mount_id(cgroup_file))
         finally:os.close(cgroup_file);os.close(target);os.close(root)
 
+    def test_mount_origin_only_reports_allowlisted_categories(self):
+        target=self.root/'a'/'cgroup.freeze';target.write_bytes(b'')
+        row={'id':7,'path':'/a/cgroup.freeze','root':'/hidden/cgroup.procs','fs':b'cgroup2','options':{b'rw'}}
+        self.assertEqual(resolver.classify_origin(self.fd,[row],time.monotonic()+1,lambda fd:7),('sample','cgroup_freeze','cgroup_procs'))
+        row['root']='/hidden/private-value'
+        self.assertEqual(resolver.classify_origin(self.fd,[row],time.monotonic()+1,lambda fd:7),('sample','cgroup_freeze','other'))
+        row['path']='/../invalid'
+        self.assertEqual(resolver.classify_origin(self.fd,[row],time.monotonic()+1,lambda fd:7),('unavailable',))
+
     def test_passive_metadata_is_fixed_and_acl_uncertainty_is_explicit(self):
         target=self.root/'a'/'cgroup.procs';target.write_bytes(b'unchanged');target.chmod(0o640)
         row={'id':7,'path':'/a/cgroup.procs','fs':b'cgroup2','options':{b'rw'}}

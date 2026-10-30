@@ -1,6 +1,6 @@
 """Pure hosted fixture decoding; byte input is untrusted, never a PID witness."""
 from inventory_refresh_cgroup_witness import process_start_ticks
-from inventory_refresh_mount_resolver import classify_detail as classify_mounts, classify_metadata
+from inventory_refresh_mount_resolver import classify_detail as classify_mounts, classify_metadata, classify_origin, CONTROL_NAMES
 from inventory_refresh_resources import _mount_id
 from inventory_refresh_reporter_parent import validate_process_view
 from inventory_refresh_resources import mount_rows
@@ -165,7 +165,7 @@ class ProcessProbe:
 
     def mount_diagnostic(self,initial_stat,mountinfo):
         """Point comparison only; trusts procfs/kernel and is not an atomic witness."""
-        owned=[];failed=False;result='unavailable';stage='check';self._mount_metadata=('unavailable',)
+        owned=[];failed=False;result='unavailable';stage='check';self._mount_metadata=('unavailable',);self._mount_origin=('unavailable',)
         try:
             self._check();start=process_start_ticks(initial_stat,self._pid)
             assert process_start_ticks(self._read('stat',8192),self._pid)==start
@@ -184,6 +184,7 @@ class ProcessProbe:
                 'file_procs','file_threads','file_subtree','file_other','directory_procs','directory_threads','directory_subtree','directory_other','multiple')
             if candidate=='matching':
                 self._mount_metadata=classify_metadata(root,list(mount_rows(mountinfo).values()),self._deadline,_mount_id,60002,60002)
+                self._mount_origin=classify_origin(root,list(mount_rows(mountinfo).values()),self._deadline,_mount_id)
             stage='recheck';self._check();assert process_start_ticks(self._read('stat',8192),self._pid)==start
             assert os.readlink('root',dir_fd=self._process)=='/' and os.readlink('mnt',dir_fd=ns)==namespace_link
             assert namespace_id==ident(os.fstat(namespace))==ident(os.stat('mnt',dir_fd=ns,follow_symlinks=True))
@@ -242,6 +243,10 @@ class ProcessProbe:
                         all(item in ('yes','no') for item in metadata[3:6]) and metadata[6] in ('present','absent','unknown')):
                         print('Native fixture mount metadata='+','.join(metadata[1:]),file=sys.stderr)
                     else:print('Native fixture mount metadata=unknown',file=sys.stderr)
+                    origin=getattr(self,'_mount_origin',('unavailable',));categories=set(CONTROL_NAMES.values())|{'other'}
+                    if type(origin) is tuple and len(origin)==3 and origin[0]=='sample' and origin[1] in categories and origin[2] in categories:
+                        print('Native fixture mount origin='+origin[1]+','+origin[2],file=sys.stderr)
+                    else:print('Native fixture mount origin=unknown',file=sys.stderr)
                 detail=self._mount_detail
                 allowed=('check','root_link','namespace_dir','namespace_link','namespace_open','root_open','identity','classify','recheck','close')
                 resolver=('ok','rows','candidates','resolve','validation','root','open_missing','open_denied','open_other','identity','mount_id','recheck','close')
