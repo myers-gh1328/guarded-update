@@ -62,6 +62,16 @@ fn pass(
     let latest_result = store.latest();
     let invalid_latest = latest_result.is_err();
     let latest = latest_result.unwrap_or(None);
+    // A report may have been published before the corresponding schedule save.
+    // Only the report bearing the reserved sequence can be that new report.
+    if store.schedule.collection_error
+        && latest
+            .as_ref()
+            .and_then(|report| report["sequence"].as_u64())
+            == Some(store.schedule.sequence)
+    {
+        store.finish_replacement(now)?;
+    }
     let descriptor=latest.as_ref().map(|report|->Result<Value,String> {
         let bytes=state::read(&store.dir.join("latest.json"),state::MAX_REPORT)?;
         Ok(json!({"report_id":report["report_id"],"sequence":report["sequence"],"sha256":tools.sha256(&bytes)?,"collected_at":report["collected_at"]}))
@@ -367,9 +377,194 @@ mod tests {
         (temp, store)
     }
     #[test]
+    fn interrupted_report_replacement_does_not_inherit_old_permanent_failure() {
+        struct Accept(RefCell<Vec<String>>);
+        impl Network for Accept {
+            fn post(&self, _: &Config, path: &str, body: &str, _: u64) -> Result<Response, String> {
+                self.0.borrow_mut().push(path.into());
+                let body = if path.ends_with("check-ins") {
+                    json!({"schema_version":1,"reporting_enabled":true,"source_revision":1,"receipt":null})
+                } else {
+                    let report: Value = serde_json::from_str(body).unwrap();
+                    json!({"schema_version":1,"enrollment_id":report["enrollment_id"],"sequence":report["sequence"],"report_id":report["report_id"],"sha256":SystemTools.sha256(body.as_bytes()).unwrap(),"accepted_at":"2026-01-01T00:00:00Z","disposition":"current"})
+                };
+                Ok(Response {
+                    status: 200,
+                    body,
+                    retry_after: 0,
+                })
+            }
+        }
+        let (temp, mut store) = store();
+        store.reserve().unwrap();
+        store.schedule.source_revision = 1;
+        store.schedule.next_collection_at = 1000;
+        store.schedule.permanent_error = true;
+        store.schedule.collection_error = true;
+        store.save().unwrap();
+        // A crash after publishing the new report but before its schedule save.
+        let report = json!({"enrollment_id":"epoch","sequence":1,"report_id":"new","source_revision":1,"collected_at":"2026-01-01T00:00:00Z"});
+        state::atomic(
+            &temp.0.join("latest.json"),
+            &serde_json::to_vec(&report).unwrap(),
+        )
+        .unwrap();
+        drop(store);
+        let mut store = Store::load(&temp.0, "epoch").unwrap();
+        let network = Accept(RefCell::new(vec![]));
+        pass(
+            &config(&temp.0),
+            &mut store,
+            &FailedCollector,
+            &network,
+            100,
+        )
+        .unwrap();
+        assert_eq!(
+            network
+                .0
+                .borrow()
+                .iter()
+                .filter(|path| path.ends_with("reports"))
+                .count(),
+            1
+        );
+        drop(store);
+        let mut store = Store::load(&temp.0, "epoch").unwrap();
+        pass(
+            &config(&temp.0),
+            &mut store,
+            &FailedCollector,
+            &network,
+            101,
+        )
+        .unwrap();
+        assert_eq!(
+            network
+                .0
+                .borrow()
+                .iter()
+                .filter(|path| path.ends_with("reports"))
+                .count(),
+            1
+        );
+        assert_eq!(store.schedule.sequence, 1);
+    }
+    #[test]
+    fn interrupted_publication_honors_matching_checkin_receipt() {
+        struct Receipt(Value, RefCell<usize>);
+        impl Network for Receipt {
+            fn post(&self, _: &Config, path: &str, _: &str, _: u64) -> Result<Response, String> {
+                assert!(path.ends_with("check-ins"));
+                *self.1.borrow_mut() += 1;
+                Ok(Response {
+                    status: 200,
+                    retry_after: 0,
+                    body: json!({"schema_version":1,"reporting_enabled":true,"source_revision":1,"receipt":self.0}),
+                })
+            }
+        }
+        let (temp, mut store) = store();
+        store.reserve().unwrap();
+        store.schedule.source_revision = 1;
+        store.schedule.permanent_error = true;
+        store.schedule.collection_error = true;
+        store.save().unwrap();
+        let report = json!({"enrollment_id":"epoch","sequence":1,"report_id":"new","source_revision":1,"collected_at":"2026-01-01T00:00:00Z"});
+        let bytes = serde_json::to_vec(&report).unwrap();
+        state::atomic(&temp.0.join("latest.json"), &bytes).unwrap();
+        let digest = SystemTools.sha256(&bytes).unwrap();
+        drop(store);
+        let mut store = Store::load(&temp.0, "epoch").unwrap();
+        let network = Receipt(
+            json!({"schema_version":1,"enrollment_id":"epoch","sequence":1,"report_id":"new","sha256":digest,"accepted_at":"2026-01-01T00:00:00Z","disposition":"current"}),
+            RefCell::new(0),
+        );
+        pass(
+            &config(&temp.0),
+            &mut store,
+            &FailedCollector,
+            &network,
+            100,
+        )
+        .unwrap();
+        assert_eq!(*network.1.borrow(), 1);
+        assert_eq!(
+            store.schedule.acknowledged_sha256.as_deref(),
+            Some(digest.as_str())
+        );
+        assert_eq!(store.schedule.sequence, 1);
+    }
+    #[test]
+    fn interrupted_publication_save_failure_has_no_network_effect() {
+        let (temp, mut store) = store();
+        store.reserve().unwrap();
+        store.schedule.collection_error = true;
+        store.schedule.permanent_error = true;
+        store.save().unwrap();
+        state::atomic(
+            &temp.0.join("latest.json"),
+            &serde_json::to_vec(&json!({"enrollment_id":"epoch","sequence":1,"report_id":"new"}))
+                .unwrap(),
+        )
+        .unwrap();
+        drop(store);
+        std::fs::create_dir(temp.0.join("schedule.pending")).unwrap();
+        let mut store = Store::load(&temp.0, "epoch").unwrap();
+        let network = FakeNetwork {
+            offline: false,
+            calls: RefCell::new(vec![]),
+        };
+        assert!(
+            pass(
+                &config(&temp.0),
+                &mut store,
+                &FailedCollector,
+                &network,
+                100
+            )
+            .is_err()
+        );
+        assert!(network.calls.borrow().is_empty());
+        let disk = Store::load(&temp.0, "epoch").unwrap();
+        assert!(disk.schedule.collection_error && disk.schedule.permanent_error);
+    }
+    #[test]
+    fn interrupted_collection_before_publication_keeps_old_failure() {
+        let (temp, mut store) = store();
+        store.reserve().unwrap();
+        store.replace(&json!({"enrollment_id":"epoch","sequence":1,"report_id":"old","source_revision":1,"collected_at":"2026-01-01T00:00:00Z"}), 100).unwrap();
+        store.schedule.source_revision = 1;
+        store.schedule.permanent_error = true;
+        store.reserve().unwrap();
+        store.schedule.collection_error = true;
+        store.save().unwrap();
+        drop(store);
+        let mut store = Store::load(&temp.0, "epoch").unwrap();
+        let network = FakeNetwork {
+            offline: false,
+            calls: RefCell::new(vec![]),
+        };
+        pass(
+            &config(&temp.0),
+            &mut store,
+            &FailedCollector,
+            &network,
+            101,
+        )
+        .unwrap();
+        assert!(store.schedule.collection_error);
+        assert!(store.schedule.permanent_error);
+        assert_eq!(store.schedule.sequence, 2);
+        assert_eq!(network.calls.borrow().len(), 1);
+    }
+    #[test]
     fn malformed_latest_still_sends_error_checkin_without_resetting_sequence() {
         let (temp, mut store) = store();
         store.reserve().unwrap();
+        store.schedule.collection_error = true;
+        store.schedule.permanent_error = true;
+        store.save().unwrap();
         state::atomic(&temp.0.join("latest.json"), b"broken").unwrap();
         let network = FakeNetwork {
             offline: false,
@@ -386,6 +581,8 @@ mod tests {
             Value::Null
         );
         assert_eq!(store.schedule.sequence, 1);
+        assert!(store.schedule.collection_error);
+        assert!(store.schedule.permanent_error);
     }
     #[test]
     fn failed_collection_is_visible_on_next_independent_checkin() {
