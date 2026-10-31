@@ -1,6 +1,6 @@
 # Negotiated inventory request client foundation
 
-The request journal, protocol parser and native clock are staged library code.
+The request journal, protocol parser, native clock and collection lifecycle are staged library code.
 The executable does not advertise request capabilities or start requested work
 until its runtime lifecycle and native observation integration are verified.
 Installing this source does not enable a request capability or grant update
@@ -81,3 +81,31 @@ new starts while retained metadata and immutable reports remain reconcilable.
 Manual support remains unavailable until actual helper/observation integration is
 verified. No arbitrary commands, paths, packages, policies or installation grants
 are accepted from a request.
+
+## Collection lifecycle implementation
+
+The staged coordinator opens the journal under the existing process lock. It
+recovers matching retained bytes as ready, missing/different ready bytes as
+absorbing supersession, and unfinished submitted work as unconfirmed. A logical
+source cancellation does not prove native cleanup; the physical-work fence also
+survives canonical terminal state and restart.
+
+Collection starts require a fresh negotiated session, a matching persisted
+controller acknowledgement, the admitted source revision and native boot identity.
+One atomic journal commit freezes the scan identity and submitted marker before
+returning an opaque, one-use start token. Check-in responses received during that
+scan cannot replace its purpose. Authentication or malformed acknowledgement
+failures invalidate cached start negotiation while retaining frozen metadata.
+
+The finished token binds the exact encoded report before single-body publication.
+Consuming that token ends the live execution exclusion even if publication fails.
+Actual protected retained bytes determine ready versus superseded recovery;
+unreadable state or uncertain persistence blocks starts while metadata remains
+reconcilable. No missing inventory body is recreated.
+
+Daily collection uses the same exclusive coordinator scope. It first persists a
+supersession notice before replacing ready request evidence, refuses unresolved
+native work and keeps new request intake outside the daily scan. The daily output
+cannot be retroactively assigned to a request received during collection. Runtime
+configuration, executable wiring and native observation verification remain gates;
+this library slice alone does not enable device requests.

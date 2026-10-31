@@ -3,6 +3,8 @@
 mod brew;
 #[cfg(test)]
 mod clock;
+#[cfg(test)]
+mod lifecycle;
 #[cfg(any(target_os = "linux", test))]
 mod linux;
 #[cfg(any(target_os = "macos", test))]
