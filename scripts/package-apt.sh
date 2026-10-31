@@ -6,10 +6,14 @@ target=${2:?Rust Linux target required}
 output=${3:?Output directory required}
 case "$profile" in apt-agent|apt-remote|apt-executor) ;; *) echo 'Unsupported profile' >&2; exit 2;; esac
 case "$target" in
- armv7-unknown-linux-gnueabihf) architecture=armhf;;
- aarch64-unknown-linux-gnu) architecture=arm64;;
- x86_64-unknown-linux-gnu) architecture=amd64;;
- *) echo 'Only supported Linux GNU targets can be packaged' >&2; exit 2;;
+ armv7-unknown-linux-gnueabihf) architecture=armhf; artifact_arch=armhf;;
+ arm-unknown-linux-musleabihf)
+   architecture=armhf; artifact_arch=armhf
+   export RUSTFLAGS="${RUSTFLAGS:-} -C target-feature=+crt-static -C link-self-contained=yes"
+   export CARGO_TARGET_ARM_UNKNOWN_LINUX_MUSLEABIHF_LINKER=rust-lld;;
+ aarch64-unknown-linux-gnu) architecture=arm64; artifact_arch=arm64;;
+ x86_64-unknown-linux-gnu) architecture=amd64; artifact_arch=amd64;;
+ *) echo 'Only supported Linux targets can be packaged' >&2; exit 2;;
 esac
 root=$(cd "$(dirname "$0")/.." && pwd)
 cd "$root"
@@ -54,4 +58,4 @@ Description: Minimal Linux APT agent ($profile)
  or prerequisite installation is performed by this package.
 CONTROL
 install -m 0644 packaging/README.md "$stage/usr/share/doc/guarded-update-$profile/README"
-dpkg-deb --build --root-owner-group "$stage" "$output/guarded-update-${profile}_${version}_${architecture}.deb"
+dpkg-deb --build --root-owner-group "$stage" "$output/guarded-update-${profile}_${version}_${artifact_arch}.deb"
