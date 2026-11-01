@@ -2325,6 +2325,7 @@ def main():
             path.mkdir(parents=True,mode=0o755)
             info=path.lstat()
             created_paths.append((path,info.st_dev,info.st_ino))
+        PUBLIC_MAINTENANCE_ROOT.chmod(0o755)
         for name in ('admission.lock','maintenance.lock'):
             lock=Path(RUNTIME_ROOT)/name
             lock.touch(mode=0o644,exist_ok=False)

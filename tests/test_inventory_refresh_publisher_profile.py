@@ -18,6 +18,8 @@ class PublisherProfileTests(unittest.TestCase):
                                '/run/command-center-inventory-refresh','/etc/command-center-inventory-refresh/apt'})
         read=next(value for value in props if value.startswith('BindReadOnlyPaths=')).split('=',1)[1].split()
         self.assertIn('/run/systemd/private',read)
+        self.assertIn('/var/lib/command-center-inventory-maintenance',read)
+        self.assertNotIn('/var/lib/command-center-inventory-maintenance',write)
         self.assertNotIn('/run/systemd/system',read)
         self.assertNotIn('/run',read);self.assertNotIn('/var/lib',read)
         self.assertNotIn('/etc',read)
