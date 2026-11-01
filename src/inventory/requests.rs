@@ -1280,13 +1280,18 @@ pub(super) fn runtime_collection_fence(
         }
     }
     let pending = dir.join("requests.pending");
+    let required = dir.join("requests.required");
     if present(&pending)? {
         return Ok(true);
     }
     if !present(&dir.join("requests.json"))? {
         let pending = present(&pending)?;
+        let initialized = present(&required)?;
         lock.verify_for(dir)?;
-        return Ok(pending);
+        return Ok(pending || initialized);
+    }
+    if !present(&required)? {
+        return Ok(true);
     }
     let journal = RequestJournal::open(dir, enrollment, lock)?;
     if present(&pending)? {
@@ -1352,8 +1357,14 @@ impl<'a> RequestJournal<'a> {
         lock.verify_for(dir)?;
         require(uuid(enrollment) && safe(seeds.helper) && safe(seeds.observation))?;
         let path = dir.join("requests.json");
-        if std::fs::symlink_metadata(&path).is_ok() {
-            return Err("Existing request journal cannot be reset".into());
+        let required = dir.join("requests.required");
+        let pending = dir.join("requests.pending");
+        for candidate in [&path, &required, &pending] {
+            match std::fs::symlink_metadata(candidate) {
+                Ok(_) => return Err("Existing request journal cannot be reset".into()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+                Err(_) => return Err("Request journal state unavailable".into()),
+            }
         }
         let journal = Journal {
             schema_version: 2,
@@ -1366,6 +1377,10 @@ impl<'a> RequestJournal<'a> {
             manual: Domain::default(),
             collection: Domain::default(),
         };
+        // Persist the initialized fence first. A crash before the journal write
+        // leaves an absorbing recovery state, never a legacy empty state.
+        super::state::atomic(&required, b"required-v1\n")?;
+        lock.verify_for(dir)?;
         let saved = super::state::atomic(&path, &journal.encode()?);
         let checked = lock.verify_for(dir);
         saved?;
@@ -1380,6 +1395,8 @@ impl<'a> RequestJournal<'a> {
             .lock()
             .map_err(|_| "Request journal access uncertain; restart and reconcile")?;
         lock.verify_for(dir)?;
+        let required = super::state::read(&dir.join("requests.required"), 64)?;
+        require(required == b"required-v1\n")?;
         let snapshot = super::state::read(&dir.join("requests.json"), MAX_JOURNAL)?;
         let journal: Journal = serde_json::from_slice(&snapshot)
             .map_err(|_| "Request journal invalid; explicit recovery required")?;
@@ -2453,11 +2470,30 @@ mod tests {
         );
     }
     #[test]
+    fn initialized_journal_loss_never_reverts_to_legacy_collection() {
+        let fixture = Fixture::new();
+        std::fs::remove_file(fixture.dir.join("requests.json")).unwrap();
+        assert!(runtime_collection_fence(&fixture.dir, BOOT, &fixture.lock).unwrap());
+        assert!(
+            RequestJournal::initialize(
+                &fixture.dir,
+                BOOT,
+                CounterSeeds {
+                    helper: 5,
+                    observation: 7
+                },
+                &fixture.lock
+            )
+            .is_err()
+        );
+    }
+    #[test]
     fn runtime_fence_rejects_pending_and_invalid_state_without_repair() {
         let fixture = Fixture::new();
         let journal = fixture.dir.join("requests.json");
+        let original = std::fs::read(&journal).unwrap();
         std::fs::remove_file(&journal).unwrap();
-        assert!(!runtime_collection_fence(&fixture.dir, BOOT, &fixture.lock).unwrap());
+        assert!(runtime_collection_fence(&fixture.dir, BOOT, &fixture.lock).unwrap());
         let pending = fixture.dir.join("requests.pending");
         std::os::unix::fs::symlink("missing", &pending).unwrap();
         assert!(runtime_collection_fence(&fixture.dir, BOOT, &fixture.lock).unwrap());
@@ -2468,16 +2504,7 @@ mod tests {
                 .is_symlink()
         );
         std::fs::remove_file(&pending).unwrap();
-        RequestJournal::initialize(
-            &fixture.dir,
-            BOOT,
-            CounterSeeds {
-                helper: 5,
-                observation: 7,
-            },
-            &fixture.lock,
-        )
-        .unwrap();
+        super::super::state::atomic(&journal, &original).unwrap();
         std::fs::write(&pending, b"pending").unwrap();
         assert!(runtime_collection_fence(&fixture.dir, BOOT, &fixture.lock).unwrap());
         assert_eq!(std::fs::read(&pending).unwrap(), b"pending");
@@ -2493,6 +2520,81 @@ mod tests {
         std::fs::write(&journal, b"invalid").unwrap();
         assert!(runtime_collection_fence(&fixture.dir, BOOT, &fixture.lock).is_err());
         assert_eq!(std::fs::read(journal).unwrap(), b"invalid");
+    }
+    #[test]
+    fn legacy_without_any_request_state_remains_unfenced() {
+        let temp = super::super::state::tests::TestDir::new();
+        let lock = super::super::state::Lock::acquire(&temp.0).unwrap();
+        assert!(!runtime_collection_fence(&temp.0, BOOT, &lock).unwrap());
+    }
+    #[test]
+    fn journal_without_required_marker_is_never_admitted() {
+        let fixture = Fixture::new();
+        std::fs::remove_file(fixture.dir.join("requests.required")).unwrap();
+        assert!(runtime_collection_fence(&fixture.dir, BOOT, &fixture.lock).unwrap());
+        assert!(RequestJournal::open(&fixture.dir, BOOT, &fixture.lock).is_err());
+    }
+    #[test]
+    fn initialization_crash_windows_keep_a_visible_fence() {
+        let temp = super::super::state::tests::TestDir::new();
+        let lock = super::super::state::Lock::acquire(&temp.0).unwrap();
+        let pending = temp.0.join("requests.pending");
+        // Interrupted marker write or fsync before rename.
+        std::fs::write(&pending, b"partial marker").unwrap();
+        assert!(runtime_collection_fence(&temp.0, BOOT, &lock).unwrap());
+        assert!(
+            RequestJournal::initialize(
+                &temp.0,
+                BOOT,
+                CounterSeeds {
+                    helper: 5,
+                    observation: 7
+                },
+                &lock
+            )
+            .is_err()
+        );
+        assert_eq!(std::fs::read(&pending).unwrap(), b"partial marker");
+        std::fs::remove_file(&pending).unwrap();
+        // Marker rename/dir-fsync completed but journal publication did not.
+        super::super::state::atomic(&temp.0.join("requests.required"), b"required-v1\n").unwrap();
+        assert!(runtime_collection_fence(&temp.0, BOOT, &lock).unwrap());
+        assert!(
+            RequestJournal::initialize(
+                &temp.0,
+                BOOT,
+                CounterSeeds {
+                    helper: 5,
+                    observation: 7
+                },
+                &lock
+            )
+            .is_err()
+        );
+    }
+    #[test]
+    fn required_marker_type_or_content_cannot_authorize_a_journal() {
+        for kind in ["symlink", "directory", "malformed"] {
+            let fixture = Fixture::new();
+            let marker = fixture.dir.join("requests.required");
+            std::fs::remove_file(&marker).unwrap();
+            if kind == "directory" {
+                std::fs::create_dir(&marker).unwrap();
+            } else if kind == "symlink" {
+                std::os::unix::fs::symlink("missing", &marker).unwrap();
+            } else {
+                super::super::state::atomic(&marker, b"invalid\n").unwrap();
+            }
+            assert!(runtime_collection_fence(&fixture.dir, BOOT, &fixture.lock).is_err());
+            assert!(RequestJournal::open(&fixture.dir, BOOT, &fixture.lock).is_err());
+        }
+    }
+    #[test]
+    fn deleting_every_request_marker_is_outside_the_local_fence_guarantee() {
+        let fixture = Fixture::new();
+        std::fs::remove_file(fixture.dir.join("requests.required")).unwrap();
+        std::fs::remove_file(fixture.dir.join("requests.json")).unwrap();
+        assert!(!runtime_collection_fence(&fixture.dir, BOOT, &fixture.lock).unwrap());
     }
     #[test]
     fn runtime_fence_rejects_dangling_journal_and_unsafe_permissions() {
@@ -4042,7 +4144,17 @@ mod tests {
             ClientStatus::ResultSuperseded
         );
         assert!(!fixture.dir.join("latest.json").exists());
-        assert_eq!(std::fs::read_dir(&fixture.dir).unwrap().count(), 2);
+        let files = std::fs::read_dir(&fixture.dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            files,
+            ["requests.json", "requests.required", "running.lock"]
+                .into_iter()
+                .map(std::ffi::OsString::from)
+                .collect()
+        );
     }
     #[test]
     fn supersession_is_absorbing_even_through_generic_error_handlers() {

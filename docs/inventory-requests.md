@@ -185,13 +185,22 @@ Linux sync inspects an existing request journal under its inventory lock before
 starting a daily collection. A pending journal replacement, invalid or unreadable
 journal, or retained manual or collection work defers that collection and
 reports an error on check-in; retained uploads and check-ins continue. The fence
-does not change the journal or initialize missing counters. A genuinely absent
-journal and pending file retain the existing scheduling behavior. This is a
+does not change the journal or initialize missing counters. Initialization first
+durably publishes `requests.required`, then writes the journal. A marker without
+a journal, a journal without a marker, or an interrupted replacement fences
+collection and requires reconciliation; initialization never resets any of them.
+An existing journal created by an older build without this marker also requires
+explicit reconciliation. A legacy installation with no marker, journal, or
+pending file retains its existing scheduling behavior. This is a
 conservative transition: unacknowledged received deliveries and terminal failed
 or expired deliveries with no work evidence no longer block collection; their
 request metadata remains intact. Any completed, acknowledged or uncertain work still prevents a
 daily collection until a later reconciliation implementation can safely clear it. The
 fence does not prove processes have stopped or enable device requests.
+The marker and journal share the reporter-owned state directory: deletion or
+rollback of all request files together remains indistinguishable from a legacy
+installation. A separately protected initialization seal and rollback/source
+handoff proof remain required before enabling native request execution.
 
 ## Collection lifecycle implementation
 
