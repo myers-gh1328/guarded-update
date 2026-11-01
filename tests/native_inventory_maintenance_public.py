@@ -168,7 +168,10 @@ def validate_inhibited_unit(raw):
         if not separator or key in values:raise ValueError(ERROR)
         values[key]=value
     if values.get(b'Job')==b'0':values[b'Job']=b''
-    if values!={b'ActiveState':b'inactive',b'SubState':b'dead',b'Job':b'',b'ConditionResult':b'no',b'NeedDaemonReload':b'no'}:raise ValueError(ERROR)
+    state=(values.pop(b'ActiveState',None),values.pop(b'SubState',None))
+    # Stopping an active oneshot can leave PID1's failed result even though the
+    # service has no processes; the failed condition must still be explicit.
+    if state not in ((b'inactive',b'dead'),(b'failed',b'failed')) or values!={b'Job':b'',b'ConditionResult':b'no',b'NeedDaemonReload':b'no'}:raise ValueError(ERROR)
 
 
 def validate_unit_source(raw):

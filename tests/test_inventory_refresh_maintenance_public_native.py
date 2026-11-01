@@ -16,6 +16,7 @@ class PublicMarkerNativeTests(unittest.TestCase):
     def test_managed_reporter_status_requires_inactive_unqueued_and_condition_failed(self):
         good=b'ActiveState=inactive\nSubState=dead\nJob=\nConditionResult=no\nNeedDaemonReload=no\n'
         native.validate_inhibited_unit(good)
+        native.validate_inhibited_unit(good.replace(b'ActiveState=inactive',b'ActiveState=failed').replace(b'SubState=dead',b'SubState=failed'))
         for raw in (good.replace(b'inactive',b'active'),good.replace(b'Job=\n',b'Job=42\n'),good.replace(b'ConditionResult=no',b'ConditionResult=yes'),good+b'Job=\n',good.replace(b'NeedDaemonReload=no',b'NeedDaemonReload=yes')):
             with self.subTest(raw=raw),self.assertRaises(ValueError):native.validate_inhibited_unit(raw)
     def test_managed_fixture_rejects_reloaded_or_overridden_unit(self):
