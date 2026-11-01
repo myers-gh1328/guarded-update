@@ -219,6 +219,15 @@ reporter-visible receipt, a caller proving producer drain and restart inhibition
 anti-rollback/source handoff, and actual target ownership/cleanup proofs are
 still required. The production reporter does not call these operations.
 
+The distributed Linux reporter service example includes a systemd condition
+that prevents new managed starts while the root-owned public maintenance marker
+exists. The disposable native CI fixture exercises an already running service
+and descendant, then checks a stop and inhibited restart attempts. This covers
+only its fixed fixture unit: it does not stop existing production processes,
+authenticate a requester, inhibit other launchers or prove production cleanup.
+Installed services must be explicitly updated and their loaded configuration,
+restart behavior and complete producer set verified before relying on the guard.
+
 ## Collection lifecycle implementation
 
 The staged coordinator opens the journal under the existing process lock. It

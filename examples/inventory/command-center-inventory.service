@@ -2,6 +2,7 @@
 Description=Command Center reporting-only inventory
 After=network-online.target
 Wants=network-online.target
+ConditionPathExists=!/var/lib/command-center-inventory-maintenance/maintenance.pending
 
 [Service]
 Type=oneshot

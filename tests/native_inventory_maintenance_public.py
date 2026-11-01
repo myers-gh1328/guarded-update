@@ -14,6 +14,13 @@ LIB='/usr/local/libexec/command-center-inventory-refresh'
 ENV={'PATH':'/usr/sbin:/usr/bin:/sbin:/bin','LC_ALL':'C'}
 SOURCE_NAMES=('inventory_refresh_maintenance_fence.py','inventory_refresh_observation.py')
 PARENT_SOURCE_NAMES=('inventory_refresh_resources.py','inventory_refresh_reporter_resources.py','inventory_refresh_reporter_parent.py')
+UNIT='command-center-maintenance-fixture.service'
+UNIT_PATH=Path('/etc/systemd/system')/UNIT
+MARKER='/var/lib/command-center-inventory-maintenance/maintenance.pending'
+UNIT_BODY=("[Unit]\nDescription=Disposable maintenance inhibition fixture\n"
+           "ConditionPathExists=!"+MARKER+"\n[Service]\nType=oneshot\nUser=60002\nGroup=60002\n"
+           "KillMode=control-group\nRestart=no\nTimeoutStopSec=5s\n"
+           "ExecStart=/bin/sh -c 'sleep 300 & wait'\n").encode('ascii')
 PROGRAM=r'''import os,sys
 sys.path.insert(0,'/usr/local/libexec/command-center-inventory-refresh')
 import inventory_refresh_maintenance_fence as fence
@@ -153,6 +160,104 @@ def validate_output(mode,data):
     if mode not in expected or data!=expected[mode]:raise ValueError(ERROR)
 
 
+def validate_inhibited_unit(raw):
+    if type(raw) is not bytes or len(raw)>4096:raise ValueError(ERROR)
+    values={}
+    for line in raw.splitlines():
+        key,separator,value=line.partition(b'=')
+        if not separator or key in values:raise ValueError(ERROR)
+        values[key]=value
+    if values.get(b'Job')==b'0':values[b'Job']=b''
+    if values!={b'ActiveState':b'inactive',b'SubState':b'dead',b'Job':b'',b'ConditionResult':b'no',b'NeedDaemonReload':b'no'}:raise ValueError(ERROR)
+
+
+def validate_unit_source(raw):
+    if type(raw) is not bytes or len(raw)>4096:raise ValueError(ERROR)
+    values={}
+    for line in raw.splitlines():
+        key,separator,value=line.partition(b'=')
+        if not separator or key in values:raise ValueError(ERROR)
+        values[key]=value
+    if values!={b'LoadState':b'loaded',b'FragmentPath':str(UNIT_PATH).encode(),b'DropInPaths':b'',b'NeedDaemonReload':b'no',b'KillMode':b'control-group'}:raise ValueError(ERROR)
+
+
+def check_unit_source(identity,deadline):
+    if _metadata(UNIT_PATH.lstat())!=identity or UNIT_PATH.read_bytes()!=UNIT_BODY:raise ValueError(ERROR)
+    raw=systemctl(['show',UNIT,'--all','--property=LoadState,FragmentPath,DropInPaths,NeedDaemonReload,KillMode'],deadline)
+    validate_unit_source(raw)
+
+
+def systemctl(args,deadline):
+    if time.monotonic()>=deadline:raise ValueError(ERROR)
+    result=subprocess.run(['/bin/systemctl',*args],env=ENV,stdin=subprocess.DEVNULL,
+                          stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,timeout=max(.01,deadline-time.monotonic()))
+    if result.returncode!=0 or len(result.stdout)>4096 or time.monotonic()>=deadline:raise ValueError(ERROR)
+    return result.stdout
+
+
+def start_managed_fixture(deadline):
+    """Start one fixed disposable systemd service and confirm a descendant."""
+    raw=systemctl(['show',UNIT,'--all','--property=LoadState,ActiveState,Job,FragmentPath'],deadline)
+    values={}
+    for line in raw.splitlines():
+        key,separator,value=line.partition(b'=')
+        if not separator or key in values:raise ValueError(ERROR)
+        values[key]=value
+    if values.get(b'Job')==b'0':values[b'Job']=b''
+    if values!={b'LoadState':b'not-found',b'ActiveState':b'inactive',b'Job':b'',b'FragmentPath':b''}:raise ValueError(ERROR)
+    fd=os.open(UNIT_PATH,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o644)
+    first=os.fstat(fd);created=(first.st_dev,first.st_ino);identity=None;loaded=False
+    try:
+        if os.write(fd,UNIT_BODY)!=len(UNIT_BODY):raise ValueError(ERROR)
+        os.fsync(fd);info=os.fstat(fd);identity=_metadata(info)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid!=0 or info.st_gid!=0 or info.st_nlink!=1 or info.st_mode&0o022:raise ValueError(ERROR)
+        os.close(fd);fd=None
+        loaded=True;systemctl(['daemon-reload'],deadline)
+        check_unit_source(identity,deadline)
+        systemctl(['start','--no-block',UNIT],deadline)
+        group=Path('/sys/fs/cgroup/system.slice')/UNIT
+        while time.monotonic()<deadline:
+            try:
+                if len((group/'cgroup.procs').read_bytes().splitlines())>=2:break
+            except FileNotFoundError:pass
+            time.sleep(.02)
+        else:raise ValueError(ERROR)
+        return identity,group
+    except BaseException:
+        if fd is not None:
+            try:os.close(fd)
+            except OSError:pass
+        if identity is None:
+            info=UNIT_PATH.lstat()
+            if (info.st_dev,info.st_ino)!=created or not stat.S_ISREG(info.st_mode) or info.st_uid!=0 or info.st_nlink!=1:raise ValueError(ERROR)
+            UNIT_PATH.unlink()
+        else:cleanup_managed_fixture(identity,loaded,time.monotonic()+10)
+        raise ValueError(ERROR) from None
+
+
+def cleanup_managed_fixture(identity,loaded,deadline):
+    """Remove only our unchanged unit; leave uncertain replacements untouched."""
+    if identity is None or _metadata(UNIT_PATH.lstat())!=identity or UNIT_PATH.read_bytes()!=UNIT_BODY:raise ValueError(ERROR)
+    if loaded:
+        check_unit_source(identity,deadline);systemctl(['stop',UNIT],deadline)
+        if _metadata(UNIT_PATH.lstat())!=identity or UNIT_PATH.read_bytes()!=UNIT_BODY:raise ValueError(ERROR)
+    UNIT_PATH.unlink()
+    if loaded:systemctl(['daemon-reload'],deadline)
+
+
+def finish_managed_fixture(identity,group,deadline):
+    """Stop the owned fixture, check its cgroup and prove restarts are skipped."""
+    systemctl(['stop',UNIT],deadline)
+    if group.exists() and b'populated 0\n' not in (group/'cgroup.events').read_bytes().splitlines(keepends=True):raise ValueError(ERROR)
+    for _ in range(3):
+        check_unit_source(identity,deadline)
+        systemctl(['start',UNIT],deadline)
+        raw=systemctl(['show',UNIT,'--all','--property=ActiveState,SubState,Job,ConditionResult,NeedDaemonReload'],deadline)
+        validate_inhibited_unit(raw)
+        if group.exists() and b'populated 0\n' not in (group/'cgroup.events').read_bytes().splitlines(keepends=True):raise ValueError(ERROR)
+    check_unit_source(identity,deadline)
+
+
 def invoke(mode,deadline):
     if time.monotonic()>=deadline:raise ValueError(ERROR)
     child=subprocess.Popen(command(mode,mode=='create'),env=ENV,stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL)
@@ -186,7 +291,7 @@ def run(archive):
     from inventory_refresh_artifact_fixture import verify_archive,LIB as ARCHIVE_LIB
     from inventory_refresh_resources import _Chain
     from native_inventory_cross_uid import create_account,ensure_libexec
-    deadline=time.monotonic()+45;owned=[];failed=False;complete=False;stage='account'
+    deadline=time.monotonic()+90;owned=[];managed=None;failed=False;complete=False;stage='account'
     try:
         create_account(deadline);stage='archive';verified=verify_archive(repo,archive)
         stage='libexec'
@@ -203,20 +308,25 @@ def run(archive):
         public=_Chain(('var','lib','command-center-inventory-maintenance'));owned.append(public);public.verify()
         info=os.fstat(public.fds[-1])
         if (info.st_uid,info.st_gid,stat.S_IMODE(info.st_mode))!=(0,0,0o755):raise ValueError(ERROR)
+        stage='managed_reporter_start';managed=start_managed_fixture(deadline);unit_identity,group=managed
         for mode in ('absent','deny','absent','create','present'):
             stage='invoke_'+mode
             sources.verify();source_chain.verify();public.verify();varlib.verify();invoke(mode,deadline)
             sources.verify();source_chain.verify();public.verify();varlib.verify()
+        stage='managed_reporter_drain';finish_managed_fixture(unit_identity,group,deadline)
         complete=True
     except BaseException:failed=True
     finally:
+        if managed is not None:
+            try:cleanup_managed_fixture(managed[0],True,time.monotonic()+10)
+            except BaseException:failed=True
         for item in reversed(owned):
             try:item.close()
             except BaseException:failed=True
     if failed or not complete or time.monotonic()>=deadline:
         print('Synthetic public marker stage='+stage,file=sys.stderr)
         raise ValueError(ERROR)
-    return {'synthetic_public_marker_cross_uid':True,'production_authority':False,'cleanup_proven':False}
+    return {'synthetic_public_marker_cross_uid':True,'fixture_systemd_inhibited_and_drained':True,'production_authority':False,'cleanup_proven':False}
 
 
 if __name__=='__main__':

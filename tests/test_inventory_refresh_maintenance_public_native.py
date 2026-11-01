@@ -13,6 +13,24 @@ import native_inventory_maintenance_public as native
 
 
 class PublicMarkerNativeTests(unittest.TestCase):
+    def test_managed_reporter_status_requires_inactive_unqueued_and_condition_failed(self):
+        good=b'ActiveState=inactive\nSubState=dead\nJob=\nConditionResult=no\nNeedDaemonReload=no\n'
+        native.validate_inhibited_unit(good)
+        for raw in (good.replace(b'inactive',b'active'),good.replace(b'Job=\n',b'Job=42\n'),good.replace(b'ConditionResult=no',b'ConditionResult=yes'),good+b'Job=\n',good.replace(b'NeedDaemonReload=no',b'NeedDaemonReload=yes')):
+            with self.subTest(raw=raw),self.assertRaises(ValueError):native.validate_inhibited_unit(raw)
+    def test_managed_fixture_rejects_reloaded_or_overridden_unit(self):
+        good=(f'LoadState=loaded\nFragmentPath={native.UNIT_PATH}\nDropInPaths=\nNeedDaemonReload=no\nKillMode=control-group\n').encode()
+        native.validate_unit_source(good)
+        for raw in (good.replace(b'DropInPaths=\n',b'DropInPaths=/tmp/override\n'),good.replace(b'NeedDaemonReload=no',b'NeedDaemonReload=yes'),good.replace(b'KillMode=control-group',b'KillMode=process')):
+            with self.subTest(raw=raw),self.assertRaises(ValueError):native.validate_unit_source(raw)
+    def test_managed_fixture_cleanup_preserves_replaced_unit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            unit=Path(directory)/'fixture.service';unit.write_bytes(native.UNIT_BODY)
+            identity=native._metadata(unit.lstat());unit.rename(Path(directory)/'original')
+            unit.write_bytes(native.UNIT_BODY)
+            with patch.object(native,'UNIT_PATH',unit),patch.object(native,'systemctl') as command:
+                with self.assertRaises(ValueError):native.cleanup_managed_fixture(identity,True,time.monotonic()+5)
+                command.assert_not_called();self.assertTrue(unit.exists())
     def test_reporter_parent_profile_is_exact_and_rejects_extra_files(self):
         with tempfile.TemporaryDirectory() as path:
             directory=os.open(path,os.O_RDONLY|os.O_DIRECTORY)
