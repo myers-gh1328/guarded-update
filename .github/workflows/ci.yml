@@ -142,6 +142,31 @@ jobs:
         run: |
           python3 -m unittest discover -s tests -p test_inventory_packaging.py -v
           bash scripts/build-inventory-linux.sh inventory-dist
+      - name: Build and test ARMv6 executor on emulated ARM1176
+        env:
+          CARGO_TARGET_ARM_UNKNOWN_LINUX_MUSLEABIHF_RUNNER: qemu-arm -cpu arm1176
+          CARGO_TARGET_ARM_UNKNOWN_LINUX_MUSLEABIHF_LINKER: rust-lld
+          RUSTFLAGS: -C target-feature=+crt-static -C link-self-contained=yes
+        run: |
+          python3 -m unittest discover -s tests -p test_armv6_apt_packaging.py -v
+          bash scripts/package-apt.sh apt-executor arm-unknown-linux-musleabihf armv6-dist
+          package=(armv6-dist/guarded-update-apt-executor_*_armhf.deb)
+          test "${#package[@]}" = 1
+          test "$(dpkg-deb -f "${package[0]}" Architecture)" = armhf
+          ! dpkg-deb --ctrl-tarfile "${package[0]}" | tar -tf - | grep -E '(preinst|postinst|prerm|postrm)'
+          mkdir armv6-extracted
+          dpkg-deb -x "${package[0]}" armv6-extracted
+          binary=armv6-extracted/usr/bin/guarded-update
+          ! readelf -l "$binary" | grep -q INTERP
+          qemu-arm -cpu arm1176 "$binary" --version
+          cargo test --locked --target arm-unknown-linux-musleabihf --no-default-features --features apt-executor execution_gate::tests
+          cargo test --locked --target arm-unknown-linux-musleabihf --no-default-features --features apt-executor execution_claim::tests
+      - name: Preserve opt-in ARMv6 executor package
+        uses: actions/upload-artifact@v4
+        with:
+          name: guarded-update-armv6-executor
+          path: armv6-dist/*.deb
+          if-no-files-found: error
       - name: Preserve separate Linux inventory artifacts
         uses: actions/upload-artifact@v4
         with:
