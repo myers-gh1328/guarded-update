@@ -247,15 +247,24 @@ def cleanup_managed_fixture(identity,loaded,deadline):
 
 def finish_managed_fixture(identity,group,deadline):
     """Stop the owned fixture, check its cgroup and prove restarts are skipped."""
-    systemctl(['stop',UNIT],deadline)
-    if group.exists() and b'populated 0\n' not in (group/'cgroup.events').read_bytes().splitlines(keepends=True):raise ValueError(ERROR)
-    for _ in range(3):
-        check_unit_source(identity,deadline)
-        systemctl(['start',UNIT],deadline)
-        raw=systemctl(['show',UNIT,'--all','--property=ActiveState,SubState,Job,ConditionResult,NeedDaemonReload'],deadline)
-        validate_inhibited_unit(raw)
+    stage='stop';raw=None
+    try:
+        systemctl(['stop',UNIT],deadline)
+        stage='cgroup_after_stop'
         if group.exists() and b'populated 0\n' not in (group/'cgroup.events').read_bytes().splitlines(keepends=True):raise ValueError(ERROR)
-    check_unit_source(identity,deadline)
+        for _ in range(3):
+            stage='unit_source';check_unit_source(identity,deadline)
+            stage='restart';systemctl(['start',UNIT],deadline)
+            stage='status';raw=systemctl(['show',UNIT,'--all','--property=ActiveState,SubState,Job,ConditionResult,NeedDaemonReload'],deadline)
+            validate_inhibited_unit(raw)
+            stage='cgroup_after_restart'
+            if group.exists() and b'populated 0\n' not in (group/'cgroup.events').read_bytes().splitlines(keepends=True):raise ValueError(ERROR)
+        stage='final_source';check_unit_source(identity,deadline)
+    except BaseException:
+        print('Synthetic managed reporter stage='+stage,file=sys.stderr)
+        if stage=='status' and type(raw) is bytes and len(raw)<=4096:
+            print('Synthetic systemd status='+repr(raw),file=sys.stderr)
+        raise ValueError(ERROR) from None
 
 
 def invoke(mode,deadline):
