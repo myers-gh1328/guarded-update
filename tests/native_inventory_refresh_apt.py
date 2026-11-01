@@ -751,6 +751,13 @@ fields=dict(line.split(':',1) for line in open('/proc/self/status').read().split
 assert {name:int(fields[name].strip(),16) for name in ('CapPrm','CapEff','CapBnd','CapInh','CapAmb')}=={'CapPrm':3,'CapEff':3,'CapBnd':3,'CapInh':0,'CapAmb':0}
 assert fields['NoNewPrivs'].split()==['1']
 assert sys.flags.no_site
+from inventory_refresh_maintenance_lock import MaintenanceLock, MaintenanceAdmission
+from inventory_refresh_maintenance_fence import _fixed, _fixed_public
+stage='maintenance_gate';gate=MaintenanceLock.fixed('participant',name='admission.lock');gate.close()
+stage='maintenance_lifetime';lifetime=MaintenanceLock.fixed('participant');lifetime.close()
+stage='maintenance_private_marker';assert _fixed('present') is False
+stage='maintenance_public_marker';assert _fixed_public('present') is False
+stage='maintenance_admission';admission=MaintenanceAdmission.participant_fixed();admission.close()
 stage='runtime_admission';runtime=FixedRuntime.fixed()
 try:
  journal=runtime._journal;store=runtime._store;resources=runtime._resources;policy=runtime._policy
