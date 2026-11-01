@@ -202,6 +202,23 @@ rollback of all request files together remains indistinguishable from a legacy
 installation. A separately protected initialization seal and rollback/source
 handoff proof remain required before enabling native request execution.
 
+An unregistered Root-only writer can create and fsync a fixed root-owned
+`initialized-requests` record without replacing an existing record. Its matching
+reader samples the record while an independently verified Root journal lock is
+held. Both bind the enrollment and Root epoch to that journal and reject
+malformed, replaced, unsafe or mismatched state. A failed publication preserves
+the possibly partial record for reconciliation; even a complete-looking record
+is only `present_unconfirmed`, because it may precede a failed fsync or close.
+Fixture tests use the test
+process's UID/GID; they do not prove real Root provisioning. The writer relies on
+its future caller for producer drain; neither operation produces a legacy,
+enrollment, execution or cleanup authorization. A matching historical marker
+and journal can both be rolled back together, and sampled checks cannot prove
+lock or ancestry stability after return. Before activation, an authenticated
+reporter-visible receipt, a caller proving producer drain and restart inhibition,
+anti-rollback/source handoff, and actual target ownership/cleanup proofs are
+still required. The production reporter does not call these operations.
+
 ## Collection lifecycle implementation
 
 The staged coordinator opens the journal under the existing process lock. It
