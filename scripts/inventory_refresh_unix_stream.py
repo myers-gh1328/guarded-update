@@ -137,3 +137,13 @@ def decode_credentials(raw,ancillary,flags,expected):
         if actual!=expected:raise ValueError(ERROR)
         return actual
     except BaseException:raise ValueError(ERROR) from None
+
+
+def validate_credential_eof(raw,ancillary,flags):
+    """Accept only empty EOF or Linux's zero credential artifact; not identity."""
+    try:
+        OneMessage._discard(ancillary)
+        zero=(socket.SOL_SOCKET,getattr(socket,'SCM_CREDENTIALS',2),b'\0'*struct.calcsize('iII'))
+        if (type(raw) is not bytes or raw!=b'' or type(ancillary) is not list or type(flags) is not int or
+            flags&(socket.MSG_TRUNC|socket.MSG_CTRUNC) or ancillary not in ([],[zero])):raise ValueError(ERROR)
+    except BaseException:raise ValueError(ERROR) from None

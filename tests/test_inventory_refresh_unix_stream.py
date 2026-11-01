@@ -50,6 +50,16 @@ class SeqpacketTests(unittest.TestCase):
             with self.assertRaises(ValueError):packet.decode_credentials(b'DRAIN-1',[('malformed',),rights],0,(17,0,0))
         self.assertEqual([call.args[0] for call in close.call_args_list],[41,42])
 
+    def test_eof_zero_credentials_are_only_a_kernel_artifact(self):
+        zero=(socket.SOL_SOCKET,getattr(socket,'SCM_CREDENTIALS',2),b'\0'*12)
+        packet.validate_credential_eof(b'',[],0);packet.validate_credential_eof(b'',[zero],0)
+        for raw,records,flags in ((b'x',[],0),(b'',[zero,zero],0),(b'',[(zero[0],zero[1],b'\0'*11+b'\1')],0),(b'',[],socket.MSG_CTRUNC)):
+            with self.assertRaises(ValueError):packet.validate_credential_eof(raw,records,flags)
+        rights=(socket.SOL_SOCKET,socket.SCM_RIGHTS,array.array('i',[41,42]).tobytes())
+        with patch.object(packet.os,'close') as close:
+            with self.assertRaises(ValueError):packet.validate_credential_eof(b'',[zero,rights],0)
+        self.assertEqual([call.args[0] for call in close.call_args_list],[41,42])
+
     @unittest.skipUnless(sys.platform=='linux','Linux Unix-stream fixture')
     def test_actual_child_packet_and_eof(self):
         left,right=socket.socketpair(socket.AF_UNIX,socket.SOCK_STREAM)
@@ -130,7 +140,6 @@ class SeqpacketTests(unittest.TestCase):
                 remaining=deadline-time.monotonic();self.assertGreater(remaining,0)
                 self.assertTrue(select.select([connection],[],[],remaining)[0])
                 extra,ancillary,flags,_=connection.recvmsg(1,socket.CMSG_SPACE(16),socket.MSG_CMSG_CLOEXEC)
-                packet.OneMessage._discard(ancillary)
-                self.assertEqual(extra,b'');self.assertEqual(ancillary,[]);self.assertFalse(flags&(socket.MSG_TRUNC|socket.MSG_CTRUNC))
+                packet.validate_credential_eof(extra,ancillary,flags)
                 connection.close();listener.close();self.assertEqual(child.wait(timeout=5),0)
                 os.unlink(address);os.rmdir(path)
