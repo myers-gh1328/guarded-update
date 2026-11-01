@@ -62,6 +62,7 @@ PARENT_SLICE = 'command-center-inventory.slice'
 WORKER_SLICE = 'command-center-inventory-worker.slice'
 WORKER_UNIT = 'command-center-inventory-refresh-worker.service'
 LIB_ROOT = Path('/usr/local/libexec/command-center-inventory-refresh')
+PUBLIC_MAINTENANCE_ROOT = Path('/var/lib/command-center-inventory-maintenance')
 ENV = {'PATH': '/usr/sbin:/usr/bin:/sbin:/bin', 'LC_ALL': 'C', 'PYTHONDONTWRITEBYTECODE': '1'}
 PASSWORD = 'synthetic-proof-password'
 
@@ -2277,8 +2278,10 @@ def main():
     assert sys.platform == 'linux' and os.geteuid() == 0 and os.environ.get('GITHUB_ACTIONS') == 'true'
     assert len(sys.argv)==2
     archive=Path(sys.argv[1])
-    for path in [Path(POLICY_ROOT), Path(CACHE_ROOT), Path(RUNTIME_ROOT), Path(STATE_ROOT), LIB_ROOT]:
-        assert not path.exists(), 'Refuse to adopt an existing helper installation'
+    fixture_paths=[Path(POLICY_ROOT), Path(CACHE_ROOT), Path(RUNTIME_ROOT), Path(STATE_ROOT), LIB_ROOT, PUBLIC_MAINTENANCE_ROOT]
+    for path in fixture_paths:
+        assert not os.path.lexists(path), 'Refuse to adopt an existing helper installation'
+    created_paths=[]
     unit_files = [Path('/run/systemd/system')/name for name in [PARENT_SLICE, WORKER_SLICE]]
     assert all(not path.exists() for path in unit_files)
     base = Path('/run')/('inventoryaptproof'+secrets.token_hex(6))
@@ -2311,8 +2314,14 @@ def main():
             command(['/usr/sbin/useradd', '--system', '--uid', str(identity), '--gid', account,
                      '--no-create-home', '--home-dir', '/nonexistent', '--shell', '/usr/sbin/nologin', account])
             accounts.append(account)
-        for path in [Path(POLICY_ROOT), Path(CACHE_ROOT), Path(RUNTIME_ROOT), Path(STATE_ROOT), LIB_ROOT]:
-            path.mkdir(parents=True, mode=0o755)
+        for path in fixture_paths:
+            path.mkdir(parents=True,mode=0o755)
+            info=path.lstat()
+            created_paths.append((path,info.st_dev,info.st_ino))
+        for name in ('admission.lock','maintenance.lock'):
+            lock=Path(RUNTIME_ROOT)/name
+            lock.touch(mode=0o644,exist_ok=False)
+            lock.chmod(0o644)
         shutil.copyfile(ROOT/'scripts/inventory_refresh_worker.py', LIB_ROOT/'worker.py')
         (LIB_ROOT/'worker.py').chmod(0o444)
         shutil.copyfile(ROOT/'scripts/inventory_refresh_guardian.py', LIB_ROOT/'guardian.py')
@@ -2508,9 +2517,11 @@ for path in sys.argv[2:]:
             command(['/bin/systemctl', 'daemon-reload'])
             if hook.exists():
                 hook.unlink()
-            for path in [Path(POLICY_ROOT), Path(CACHE_ROOT), Path(RUNTIME_ROOT), Path(STATE_ROOT), LIB_ROOT]:
-                if path.exists():
-                    shutil.rmtree(path)
+            for path,device,inode in reversed(created_paths):
+                info=path.lstat()
+                if not stat.S_ISDIR(info.st_mode) or (info.st_dev,info.st_ino)!=(device,inode):
+                    raise RuntimeError('Fixture directory identity changed during cleanup')
+                shutil.rmtree(path)
             for home in signers:
                 command(['/usr/bin/gpgconf', '--homedir', str(home), '--kill', 'gpg-agent'])
             for account in reversed(accounts):
