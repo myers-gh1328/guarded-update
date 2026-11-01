@@ -710,6 +710,66 @@ finally:
         'parent_probe_holds_no_package_or_executor_locks_verified':True}
 
 
+def prove_public_marker_namespace():
+    """Exercise the fixed read-only bind on the disposable hosted VM."""
+    from inventory_refresh_publisher_profile import publisher_properties
+    info=PUBLIC_MAINTENANCE_ROOT.stat()
+    marker=PUBLIC_MAINTENANCE_ROOT/'maintenance.pending'
+    assert not os.path.lexists(marker)
+    program=r'''import errno,os,sys
+p='/var/lib/command-center-inventory-maintenance'
+s=os.stat(p);assert (s.st_dev,s.st_ino)==(int(sys.argv[1]),int(sys.argv[2]))
+assert not os.path.lexists(p+'/maintenance.pending')
+try:os.open(p+'/forbidden',os.O_CREAT|os.O_EXCL|os.O_WRONLY,0o600)
+except OSError as e:assert e.errno==errno.EROFS
+else:raise AssertionError('marker bind writable')
+print('ready',flush=True)
+assert sys.stdin.readline()=='check\n'
+assert os.path.isfile(p+'/maintenance.pending')
+'''
+    def command_args(unit,code=program):
+        args=['/usr/bin/systemd-run','--quiet','--wait','--collect','--pipe','--unit='+unit,'--slice='+PARENT_SLICE]
+        for item in publisher_properties():args+=['-p',item]
+        return args+['/usr/bin/python3','-I','-B','-S','-c',code,str(info.st_dev),str(info.st_ino)]
+    unit='marker-bind-proof-'+secrets.token_hex(8)+'.service'
+    process=subprocess.Popen(command_args(unit),env=ENV,stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+    created=None;finished=False
+    try:
+        ready,_,_=select.select([process.stdout],[],[],30)
+        assert ready and process.stdout.readline()==b'ready\n', 'Marker bind did not start'
+        fd=os.open(marker,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
+        try:
+            entry=os.fstat(fd);created=(entry.st_dev,entry.st_ino)
+            os.fsync(fd)
+        finally:os.close(fd)
+        out,err=process.communicate(b'check\n',timeout=30)
+        assert process.returncode==0, 'Marker transition proof failed'
+        finished=True
+    finally:
+        if not finished:
+            command(['/bin/systemctl','stop',unit],timeout=30)
+            active=subprocess.run(['/bin/systemctl','is-active','--quiet',unit],env=ENV,stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=10)
+            if active.returncode==0:raise RuntimeError('Fixture unit remained active')
+            if process.poll() is None:process.kill();process.communicate(timeout=10)
+        if created is not None:
+            entry=marker.lstat()
+            if not stat.S_ISREG(entry.st_mode) or (entry.st_dev,entry.st_ino)!=created:
+                raise RuntimeError('Fixture marker identity changed during cleanup')
+            marker.unlink()
+    # A non-optional source must not launch when its fixed directory is absent.
+    hidden=PUBLIC_MAINTENANCE_ROOT.with_name(PUBLIC_MAINTENANCE_ROOT.name+'-fixture-hidden')
+    assert not os.path.lexists(hidden)
+    PUBLIC_MAINTENANCE_ROOT.rename(hidden)
+    try:
+        sentinel=Path(RUNTIME_ROOT)/('missing-bind-executed-'+secrets.token_hex(8))
+        missing_program="import pathlib;pathlib.Path("+repr(str(sentinel))+").touch()"
+        result=subprocess.run(command_args('marker-bind-missing-'+secrets.token_hex(8)+'.service',missing_program),env=ENV,stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=30)
+        assert result.returncode!=0, 'Missing marker bind unexpectedly started'
+        assert not os.path.lexists(sentinel), 'Missing marker bind executed its payload'
+    finally:hidden.rename(PUBLIC_MAINTENANCE_ROOT)
+    return {'public_marker_bind_transition_verified':True,'public_marker_bind_readonly_verified':True,'public_marker_bind_missing_source_rejected':True}
+
+
 def prove_root_refresh_transaction(expected_generation):
     """Actual fixed production components in one CAP3 publisher, synthetic only."""
     from inventory_refresh_publisher_profile import publisher_properties
@@ -2454,6 +2514,7 @@ for path in sys.argv[2:]:
                 observation['observation_failed_unit_acknowledgement_and_reuse_verified']=True
                 private_policy_guard.recheck()
                 publication_binding.recheck()
+            resource_proof.update(prove_public_marker_namespace())
             resource_proof.update(prove_root_refresh_transaction(generation))
             previous = (Path(CACHE_ROOT)/'current.json').read_bytes()
             for number, candidate in [(2, policy(certificate_path=wrong_ca)),
