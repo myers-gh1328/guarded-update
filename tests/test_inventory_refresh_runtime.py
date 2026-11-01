@@ -25,6 +25,8 @@ class RuntimeTests(unittest.TestCase):
         def add(target,**kwargs):
             value=patch(target,**kwargs);self.patches.append(value);self.addCleanup(value.stop);return value.start()
         self.resource_factory=add('inventory_refresh_runtime.RuntimeResources.fixed',side_effect=lambda:(self.events.append('resources_open'),self.resources)[1])
+        self.production_guard=Mock()
+        add('inventory_refresh_runtime.MaintenanceAdmission.participant_fixed',return_value=self.production_guard)
         self.policy_factory=add('inventory_refresh_runtime.PolicyGuard.fixed',side_effect=lambda:(self.events.append('policy_open'),f.policy)[1])
         add('inventory_refresh_runtime._state',return_value=self.state)
         actual_maintenance_present=module.maintenance_present
@@ -57,6 +59,17 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(self.runtime.step()['state'],'ready')
         self.assertIs(self.runtime._dispatcher._journal,self.f.journal)
         self.assertEqual(self.f.status()['cache_generation'],'c'*32)
+
+    def test_fixed_runtime_admits_and_retains_cooperative_lifetime_lock(self):
+        guard=Mock()
+        with patch.object(module,'MaintenanceAdmission',create=True) as admission:
+            admission.participant_fixed.return_value=guard
+            self.runtime=module.FixedRuntime.fixed()
+            admission.participant_fixed.assert_called_once_with()
+            self.assertTrue(guard.verify.called)
+            self.assertIs(self.runtime._maintenance,guard)
+            self.runtime.close()
+            guard.close.assert_called_once_with()
 
     def test_existing_maintenance_marker_rejects_without_journal_write(self):
         marker=self.f.root/'state'/'maintenance.pending';marker.write_bytes(b'partial')
@@ -125,6 +138,24 @@ class RuntimeTests(unittest.TestCase):
         with self.assertRaises(ValueError):self.runtime.close()
         with self.assertRaises(ValueError):self.runtime.close()
         guard.close.assert_not_called()
+
+    def test_uncertain_resource_close_retains_real_lock_against_another_process(self):
+        import subprocess
+        from inventory_refresh_maintenance_lock import MaintenanceLock
+        path=self.f.root/'maintenance-failure';path.mkdir(mode=0o700)
+        (path/'maintenance.lock').write_bytes(b'');(path/'maintenance.lock').chmod(0o644)
+        directory=os.open(path,os.O_RDONLY|os.O_DIRECTORY)
+        guard=MaintenanceLock.from_directory(directory,'participant',os.getuid(),os.getgid())
+        program="import fcntl,os,sys\nf=os.open(sys.argv[1],os.O_RDONLY)\ntry:\n fcntl.flock(f,fcntl.LOCK_EX|fcntl.LOCK_NB)\nexcept BlockingIOError: sys.exit(42)\nfinally: os.close(f)"
+        try:
+            self.runtime=module.FixedRuntime._with_maintenance_for_test(guard)
+            self.resources.close.side_effect=ValueError('uncertain')
+            with self.assertRaises(ValueError):self.runtime.close()
+            result=subprocess.run([sys.executable,'-I','-B','-S','-c',program,str(path/'maintenance.lock')],
+                stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=5)
+            self.assertEqual(result.returncode,42)
+        finally:
+            guard.close();os.close(directory)
 
     def test_changed_maintenance_guard_fences_runtime_and_is_retained(self):
         guard=Mock();self.runtime=module.FixedRuntime._with_maintenance_for_test(guard)

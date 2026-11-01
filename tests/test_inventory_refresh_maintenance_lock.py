@@ -6,7 +6,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
 import inventory_refresh_maintenance_lock as module
@@ -22,6 +22,24 @@ finally: os.close(fd)
 
 
 class MaintenanceLockTest(unittest.TestCase):
+    def test_fixed_admission_checks_both_markers_under_gate(self):
+        gate=Mock();gate._identity=(1,2);lifetime=Mock();lifetime._identity=(1,3)
+        with patch.object(module.MaintenanceLock,'fixed',side_effect=[gate,lifetime]) as fixed, \
+             patch('inventory_refresh_maintenance_fence._fixed',return_value=False) as private, \
+             patch('inventory_refresh_maintenance_fence._fixed_public',return_value=False) as public:
+            self.assertIs(module.MaintenanceAdmission.participant_fixed(),lifetime)
+        self.assertEqual(fixed.call_count,2)
+        self.assertEqual(private.call_count,2);self.assertEqual(public.call_count,2)
+        gate.close.assert_called_once();lifetime.close.assert_not_called()
+
+    def test_fixed_admission_closes_locks_if_marker_appears_during_admission(self):
+        gate=Mock();gate._identity=(1,2);lifetime=Mock();lifetime._identity=(1,3)
+        with patch.object(module.MaintenanceLock,'fixed',side_effect=[gate,lifetime]), \
+             patch('inventory_refresh_maintenance_fence._fixed',return_value=False), \
+             patch('inventory_refresh_maintenance_fence._fixed_public',side_effect=[False,True]):
+            with self.assertRaises(ValueError):module.MaintenanceAdmission.participant_fixed()
+        gate.close.assert_called_once();lifetime.close.assert_called_once()
+
     def setUp(self):
         self.temp=tempfile.TemporaryDirectory();self.path=Path(self.temp.name)
         (self.path/'maintenance.lock').write_bytes(b'');(self.path/'maintenance.lock').chmod(0o644)

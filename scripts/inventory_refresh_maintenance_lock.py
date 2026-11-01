@@ -28,9 +28,9 @@ def _metadata(info):
 
 class MaintenanceLock:
     @classmethod
-    def fixed(cls,mode):
+    def fixed(cls,mode,*,name=NAME):
         """Open only the preprovisioned fixed Linux lock; never create it."""
-        if sys.platform!='linux' or mode not in ('participant','maintenance'):
+        if sys.platform!='linux' or mode not in ('participant','maintenance') or name not in (NAME,GATE):
             raise ValueError(ERROR)
         root=None;ancestry=None;value=None;failed=False
         try:
@@ -43,7 +43,7 @@ class MaintenanceLock:
                 raise ValueError(ERROR)
             root=os.open('/',os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW|os.O_NONBLOCK)
             ancestry=_Ancestry.open(root,('run','command-center-inventory-refresh'))
-            value=cls.from_directory(ancestry.fds[-1],mode,0,0,ancestry.verify)
+            value=cls.from_directory(ancestry.fds[-1],mode,0,0,ancestry.verify,name=name)
             value._ancestry=ancestry;ancestry=None
         except BaseException:failed=True
         finally:
@@ -153,6 +153,34 @@ class MaintenanceAdmission:
     No built-in deadline: a future maintenance owner must bound drain and
     preserve uncertainty on timeout. All producers must cooperate.
     """
+    @staticmethod
+    def participant_fixed():
+        """Acquire the fixed gate and lifetime lock around both marker checks.
+
+        Cooperation cannot prove legacy producers stopped or descendants gone.
+        """
+        from inventory_refresh_maintenance_fence import _fixed, _fixed_public
+        gate=None;lifetime=None;failed=False
+        try:
+            gate=MaintenanceLock.fixed('participant',name=GATE)
+            def absent():
+                if _fixed('present') is not False or _fixed_public('present') is not False:raise ValueError(ERROR)
+            absent();gate.verify()
+            lifetime=MaintenanceLock.fixed('participant')
+            if gate._identity[:2]==lifetime._identity[:2]:raise ValueError(ERROR)
+            absent();gate.verify();lifetime.verify()
+            gate.close();gate=None
+            return lifetime
+        except BaseException:failed=True
+        finally:
+            if failed:
+                if lifetime is not None:
+                    try:lifetime.close()
+                    except BaseException:pass
+                if gate is not None:
+                    try:gate.close()
+                    except BaseException:pass
+        raise ValueError(ERROR)
     @staticmethod
     def participant_checked(directory,owner,group,marker_present,verify_ancestry=lambda:None):
         """Check a caller-supplied marker twice while admission stays held.

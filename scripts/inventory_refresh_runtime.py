@@ -12,6 +12,7 @@ from inventory_refresh_channel import ObservationChannel
 from inventory_refresh_dispatch import RootDispatcher
 from inventory_refresh_io import Inbox,StatusPublisher
 from inventory_refresh_maintenance_fence import present as maintenance_present
+from inventory_refresh_maintenance_lock import MaintenanceAdmission
 from inventory_refresh_observation import _Ancestry
 from inventory_refresh_observation_transaction import ObservationTransaction
 from inventory_refresh_observer import kernel_clock
@@ -49,7 +50,7 @@ class FixedRuntime:
 
     @classmethod
     def fixed(cls):
-        return cls._construct(None)
+        return cls._construct(MaintenanceAdmission.participant_fixed())
 
     @classmethod
     def _with_maintenance_for_test(cls,maintenance):

@@ -140,9 +140,14 @@ lock release, or maintenance
 ownership. Valid unstarted requests can still remain in the inboxes; a future
 maintenance owner must fence producers and reconcile those files before
 switching modes. Those remain separate requirements before publishing a binding.
-Coordinator startup rejects any `maintenance.pending` entry, or an uncertain
-read of that entry, before constructing action-capable components. This
-sampled check does not stop reporter starts or prevent concurrent publication.
+Coordinator startup acquires the preprovisioned shared admission gate and
+lifetime lock, checks both private and public maintenance markers twice while
+holding admission, and retains the lifetime lock through successful cleanup.
+Missing locks or uncertain marker reads fail closed before action-capable
+components are constructed. This cooperative protocol does not control legacy
+or unmanaged producers. The lock descriptor is close-on-exec, so an exec'd
+descendant is not automatically covered; managed cgroup draining remains a
+separate activation requirement.
 The marker has no automatic removal; startup requires explicit reconciliation
 when it is present. Its absence does not resolve an uncertain prior write.
 
