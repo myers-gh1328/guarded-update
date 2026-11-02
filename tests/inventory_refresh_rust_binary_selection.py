@@ -43,7 +43,7 @@ def _select(raw,repo,target):
     require(isinstance(repo,Path) and repo.is_absolute() and isinstance(target,Path) and target.is_absolute())
     require(str(repo)==os.path.normpath(str(repo)) and str(target)==os.path.normpath(str(target)))
     selected=[];finished=False;lines=raw.splitlines();require(0<len(lines)<=32768)
-    package='path+'+repo.as_uri()+'#guarded-update@0.1.9'
+    package='path+'+repo.as_uri()+'#guarded-update@0.1.10'
     for line in lines:
         require(not finished and 0<len(line)<=256*1024)
         item=json.loads(line,object_pairs_hook=_unique,parse_constant=_constant)

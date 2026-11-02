@@ -19,7 +19,7 @@ class SelectionTests(unittest.TestCase):
         self.target=self.root/'target';self.deps=self.target/'debug'/'deps';self.deps.mkdir(parents=True)
         self.binary=self.deps/'command_center_inventory-0123456789abcdef';self.binary.write_bytes(b'synthetic test binary');self.binary.chmod(0o555)
         self.repo=self.root/'source';self.repo.mkdir();self.fd=os.open(self.target,os.O_RDONLY|os.O_DIRECTORY)
-        self.event={'reason':'compiler-artifact','package_id':'path+'+self.repo.as_uri()+'#guarded-update@0.1.9',
+        self.event={'reason':'compiler-artifact','package_id':'path+'+self.repo.as_uri()+'#guarded-update@0.1.10',
             'manifest_path':str(self.repo/'Cargo.toml'),'target':{'name':'command-center-inventory','kind':['bin'],
             'src_path':str(self.repo/'src/inventory_main.rs')},'profile':{'test':True},'features':['inventory-agent'],
             'executable':str(self.binary),'fresh':False}
@@ -32,7 +32,7 @@ class SelectionTests(unittest.TestCase):
             root=Path(temp);target=root/'target';deps=target/'debug'/'deps';deps.mkdir(parents=True)
             binary=deps/'command_center_inventory-0123456789abcdef';binary.write_bytes(b'synthetic test binary');binary.chmod(0o555)
             repo=root/'source';repo.mkdir()
-            event={'reason':'compiler-artifact','package_id':repo.as_uri()+'#guarded-update@0.1.9',
+            event={'reason':'compiler-artifact','package_id':repo.as_uri()+'#guarded-update@0.1.10',
                 'manifest_path':str(repo/'Cargo.toml'),'target':{'name':'command-center-inventory','kind':['bin'],
                 'src_path':str(repo/'src/inventory_main.rs')},'profile':{'test':True},'features':['inventory-agent'],
                 'executable':str(binary),'fresh':False}

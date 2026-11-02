@@ -2,6 +2,13 @@
 
 All notable changes are listed here. Versions follow semantic versioning.
 
+## 0.1.10 - 2026-11-01
+
+- Preserve read-only daily Linux inventory reporting and report cached APT currency as Unknown.
+- Fence daily collection when the initialization marker remains but its request
+  journal is lost or uncertain. Loss or rollback of both files is not detected.
+- Add inactive metadata-refresh foundations; request execution remains disabled.
+
 ## 0.1.9 - 2026-10-27
 
 - Add a signed exact-body digest header for pre-body cryptographic admission.
