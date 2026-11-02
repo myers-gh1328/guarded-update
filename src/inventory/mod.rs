@@ -124,6 +124,16 @@ fn pass(
     let latest_result = store.latest();
     let invalid_latest = latest_result.is_err();
     let latest = latest_result.unwrap_or(None);
+    // A report may have been published before the corresponding schedule save.
+    // Only the report bearing the reserved sequence can be that new report.
+    if store.schedule.collection_error
+        && latest
+            .as_ref()
+            .and_then(|report| report["sequence"].as_u64())
+            == Some(store.schedule.sequence)
+    {
+        store.finish_replacement(now)?;
+    }
     let descriptor=latest.as_ref().map(|report|->Result<Value,String> {
         let bytes=state::read(&store.dir.join("latest.json"),state::MAX_REPORT)?;
         Ok(json!({"report_id":report["report_id"],"sequence":report["sequence"],"sha256":tools.sha256(&bytes)?,"collected_at":report["collected_at"]}))
@@ -388,6 +398,141 @@ pub fn main() -> std::process::ExitCode {
 mod tests {
     use super::*;
     use std::cell::RefCell;
+    struct FixtureNetwork(std::path::PathBuf);
+    impl Network for FixtureNetwork {
+        fn post(
+            &self,
+            config: &Config,
+            path: &str,
+            body: &str,
+            now: u64,
+        ) -> Result<Response, String> {
+            transport::post_fixture(config, path, body, now, &self.0)
+        }
+    }
+    #[test]
+    #[ignore = "requires the private disposable Command Center TLS fixture"]
+    fn synthetic_app_delivery_with_test_ca() {
+        let root = std::path::PathBuf::from(
+            std::env::var("GUARDED_UPDATE_INVENTORY_FIXTURE_ROOT").unwrap(),
+        );
+        state::protected(&root, true).unwrap();
+        let port = std::fs::read_to_string(root.join("port"))
+            .unwrap()
+            .parse::<u16>()
+            .unwrap();
+        let enrollment = "00000000-0000-4000-8000-000000000001";
+        let mut config = config(&root);
+        config.server_url = format!("https://127.0.0.1:{port}");
+        config.device_id = "test-pi".into();
+        config.enrollment_id = enrollment.into();
+        config.key_id = "synthetic-key".into();
+        config.reporting_private_key_file = root.join("device.key");
+        let state_dir = root.join("agent-state");
+        std::fs::create_dir(&state_dir).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&state_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        config.state_dir = state_dir.clone();
+        Store::initialize(&state_dir, enrollment).unwrap();
+        let mut store = Store::load(&state_dir, enrollment).unwrap();
+        let body: Value = serde_json::from_slice(
+            &state::read(&root.join("report.json"), state::MAX_REPORT).unwrap(),
+        )
+        .unwrap();
+        let now = crate::timefmt::now_secs() as u64;
+        store.reserve().unwrap();
+        store.replace(&body, now).unwrap();
+        let network = FixtureNetwork(root.join("server.pem"));
+        assert!(pass(&config, &mut store, &FailedCollector, &network, now, false).is_err());
+        let second = pass(
+            &config,
+            &mut store,
+            &FailedCollector,
+            &network,
+            now + 1,
+            false,
+        );
+        assert!(second.is_ok(), "{second:?}");
+        assert!(store.schedule.acknowledged_sha256.is_some());
+        assert_eq!(store.schedule.sequence, 1);
+    }
+    fn fixture_signature_status(key: &str) -> u16 {
+        let root = std::path::PathBuf::from(
+            std::env::var("GUARDED_UPDATE_INVENTORY_FIXTURE_ROOT").unwrap(),
+        );
+        state::protected(&root, true).unwrap();
+        let port = std::fs::read_to_string(root.join("port"))
+            .unwrap()
+            .parse::<u16>()
+            .unwrap();
+        let mut config = config(&root);
+        config.server_url = format!("https://127.0.0.1:{port}");
+        config.device_id = "test-pi".into();
+        config.enrollment_id = "00000000-0000-4000-8000-000000000001".into();
+        config.key_id = "synthetic-key".into();
+        config.reporting_private_key_file = root.join(key);
+        let now = crate::timefmt::now_secs() as u64;
+        let body=json!({"schema_version":1,"enrollment_id":config.enrollment_id,"agent_version":"synthetic","latest_report":null,"collection_state":"idle","refresh_result":null}).to_string();
+        transport::post_fixture(
+            &config,
+            "/api/agent/v1/inventory/check-ins",
+            &body,
+            now,
+            &root.join("server.pem"),
+        )
+        .unwrap()
+        .status
+    }
+    #[test]
+    #[ignore = "requires the private disposable Command Center TLS fixture"]
+    fn synthetic_unregistered_signature_is_rejected() {
+        assert_eq!(fixture_signature_status("other-device.key"), 401);
+    }
+    #[test]
+    #[ignore = "requires the private disposable Command Center TLS fixture"]
+    fn synthetic_revoked_signature_is_rejected() {
+        assert_eq!(fixture_signature_status("device.key"), 401);
+    }
+    #[test]
+    #[ignore = "requires the private disposable Command Center TLS fixture"]
+    fn synthetic_offline_preserves_latest() {
+        let root = std::path::PathBuf::from(
+            std::env::var("GUARDED_UPDATE_INVENTORY_FIXTURE_ROOT").unwrap(),
+        );
+        state::protected(&root, true).unwrap();
+        let port = std::fs::read_to_string(root.join("port"))
+            .unwrap()
+            .parse::<u16>()
+            .unwrap();
+        let mut config = config(&root);
+        config.server_url = format!("https://127.0.0.1:{port}");
+        config.device_id = "test-pi".into();
+        config.enrollment_id = "00000000-0000-4000-8000-000000000001".into();
+        config.key_id = "synthetic-key".into();
+        config.reporting_private_key_file = root.join("device.key");
+        config.state_dir = root.join("agent-state");
+        let mut store = Store::load(&config.state_dir, &config.enrollment_id).unwrap();
+        let before = state::read(&config.state_dir.join("latest.json"), state::MAX_REPORT).unwrap();
+        let acknowledged = store.schedule.acknowledged_sha256.clone();
+        let now = crate::timefmt::now_secs() as u64;
+        assert!(
+            pass(
+                &config,
+                &mut store,
+                &FailedCollector,
+                &FixtureNetwork(root.join("server.pem")),
+                now + 2,
+                false
+            )
+            .is_err()
+        );
+        assert_eq!(
+            state::read(&config.state_dir.join("latest.json"), state::MAX_REPORT).unwrap(),
+            before
+        );
+        assert_eq!(store.schedule.acknowledged_sha256, acknowledged);
+        assert_eq!(store.schedule.sequence, 1);
+    }
     struct FakeNetwork {
         offline: bool,
         calls: RefCell<Vec<Value>>,
@@ -451,9 +596,204 @@ mod tests {
         (temp, store)
     }
     #[test]
+    fn interrupted_report_replacement_does_not_inherit_old_permanent_failure() {
+        struct Accept(RefCell<Vec<String>>);
+        impl Network for Accept {
+            fn post(&self, _: &Config, path: &str, body: &str, _: u64) -> Result<Response, String> {
+                self.0.borrow_mut().push(path.into());
+                let body = if path.ends_with("check-ins") {
+                    json!({"schema_version":1,"reporting_enabled":true,"source_revision":1,"receipt":null})
+                } else {
+                    let report: Value = serde_json::from_str(body).unwrap();
+                    json!({"schema_version":1,"enrollment_id":report["enrollment_id"],"sequence":report["sequence"],"report_id":report["report_id"],"sha256":SystemTools.sha256(body.as_bytes()).unwrap(),"accepted_at":"2026-01-01T00:00:00Z","disposition":"current"})
+                };
+                Ok(Response {
+                    status: 200,
+                    raw_body: serde_json::to_vec(&body).unwrap(),
+                    json_content_type: true,
+                    body,
+                    retry_after: 0,
+                })
+            }
+        }
+        let (temp, mut store) = store();
+        store.reserve().unwrap();
+        store.schedule.source_revision = 1;
+        store.schedule.next_collection_at = 1000;
+        store.schedule.permanent_error = true;
+        store.schedule.collection_error = true;
+        store.save().unwrap();
+        // A crash after publishing the new report but before its schedule save.
+        let report = json!({"enrollment_id":"epoch","sequence":1,"report_id":"new","source_revision":1,"collected_at":"2026-01-01T00:00:00Z"});
+        state::atomic(
+            &temp.0.join("latest.json"),
+            &serde_json::to_vec(&report).unwrap(),
+        )
+        .unwrap();
+        drop(store);
+        let mut store = Store::load(&temp.0, "epoch").unwrap();
+        let network = Accept(RefCell::new(vec![]));
+        pass(
+            &config(&temp.0),
+            &mut store,
+            &FailedCollector,
+            &network,
+            100,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            network
+                .0
+                .borrow()
+                .iter()
+                .filter(|path| path.ends_with("reports"))
+                .count(),
+            1
+        );
+        drop(store);
+        let mut store = Store::load(&temp.0, "epoch").unwrap();
+        pass(
+            &config(&temp.0),
+            &mut store,
+            &FailedCollector,
+            &network,
+            101,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            network
+                .0
+                .borrow()
+                .iter()
+                .filter(|path| path.ends_with("reports"))
+                .count(),
+            1
+        );
+        assert_eq!(store.schedule.sequence, 1);
+    }
+    #[test]
+    fn interrupted_publication_honors_matching_checkin_receipt() {
+        struct Receipt(Value, RefCell<usize>);
+        impl Network for Receipt {
+            fn post(&self, _: &Config, path: &str, _: &str, _: u64) -> Result<Response, String> {
+                assert!(path.ends_with("check-ins"));
+                *self.1.borrow_mut() += 1;
+                let body = json!({"schema_version":1,"reporting_enabled":true,"source_revision":1,"receipt":self.0});
+                Ok(Response {
+                    status: 200,
+                    retry_after: 0,
+                    raw_body: serde_json::to_vec(&body).unwrap(),
+                    json_content_type: true,
+                    body,
+                })
+            }
+        }
+        let (temp, mut store) = store();
+        store.reserve().unwrap();
+        store.schedule.source_revision = 1;
+        store.schedule.permanent_error = true;
+        store.schedule.collection_error = true;
+        store.save().unwrap();
+        let report = json!({"enrollment_id":"epoch","sequence":1,"report_id":"new","source_revision":1,"collected_at":"2026-01-01T00:00:00Z"});
+        let bytes = serde_json::to_vec(&report).unwrap();
+        state::atomic(&temp.0.join("latest.json"), &bytes).unwrap();
+        let digest = SystemTools.sha256(&bytes).unwrap();
+        drop(store);
+        let mut store = Store::load(&temp.0, "epoch").unwrap();
+        let network = Receipt(
+            json!({"schema_version":1,"enrollment_id":"epoch","sequence":1,"report_id":"new","sha256":digest,"accepted_at":"2026-01-01T00:00:00Z","disposition":"current"}),
+            RefCell::new(0),
+        );
+        pass(
+            &config(&temp.0),
+            &mut store,
+            &FailedCollector,
+            &network,
+            100,
+            false,
+        )
+        .unwrap();
+        assert_eq!(*network.1.borrow(), 1);
+        assert_eq!(
+            store.schedule.acknowledged_sha256.as_deref(),
+            Some(digest.as_str())
+        );
+        assert_eq!(store.schedule.sequence, 1);
+    }
+    #[test]
+    fn interrupted_publication_save_failure_has_no_network_effect() {
+        let (temp, mut store) = store();
+        store.reserve().unwrap();
+        store.schedule.collection_error = true;
+        store.schedule.permanent_error = true;
+        store.save().unwrap();
+        state::atomic(
+            &temp.0.join("latest.json"),
+            &serde_json::to_vec(&json!({"enrollment_id":"epoch","sequence":1,"report_id":"new"}))
+                .unwrap(),
+        )
+        .unwrap();
+        drop(store);
+        std::fs::create_dir(temp.0.join("schedule.pending")).unwrap();
+        let mut store = Store::load(&temp.0, "epoch").unwrap();
+        let network = FakeNetwork {
+            offline: false,
+            calls: RefCell::new(vec![]),
+        };
+        assert!(
+            pass(
+                &config(&temp.0),
+                &mut store,
+                &FailedCollector,
+                &network,
+                100,
+                false
+            )
+            .is_err()
+        );
+        assert!(network.calls.borrow().is_empty());
+        let disk = Store::load(&temp.0, "epoch").unwrap();
+        assert!(disk.schedule.collection_error && disk.schedule.permanent_error);
+    }
+    #[test]
+    fn interrupted_collection_before_publication_keeps_old_failure() {
+        let (temp, mut store) = store();
+        store.reserve().unwrap();
+        store.replace(&json!({"enrollment_id":"epoch","sequence":1,"report_id":"old","source_revision":1,"collected_at":"2026-01-01T00:00:00Z"}), 100).unwrap();
+        store.schedule.source_revision = 1;
+        store.schedule.permanent_error = true;
+        store.reserve().unwrap();
+        store.schedule.collection_error = true;
+        store.save().unwrap();
+        drop(store);
+        let mut store = Store::load(&temp.0, "epoch").unwrap();
+        let network = FakeNetwork {
+            offline: false,
+            calls: RefCell::new(vec![]),
+        };
+        pass(
+            &config(&temp.0),
+            &mut store,
+            &FailedCollector,
+            &network,
+            101,
+            false,
+        )
+        .unwrap();
+        assert!(store.schedule.collection_error);
+        assert!(store.schedule.permanent_error);
+        assert_eq!(store.schedule.sequence, 2);
+        assert_eq!(network.calls.borrow().len(), 1);
+    }
+    #[test]
     fn malformed_latest_still_sends_error_checkin_without_resetting_sequence() {
         let (temp, mut store) = store();
         store.reserve().unwrap();
+        store.schedule.collection_error = true;
+        store.schedule.permanent_error = true;
+        store.save().unwrap();
         state::atomic(&temp.0.join("latest.json"), b"broken").unwrap();
         let network = FakeNetwork {
             offline: false,
@@ -480,6 +820,8 @@ mod tests {
             Value::Null
         );
         assert_eq!(store.schedule.sequence, 1);
+        assert!(store.schedule.collection_error);
+        assert!(store.schedule.permanent_error);
     }
     #[test]
     fn fenced_collection_keeps_checkin_without_starting_a_scan() {
