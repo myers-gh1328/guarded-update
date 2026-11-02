@@ -1771,10 +1771,14 @@ def read_rust_barrier_marker(fd,deadline):
     marker=b'INVENTORY-BARRIER-1\n';received=bytearray();poller=select.poll()
     poller.register(fd,select.POLLIN|select.POLLHUP|select.POLLERR)
     while len(received)<len(marker):
-        remaining=deadline-time.monotonic();assert remaining>0 and poller.poll(max(1,int(remaining*1000)))
+        remaining=deadline-time.monotonic();assert remaining>0 and poller.poll(max(1,int(remaining*1000))), 'barrier timeout'
         try:chunk=os.read(fd,len(marker)+1-len(received))
         except BlockingIOError:continue
-        assert chunk and time.monotonic()<deadline;received.extend(chunk);assert marker.startswith(received)
+        assert chunk, 'barrier eof'
+        assert time.monotonic()<deadline, 'barrier timeout'
+        received.extend(chunk)
+        if not marker.startswith(received):
+            raise AssertionError('barrier extra-data' if received.startswith(marker) else 'barrier unexpected-prefix')
     assert bytes(received)==marker and time.monotonic()<deadline
 
 

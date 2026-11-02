@@ -182,12 +182,13 @@ class PublisherHarnessTests(unittest.TestCase):
                 os.set_blocking(read_fd,False);os.write(write_fd,frame)
                 if valid:scope[names[0]](read_fd,time.monotonic()+.1)
                 else:
-                    with self.assertRaises(AssertionError):scope[names[0]](read_fd,time.monotonic()+.1)
+                    category='extra-data' if frame.startswith(b'INVENTORY-BARRIER-1\n') else 'unexpected-prefix'
+                    with self.assertRaisesRegex(AssertionError,category):scope[names[0]](read_fd,time.monotonic()+.1)
             finally:os.close(read_fd);os.close(write_fd)
         read_fd,write_fd=os.pipe()
         try:
             os.set_blocking(read_fd,False);os.set_blocking(write_fd,False)
-            with self.assertRaises(AssertionError):scope[names[0]](read_fd,time.monotonic()+.02)
+            with self.assertRaisesRegex(AssertionError,'barrier timeout'):scope[names[0]](read_fd,time.monotonic()+.02)
             scope[names[1]](write_fd,time.monotonic()+.1);self.assertEqual(os.read(read_fd,100),b'ACK-1\n')
             actual=os.write
             with patch.object(os,'write',side_effect=lambda fd,raw:actual(fd,raw[:2])):
@@ -196,6 +197,11 @@ class PublisherHarnessTests(unittest.TestCase):
             with patch.object(os,'write',side_effect=OSError('failed write')):
                 with self.assertRaises(OSError):scope[names[1]](write_fd,time.monotonic()+.1)
         finally:os.close(read_fd);os.close(write_fd)
+        read_fd,write_fd=os.pipe()
+        try:
+            os.close(write_fd)
+            with self.assertRaisesRegex(AssertionError,'barrier eof'):scope[names[0]](read_fd,time.monotonic()+.1)
+        finally:os.close(read_fd)
 
     def test_rust_barrier_sample_rejects_unit_drift_and_closes_owners(self):
         tree=ast.parse((Path(__file__).parent/'native_inventory_refresh_apt.py').read_bytes())
