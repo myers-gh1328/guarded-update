@@ -8,6 +8,25 @@ use super::transport::Response;
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 
+pub(super) fn encode_collection_report(
+    enrollment: &str,
+    request_id: &str,
+    proof: &super::requests::ScanProof,
+    scan: Value,
+) -> Result<Vec<u8>, String> {
+    if scan["scanId"] != proof.report_id {
+        return Err("Collection publication identity invalid".into());
+    }
+    let collected = scan["completedAt"]
+        .as_str()
+        .ok_or("Collection timestamp missing")?;
+    let report = json!({"schema_version":1,"enrollment_id":enrollment,"report_id":proof.report_id,
+        "sequence":proof.sequence,"source_revision":proof.source_revision,"refresh_request_id":null,
+        "collection_request_id":request_id,"collected_at":collected,"scan":scan,
+        "metadata_refresh":{"result":"deferred","successful_checked_at":null,"policy_generation":null,"reason":"not_configured"}});
+    super::state::encode_report(&report)
+}
+
 pub struct Readiness {
     pub enabled: bool,
     pub coherent: bool,
@@ -100,14 +119,8 @@ impl<'a> Control<'a> {
             {
                 return Err("Collection publication identity invalid".into());
             }
-            let collected = scan["completedAt"]
-                .as_str()
-                .ok_or("Collection timestamp missing")?;
-            let report = json!({"schema_version":1,"enrollment_id":self.enrollment,"report_id":proof_scan.report_id,
-            "sequence":proof_scan.sequence,"source_revision":proof_scan.source_revision,"refresh_request_id":null,
-            "collection_request_id":started.request_id,"collected_at":collected,"scan":scan,
-            "metadata_refresh":{"result":"deferred","successful_checked_at":null,"policy_generation":null,"reason":"not_configured"}});
-            let bytes = super::state::encode_report(&report)?;
+            let bytes =
+                encode_collection_report(&self.enrollment, &started.request_id, proof_scan, scan)?;
             let digest = tools.sha256(&bytes)?;
             proof_scan.finished_boottime_ms = Some(clock.boottime_ms);
             let id = proof_scan.report_id.clone();
@@ -730,6 +743,53 @@ mod tests {
                 .unwrap()
                 .status,
             ClientStatus::Received
+        );
+    }
+    #[test]
+    fn collection_report_encoder_rejects_a_different_scan_identity() {
+        let proof = super::super::requests::ScanProof {
+            report_id: "00000000-0000-4000-8000-000000000003".into(),
+            sequence: 1,
+            source_revision: 2,
+            started_boottime_ms: 10,
+            finished_boottime_ms: None,
+        };
+        let scan = json!({"scanId":"00000000-0000-4000-8000-000000000004","completedAt":"2026-10-28T00:00:01Z"});
+        assert!(
+            encode_collection_report(EPOCH, "00000000-0000-4000-8000-000000000002", &proof, scan)
+                .is_err()
+        );
+    }
+    #[test]
+    fn collection_report_encoder_preserves_request_and_exact_scan() {
+        let proof = super::super::requests::ScanProof {
+            report_id: "00000000-0000-4000-8000-000000000003".into(),
+            sequence: 7,
+            source_revision: 2,
+            started_boottime_ms: 10,
+            finished_boottime_ms: None,
+        };
+        let scan = json!({"scanId":proof.report_id,"completedAt":"2026-10-28T00:00:01Z","packages":[{"name":"test"}]});
+        let bytes = encode_collection_report(
+            EPOCH,
+            "00000000-0000-4000-8000-000000000002",
+            &proof,
+            scan.clone(),
+        )
+        .unwrap();
+        let report: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(report["enrollment_id"], EPOCH);
+        assert_eq!(
+            report["collection_request_id"],
+            "00000000-0000-4000-8000-000000000002"
+        );
+        assert_eq!(report["report_id"], proof.report_id);
+        assert_eq!(report["sequence"], 7);
+        assert_eq!(report["source_revision"], 2);
+        assert_eq!(report["scan"], scan);
+        assert!(
+            encode_collection_report(EPOCH, "request", &proof, json!({"scanId":proof.report_id}))
+                .is_err()
         );
     }
     #[test]

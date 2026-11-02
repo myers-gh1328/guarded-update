@@ -107,6 +107,11 @@ class Inbox:
             raise IOErrorState('invalid_request')
 
     def read(self):
+        snapshot=self.read_snapshot()
+        return None if snapshot is None else snapshot[:2]
+
+    def read_snapshot(self):
+        """Verified nonce plus exact file metadata, not an atomic CAS grant."""
         self._verify()
         try:
             fd=os.open('request',os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK,dir_fd=self._inbox)
@@ -132,7 +137,8 @@ class Inbox:
             if len(raw)!=before.st_size or _stable(before)!=_stable(after) or _stable(named)!=_stable(after):
                 raise IOErrorState('invalid_request')
             try:
-                return correlator(bytes(raw))
+                nonce,sequence=correlator(bytes(raw))
+                return nonce,sequence,_stable(after)
             except ValueError:
                 raise IOErrorState('invalid_request') from None
         except OSError:

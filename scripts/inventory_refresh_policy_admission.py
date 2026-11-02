@@ -9,7 +9,7 @@ import stat
 import sys
 
 from inventory_refresh_observation import _Ancestry, _stable
-from inventory_refresh_policy import PolicyError, parse_policy, policy_generation, render_policy, MAX_POLICY
+from inventory_refresh_policy import PolicyError, parse_policy, policy_generation, render_policy, render_reader_policy, MAX_POLICY
 
 FILES=(('policy.json',MAX_POLICY),('policy-commitment.key',32))
 
@@ -117,6 +117,12 @@ class PolicyGuard:
     def render(self,staging_token):
         try:
             self._check();return render_policy(self._policy,staging_token)
+        except BaseException:
+            self._poisoned=True;raise PolicyError() from None
+
+    def reader_projection(self,generation):
+        try:
+            self._check();return render_reader_policy(self._policy,generation,self._generation)
         except BaseException:
             self._poisoned=True;raise PolicyError() from None
 

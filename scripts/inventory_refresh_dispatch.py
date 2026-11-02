@@ -15,7 +15,7 @@ CONTEXT=('journal','publisher','policy','resources','store','writers')
 class RootDispatcher:
     def __init__(self,journal,inboxes,refresh,observation):
         self._journal=journal;self._inboxes=dict(inboxes);self._refresh=refresh
-        self._observation=observation;self._closed=False;self._owned=False
+        self._observation=observation;self._closed=False;self._owned=False;self._draining=False
         self._verify()
         if observation.pristine is not True:
             raise ValueError('Inventory dispatcher requires a fresh observation lifecycle')
@@ -54,6 +54,7 @@ class RootDispatcher:
         except BaseException:pass
 
     def step(self):
+        if self._draining:return self.drain()
         result={'state':'closed' if self._closed else 'ready','poll':None,
                 'release':None,'observation':None,'refresh':None}
         if self._closed:return result
@@ -78,6 +79,40 @@ class RootDispatcher:
             return result
         except BaseException:
             self._fatal();raise ValueError('Inventory dispatcher unconfirmed') from None
+
+    def drain(self):
+        """Absorb new admissions and poll owned work; no shutdown authority."""
+        self._draining=True
+        result={'state':'closed' if self._closed else 'draining','poll':None,'release':None}
+        if self._closed:return result
+        try:
+            self._verify()
+            if self._journal.snapshot()['unconfirmed']:raise ValueError('Inventory dispatcher unconfirmed')
+            if self._observation.owns_scope and not self._owned:
+                raise ValueError('Inventory dispatcher cannot adopt observation ownership')
+            self._observation._context()
+            result['poll']=self._observation.poll()
+            if result['poll']=='unconfirmed':raise ValueError('Inventory observation unconfirmed')
+            if not self._observation.owns_scope:self._owned=False
+            requests={};invalid=False
+            for name in CAPABILITIES:
+                requests[name],error=self._read(self._inboxes[name])
+                invalid=invalid or error is not None
+            if self._observation.owns_scope:
+                job=self._observation._job
+                if not self._owned or job is None:raise ValueError('Inventory observation ownership unavailable')
+                if requests['release']==job.operation_nonce:
+                    result['release']=self._observation.release(requests['release'])
+                    if result['release']=='unconfirmed':raise ValueError('Inventory release unconfirmed')
+            self._observation._context()
+            snapshot=self._journal.snapshot()
+            if snapshot['unconfirmed']:raise ValueError('Inventory dispatcher unconfirmed')
+            active=any(value['active'] is not None for value in snapshot['capabilities'].values())
+            if not invalid and not active and not self._observation.owns_scope and self._observation._pin is None:
+                result['state']='drained'
+            return result
+        except BaseException:
+            self._fatal();raise ValueError('Inventory dispatcher drain unconfirmed') from None
 
     def close(self):
         if self._closed:return

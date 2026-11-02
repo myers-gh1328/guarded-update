@@ -131,7 +131,9 @@ class RefreshTransaction:
                 self._journal.finish('refresh',nonce,boot_id,finished,'failed',reason)
                 stage='failed_status';self._current(boot_id);return 'failed'
             checked=datetime.now(timezone.utc).isoformat().replace('+00:00','Z')
-            stage='sealing';manifest=self._store.publish(job['staging_token'],secrets.token_hex(16),self._policy.generation,checked)
+            stage='sealing';generation=secrets.token_hex(16)
+            projection=self._policy.reader_projection(generation)
+            manifest=self._store.publish(job['staging_token'],generation,self._policy.generation,checked,reader_projection=projection)
             # The actual reference/lease must match before durable success.
             stage='acceptance'
             with self._store.lease_current() as lease:

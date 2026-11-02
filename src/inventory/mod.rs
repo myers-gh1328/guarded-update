@@ -10,7 +10,61 @@ mod linux;
 #[cfg(any(target_os = "macos", test))]
 mod macos;
 mod process;
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+mod reporter_barrier;
 #[cfg(test)]
+mod reporter_direct_clock;
+#[cfg(test)]
+mod reporter_frame;
+#[cfg(all(
+    test,
+    any(
+        target_os = "macos",
+        all(
+            target_os = "linux",
+            any(
+                target_arch = "arm",
+                target_arch = "aarch64",
+                target_arch = "x86",
+                target_arch = "x86_64"
+            )
+        )
+    )
+))]
+mod reporter_obs;
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+mod reporter_pipe;
+#[cfg(all(
+    test,
+    target_os = "linux",
+    any(
+        target_arch = "arm",
+        target_arch = "aarch64",
+        target_arch = "x86",
+        target_arch = "x86_64"
+    )
+))]
+mod reporter_request_fixture;
+#[cfg(all(
+    test,
+    any(
+        target_os = "macos",
+        all(
+            target_os = "linux",
+            any(
+                target_arch = "arm",
+                target_arch = "aarch64",
+                target_arch = "x86",
+                target_arch = "x86_64"
+            )
+        )
+    )
+))]
+mod reporter_status;
+// The request foundation is compiled on Linux for the read-only recovery fence;
+// other request operations remain inactive until their runtime adapter is ready.
+#[cfg(any(test, target_os = "linux"))]
+#[cfg_attr(not(test), allow(dead_code))]
 mod requests;
 mod state;
 mod transport;
@@ -65,6 +119,7 @@ fn pass(
     tools: &impl Tools,
     network: &impl Network,
     now: u64,
+    collection_fenced: bool,
 ) -> Result<(), String> {
     let latest_result = store.latest();
     let invalid_latest = latest_result.is_err();
@@ -84,7 +139,7 @@ fn pass(
         Ok(json!({"report_id":report["report_id"],"sequence":report["sequence"],"sha256":tools.sha256(&bytes)?,"collected_at":report["collected_at"]}))
     }).transpose()?;
     let checkin = json!({"schema_version":1,"enrollment_id":config.enrollment_id,"agent_version":env!("CARGO_PKG_VERSION"),
-        "latest_report":descriptor,"collection_state":if store.schedule.permanent_error || invalid_latest || store.schedule.collection_error {"error"} else {"idle"},"refresh_result":null});
+        "latest_report":descriptor,"collection_state":if collection_fenced || store.schedule.permanent_error || invalid_latest || store.schedule.collection_error {"error"} else {"idle"},"refresh_result":null});
     // Always check in before upload retry admission. A queued/invalid report never suppresses liveness.
     let response = network.post(
         config,
@@ -145,7 +200,7 @@ fn pass(
     } else {
         store.schedule.next_collection_at
     };
-    if latest.is_none() || source_changed || now >= next_collection {
+    if !collection_fenced && (latest.is_none() || source_changed || now >= next_collection) {
         let sequence = store.reserve()?;
         store.schedule.collection_error = true;
         store.save()?;
@@ -256,21 +311,37 @@ fn run() -> Result<(), String> {
         return Err("Usage: command-center-inventory sync|initialize --config PATH".into());
     }
     let config = Config::load(std::path::Path::new(&args[2]))?;
-    let _lock = Lock::acquire(&config.state_dir)?;
     if args[0] == "initialize" {
+        let _lock = Lock::acquire(&config.state_dir)?;
         return Store::initialize(&config.state_dir, &config.enrollment_id);
     }
     if !cfg!(any(target_os = "macos", target_os = "linux")) {
         return Err("Native inventory collection requires Linux or macOS".into());
     }
-    let mut store = Store::load(&config.state_dir, &config.enrollment_id)?;
-    pass(
+    sync(
         &config,
-        &mut store,
         &SystemTools,
         &Https,
         crate::timefmt::now_secs().max(0) as u64,
     )
+}
+
+fn sync(
+    config: &Config,
+    tools: &impl Tools,
+    network: &impl Network,
+    now: u64,
+) -> Result<(), String> {
+    let _lock = Lock::acquire(&config.state_dir)?;
+    let mut store = Store::load(&config.state_dir, &config.enrollment_id)?;
+    #[cfg(target_os = "linux")]
+    let collection_fenced =
+        requests::runtime_collection_fence(&config.state_dir, &config.enrollment_id, &_lock)
+            .unwrap_or(true);
+    _lock.verify_for(&config.state_dir)?;
+    #[cfg(not(target_os = "linux"))]
+    let collection_fenced = false;
+    pass(config, &mut store, tools, network, now, collection_fenced)
 }
 
 #[cfg(target_os = "macos")]
@@ -372,8 +443,15 @@ mod tests {
         store.reserve().unwrap();
         store.replace(&body, now).unwrap();
         let network = FixtureNetwork(root.join("server.pem"));
-        assert!(pass(&config, &mut store, &FailedCollector, &network, now).is_err());
-        let second = pass(&config, &mut store, &FailedCollector, &network, now + 1);
+        assert!(pass(&config, &mut store, &FailedCollector, &network, now, false).is_err());
+        let second = pass(
+            &config,
+            &mut store,
+            &FailedCollector,
+            &network,
+            now + 1,
+            false,
+        );
         assert!(second.is_ok(), "{second:?}");
         assert!(store.schedule.acknowledged_sha256.is_some());
         assert_eq!(store.schedule.sequence, 1);
@@ -443,7 +521,8 @@ mod tests {
                 &mut store,
                 &FailedCollector,
                 &FixtureNetwork(root.join("server.pem")),
-                now + 2
+                now + 2,
+                false
             )
             .is_err()
         );
@@ -560,6 +639,7 @@ mod tests {
             &FailedCollector,
             &network,
             100,
+            false,
         )
         .unwrap();
         assert_eq!(
@@ -579,6 +659,7 @@ mod tests {
             &FailedCollector,
             &network,
             101,
+            false,
         )
         .unwrap();
         assert_eq!(
@@ -631,6 +712,7 @@ mod tests {
             &FailedCollector,
             &network,
             100,
+            false,
         )
         .unwrap();
         assert_eq!(*network.1.borrow(), 1);
@@ -666,7 +748,8 @@ mod tests {
                 &mut store,
                 &FailedCollector,
                 &network,
-                100
+                100,
+                false
             )
             .is_err()
         );
@@ -696,6 +779,7 @@ mod tests {
             &FailedCollector,
             &network,
             101,
+            false,
         )
         .unwrap();
         assert!(store.schedule.collection_error);
@@ -715,7 +799,17 @@ mod tests {
             offline: false,
             calls: RefCell::new(vec![]),
         };
-        assert!(pass(&config(&temp.0), &mut store, &FakeTools, &network, 100).is_err());
+        assert!(
+            pass(
+                &config(&temp.0),
+                &mut store,
+                &FakeTools,
+                &network,
+                100,
+                false
+            )
+            .is_err()
+        );
         assert_eq!(network.calls.borrow().len(), 1);
         assert_eq!(
             network.calls.borrow()[0]["body"]["collection_state"],
@@ -730,6 +824,183 @@ mod tests {
         assert!(store.schedule.permanent_error);
     }
     #[test]
+    fn fenced_collection_keeps_checkin_without_starting_a_scan() {
+        let (temp, mut store) = store();
+        store.schedule.source_revision = 1;
+        store.save().unwrap();
+        let network = FakeNetwork {
+            offline: false,
+            calls: RefCell::new(vec![]),
+        };
+        pass(
+            &config(&temp.0),
+            &mut store,
+            &FailedCollector,
+            &network,
+            100000,
+            true,
+        )
+        .unwrap();
+        assert_eq!(network.calls.borrow().len(), 1);
+        assert_eq!(
+            network.calls.borrow()[0]["body"]["collection_state"],
+            "error"
+        );
+        assert_eq!(store.schedule.sequence, 0);
+        assert!(store.latest().unwrap().is_none());
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sync_inspects_pending_journal_before_scheduled_collection() {
+        let dir = state::tests::TestDir::new();
+        let mut config = config(&dir.0);
+        config.enrollment_id = "00000000-0000-4000-8000-000000000001".into();
+        Store::initialize(&dir.0, &config.enrollment_id).unwrap();
+        let lock = Lock::acquire(&dir.0).unwrap();
+        requests::RequestJournal::initialize(
+            &dir.0,
+            &config.enrollment_id,
+            requests::CounterSeeds {
+                helper: 5,
+                observation: 7,
+            },
+            &lock,
+        )
+        .unwrap();
+        std::fs::write(dir.0.join("requests.pending"), b"pending").unwrap();
+        drop(lock);
+        let network = FakeNetwork {
+            offline: false,
+            calls: RefCell::new(vec![]),
+        };
+        sync(&config, &FailedCollector, &network, 100000).unwrap();
+        assert_eq!(network.calls.borrow().len(), 1);
+        assert_eq!(
+            network.calls.borrow()[0]["body"]["collection_state"],
+            "error"
+        );
+        assert_eq!(
+            Store::load(&dir.0, &config.enrollment_id)
+                .unwrap()
+                .schedule
+                .sequence,
+            0
+        );
+        assert_eq!(
+            std::fs::read(dir.0.join("requests.pending")).unwrap(),
+            b"pending"
+        );
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sync_allows_daily_collection_for_never_started_requests() {
+        use requests::{
+            Canonical, CanonicalRequest, CanonicalStatus, Capability, Clock, CollectionDelivery,
+            CounterSeeds, Delivery, Negotiated, RequestJournal,
+        };
+        for terminal in [false, true] {
+            let dir = state::tests::TestDir::new();
+            let mut config = config(&dir.0);
+            config.enrollment_id = "00000000-0000-4000-8000-000000000001".into();
+            Store::initialize(&dir.0, &config.enrollment_id).unwrap();
+            let lock = Lock::acquire(&dir.0).unwrap();
+            RequestJournal::initialize(
+                &dir.0,
+                &config.enrollment_id,
+                CounterSeeds {
+                    helper: 5,
+                    observation: 7,
+                },
+                &lock,
+            )
+            .unwrap();
+            let mut journal = RequestJournal::open(&dir.0, &config.enrollment_id, &lock).unwrap();
+            let request_id = "00000000-0000-4000-8000-000000000002";
+            let session =
+                Negotiated::new(&[Capability::Collection], &[Capability::Collection], true)
+                    .unwrap();
+            journal
+                .admit(
+                    Delivery::Collection(CollectionDelivery {
+                        request_id: request_id.into(),
+                        delivery_sequence: 1,
+                        not_before: "2026-01-01T00:00:00.000Z".into(),
+                        source_revision: 1,
+                    }),
+                    1,
+                    &Clock {
+                        boot_id: config.enrollment_id.clone(),
+                        boottime_ms: 1000,
+                        unix_ms: 1_767_225_600_000,
+                    },
+                    "aaaaaaaaaaaaaaaa",
+                    &session,
+                )
+                .unwrap();
+            if terminal {
+                let status = journal.pending(Capability::Collection).unwrap().unwrap();
+                journal
+                    .canonical(
+                        Capability::Collection,
+                        &Canonical {
+                            schema_version: 1,
+                            request: CanonicalRequest {
+                                request_id: request_id.into(),
+                                delivery_sequence: 1,
+                                status: CanonicalStatus::Failed,
+                                reason: None,
+                                report_id: None,
+                                report_sha256: None,
+                                operation_nonce: status.operation_nonce,
+                            },
+                            receipt: None,
+                        },
+                    )
+                    .unwrap();
+            }
+            let before = std::fs::read(dir.0.join("requests.json")).unwrap();
+            drop(journal);
+            drop(lock);
+            let network = FakeNetwork {
+                offline: false,
+                calls: RefCell::new(vec![]),
+            };
+            assert!(sync(&config, &FailedCollector, &network, 100000).is_err());
+            assert_eq!(
+                Store::load(&dir.0, &config.enrollment_id)
+                    .unwrap()
+                    .schedule
+                    .sequence,
+                1
+            );
+            assert_eq!(std::fs::read(dir.0.join("requests.json")).unwrap(), before);
+        }
+    }
+    #[test]
+    fn fenced_collection_still_attempts_retained_upload() {
+        let (temp, mut store) = store();
+        store.reserve().unwrap();
+        store.replace(&json!({"enrollment_id":"epoch","sequence":1,"report_id":"old","source_revision":1,"collected_at":"2026-01-01T00:00:00Z"}), 100).unwrap();
+        let network = FakeNetwork {
+            offline: false,
+            calls: RefCell::new(vec![]),
+        };
+        let _ = pass(
+            &config(&temp.0),
+            &mut store,
+            &FailedCollector,
+            &network,
+            100000,
+            true,
+        );
+        let calls = network.calls.borrow();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0]["body"]["collection_state"], "error");
+        assert!(calls[1]["path"].as_str().unwrap().ends_with("/reports"));
+        assert_eq!(store.schedule.sequence, 1);
+        assert_eq!(store.latest().unwrap().unwrap()["report_id"], "old");
+    }
+    #[test]
     fn failed_collection_is_visible_on_next_independent_checkin() {
         let (temp, mut store) = store();
         let network = FakeNetwork {
@@ -742,7 +1013,8 @@ mod tests {
                 &mut store,
                 &FailedCollector,
                 &network,
-                100
+                100,
+                false
             )
             .is_err()
         );
@@ -752,7 +1024,8 @@ mod tests {
                 &mut store,
                 &FailedCollector,
                 &network,
-                400
+                400,
+                false
             )
             .is_err()
         );
@@ -771,7 +1044,17 @@ mod tests {
             offline: true,
             calls: RefCell::new(vec![]),
         };
-        assert!(pass(&config(&temp.0), &mut store, &FakeTools, &network, 100000).is_err());
+        assert!(
+            pass(
+                &config(&temp.0),
+                &mut store,
+                &FakeTools,
+                &network,
+                100000,
+                false
+            )
+            .is_err()
+        );
         let latest = store.latest().unwrap().unwrap();
         assert_eq!(latest["sequence"], 1);
         assert_eq!(latest["source_revision"], 1);
@@ -788,7 +1071,17 @@ mod tests {
             offline: false,
             calls: RefCell::new(vec![]),
         };
-        assert!(pass(&config(&temp.0), &mut store, &FakeTools, &network, 200).is_ok());
+        assert!(
+            pass(
+                &config(&temp.0),
+                &mut store,
+                &FakeTools,
+                &network,
+                200,
+                false
+            )
+            .is_ok()
+        );
         assert_eq!(network.calls.borrow().len(), 1);
         assert_eq!(store.schedule.sequence, 1);
     }

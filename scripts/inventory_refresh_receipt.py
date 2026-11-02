@@ -62,4 +62,3 @@ def observation(value, receipt=False):
         if value['outcome']=='released':
             _require(released<=expires and value['installed_before_sha256']==value['installed_after_sha256'])
     return value
-

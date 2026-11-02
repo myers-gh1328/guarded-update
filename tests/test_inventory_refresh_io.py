@@ -52,6 +52,13 @@ class HelperIOTests(unittest.TestCase):
         path.chmod(0o600)
         return path
 
+    def test_snapshot_preserves_existing_nonce_result_and_binds_exact_file_metadata(self):
+        path=self.request(self.nonce.encode())
+        snapshot=self.reader.read_snapshot()
+        self.assertEqual(snapshot[:2],self.reader.read())
+        self.assertEqual(snapshot[2],p._stable(path.stat()))
+        path.unlink();self.assertIsNone(self.reader.read_snapshot())
+
     def test_nonce_parser_rejects_whitespace_aliases_unknown_fields_and_counter_overflow(self):
         invalid=[b'',b'a'*65,self.nonce.upper().encode(),(self.nonce+'\r\n').encode(),
                  (self.nonce+'\n\n').encode(),(' '+self.nonce).encode(),

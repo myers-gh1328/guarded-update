@@ -8,6 +8,9 @@ import unittest
 
 ROOT=Path(__file__).resolve().parents[1]
 class InventoryPackagingTests(unittest.TestCase):
+    def test_linux_reporter_example_inhibits_starts_during_root_maintenance(self):
+        unit=(ROOT/'examples/inventory/command-center-inventory.service').read_text()
+        self.assertIn('ConditionPathExists=!/var/lib/command-center-inventory-maintenance/maintenance.pending',unit)
     def test_linux_archives_have_separate_binary_and_inactive_linux_examples(self):
         for target in ['arm-unknown-linux-musleabihf','aarch64-unknown-linux-musl','x86_64-unknown-linux-musl']:
             with self.subTest(target=target), tempfile.TemporaryDirectory() as tmp:

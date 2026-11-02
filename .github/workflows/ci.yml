@@ -83,22 +83,34 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
       - name: Verify pure protocol and descriptor publication regressions
         run: python3 -B -m unittest discover -s tests -p 'test_inventory_refresh*.py' -v
+      - name: Build separate inactive inventory metadata helper archive
+        run: python3 -I -B -S scripts/package-inventory-helper.py "$RUNNER_TEMP/inventory-helper-source"
+      - name: Build isolated unprivileged Rust parent fixture
+        run: python3 -I -B -S tests/native_inventory_refresh_rust_build.py
       - name: Prove actual tmpfs, cgroup and separate-UID limits on disposable runner
         run: |
           sudo --preserve-env=GITHUB_ACTIONS python3 -B tests/native_inventory_refresh_storage.py > native-refresh-storage-proof.json
       - name: Verify real signed TLS repository acquisition through the fixed low-privilege worker
         run: |
-          sudo --preserve-env=GITHUB_ACTIONS python3 -B tests/native_inventory_refresh_apt.py > native-refresh-apt-proof.json
+          archive_commit="$(git --no-replace-objects rev-parse --verify 'HEAD^{commit}')"
+          sudo --preserve-env=GITHUB_ACTIONS python3 -B tests/native_inventory_refresh_apt.py "$RUNNER_TEMP/inventory-helper-source/helper-$archive_commit/command-center-inventory-metadata-helper.tar.gz" > native-refresh-apt-proof.json
       - name: Prove actual native package locks and exact observation release on disposable runner
         run: |
           sudo --preserve-env=GITHUB_ACTIONS python3 -B tests/native_inventory_refresh_observation.py > native-refresh-observation-proof.json
       - name: Verify actual read-only native observation sandbox
         run: |
           sudo /usr/bin/systemd-run --quiet --wait --collect --pipe --unit=command-center-inventory-readonly-proof --property=ProtectSystem=strict --property=RuntimeMaxSec=30 --property=Restart=no --setenv=GITHUB_ACTIONS=true --setenv=GUARDED_UPDATE_NATIVE_READONLY_PROOF=1 /usr/bin/python3 -B "$GITHUB_WORKSPACE/tests/native_inventory_refresh_observation.py" > native-refresh-readonly-observation-proof.json
-      - name: Build separate inactive inventory metadata helper archive
-        run: python3 -B scripts/package-inventory-helper.py "$RUNNER_TEMP/inventory-helper-source"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-rust-parent-fixture-build
+          path: ${{ runner.temp }}/inventory-rust-parent/manifest.json
+          if-no-files-found: error
+          retention-days: 90
       - uses: actions/upload-artifact@v4
         with:
           name: command-center-inventory-metadata-helper-source-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
@@ -127,6 +139,111 @@ jobs:
         with:
           name: native-inventory-refresh-storage-proof
           path: native-refresh-storage-proof.json
+          if-no-files-found: error
+
+  inventory-refresh-physical-sample:
+    name: Native reporter physical sample (experimental)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build separate inactive inventory metadata helper archive
+        run: python3 -I -B -S scripts/package-inventory-helper.py "$RUNNER_TEMP/inventory-helper-source"
+      - name: Build isolated unprivileged Rust parent fixture
+        run: python3 -I -B -S tests/native_inventory_refresh_rust_build.py
+      - name: Prepare disposable tmpfs and cgroup fixtures
+        run: sudo --preserve-env=GITHUB_ACTIONS python3 -B tests/native_inventory_refresh_storage.py > native-refresh-storage-proof.json
+      - name: Verify actual sampled reporter process profile
+        env:
+          GUARDED_UPDATE_NATIVE_BARRIER_PROOF: '1'
+        run: |
+          archive_commit="$(git --no-replace-objects rev-parse --verify 'HEAD^{commit}')"
+          sudo --preserve-env=GITHUB_ACTIONS,GUARDED_UPDATE_NATIVE_BARRIER_PROOF python3 -B tests/native_inventory_refresh_apt.py "$RUNNER_TEMP/inventory-helper-source/helper-$archive_commit/command-center-inventory-metadata-helper.tar.gz" > native-reporter-physical-sample-proof.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-reporter-physical-sample-proof
+          path: native-reporter-physical-sample-proof.json
+          if-no-files-found: error
+
+  inventory-held-fd-parent:
+    name: Synthetic held-FD ReporterParent admission
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Test held-FD supervisor contracts
+        run: python3 -B -m unittest discover -s tests -p 'test_inventory_refresh_native_exec_parent.py' -v
+      - name: Build inactive metadata helper archive
+        run: python3 -I -B -S scripts/package-inventory-helper.py "$RUNNER_TEMP/inventory-helper-source"
+      - name: Build isolated unprivileged Rust parent fixture
+        run: python3 -I -B -S tests/native_inventory_refresh_rust_build.py
+      - name: Verify held-FD ReporterParent admission
+        run: |
+          archive_commit="$(git --no-replace-objects rev-parse --verify 'HEAD^{commit}')"
+          sudo --preserve-env=GITHUB_ACTIONS python3 -B tests/native_inventory_exec_parent.py "$RUNNER_TEMP/inventory-helper-source/helper-$archive_commit/command-center-inventory-metadata-helper.tar.gz" > native-held-fd-parent-proof.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-held-fd-parent-proof
+          path: native-held-fd-parent-proof.json
+          if-no-files-found: error
+
+  inventory-cross-uid-cas:
+    name: Synthetic cross-UID journal admission (${{ matrix.mode }})
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [positive, epoch, floor, replay, lost]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Test cross-UID fixture gates
+        run: python3 -B -m unittest discover -s tests -p 'test_inventory_cross_uid*.py' -v
+      - name: Build separate inactive inventory metadata helper archive
+        run: python3 -I -B -S scripts/package-inventory-helper.py "$RUNNER_TEMP/inventory-helper-source"
+      - name: Build isolated unprivileged Rust parent fixture
+        run: python3 -I -B -S tests/native_inventory_refresh_rust_build.py
+      - name: Verify synthetic cross-UID journal admission
+        env:
+          GUARDED_UPDATE_CROSS_UID_MODE: ${{ matrix.mode }}
+        run: |
+          archive_commit="$(git --no-replace-objects rev-parse --verify 'HEAD^{commit}')"
+          sudo --preserve-env=GITHUB_ACTIONS,GUARDED_UPDATE_CROSS_UID_MODE python3 -B tests/native_inventory_cross_uid.py "$RUNNER_TEMP/inventory-helper-source/helper-$archive_commit/command-center-inventory-metadata-helper.tar.gz" > native-cross-uid-proof.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-cross-uid-proof-${{ matrix.mode }}
+          path: native-cross-uid-proof.json
+          if-no-files-found: error
+
+  inventory-public-marker:
+    name: Synthetic cross-UID maintenance marker
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Test public marker fixture gates
+        run: python3 -B -m unittest discover -s tests -p 'test_inventory_refresh_maintenance_public_native.py' -v
+      - name: Build separate inactive inventory metadata helper archive
+        run: python3 -I -B -S scripts/package-inventory-helper.py "$RUNNER_TEMP/inventory-helper-source"
+      - name: Verify public marker across identities
+        run: |
+          archive_commit="$(git --no-replace-objects rev-parse --verify 'HEAD^{commit}')"
+          sudo --preserve-env=GITHUB_ACTIONS python3 -B tests/native_inventory_maintenance_public.py "$RUNNER_TEMP/inventory-helper-source/helper-$archive_commit/command-center-inventory-metadata-helper.tar.gz" > native-public-marker-proof.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-public-marker-proof
+          path: native-public-marker-proof.json
           if-no-files-found: error
 
   windows-discovery:

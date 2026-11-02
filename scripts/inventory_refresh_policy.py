@@ -265,6 +265,47 @@ Acquire::https::Timeout "30";
 '''.replace('@POLICY@', _APT_ROOT)
 
 
+# Loaded through APT_CONFIG before any host main/parts. No acquisition operation
+# is exposed by the fixed reader; its only command is apt-cache policy.
+_READER_DIRECTORY = '_inventory-reader'
+_READER_CONFIG_TEMPLATE = """// Command Center inventory reader policy v1
+#clear APT;
+#clear Acquire;
+#clear DPkg;
+#clear Binary;
+#clear Dir;
+Dir "/";
+Dir::Etc "@READER@";
+Dir::Etc::parts "@READER@/empty.d";
+Dir::Etc::main "@READER@/empty-main.conf";
+Dir::Etc::sourcelist "@READER@/sources.sources";
+Dir::Etc::sourceparts "@READER@/empty.d";
+Dir::Etc::trusted "@READER@/empty-trusted.gpg";
+Dir::Etc::trustedparts "@READER@/empty.d";
+Dir::Etc::preferences "@READER@/preferences";
+Dir::Etc::preferencesparts "@READER@/empty.d";
+Dir::Etc::netrc "@READER@/empty-auth.conf";
+Dir::Etc::netrcparts "@READER@/empty.d";
+Dir::State "@ROOT@";
+Dir::State::lists "@ROOT@";
+Dir::State::status "/var/lib/dpkg/status";
+Dir::State::extended_states "/dev/null";
+Dir::Cache "/dev/null";
+Dir::Cache::archives "/dev/null";
+Dir::Cache::pkgcache "";
+Dir::Cache::srcpkgcache "";
+Dir::Log "/dev/null";
+Acquire::IndexTargets::deb::Packages::MetaKey "$(COMPONENT)/binary-$(ARCHITECTURE)/Packages";
+Acquire::IndexTargets::deb::Packages::flatMetaKey "Packages";
+Acquire::IndexTargets::deb::Packages::ShortDescription "Packages";
+Acquire::IndexTargets::deb::Packages::Description "$(RELEASE)/$(COMPONENT) $(ARCHITECTURE) Packages";
+Acquire::IndexTargets::deb::Packages::flatDescription "$(RELEASE) Packages";
+Acquire::IndexTargets::deb::Packages::Optional "false";
+Acquire::IndexTargets::deb::Packages::KeepCompressed "true";
+Acquire::Languages "none";
+"""
+
+
 @dataclass(frozen=True, repr=False)
 class TrustedAptPolicy:
     _files: tuple
@@ -272,6 +313,7 @@ class TrustedAptPolicy:
     _proxy: bytes
     _sections: tuple
     _template: bytes
+    _reader_template: bytes
 
     def __repr__(self):
         return '<TrustedAptPolicy schema=1 private-material-redacted>'
@@ -400,15 +442,16 @@ def parse_policy(raw):
     files = [('sources.sources', source_bytes), ('preferences', pin_bytes), ('auth.conf', auth_bytes),
              ('proxy.conf', proxy_bytes), ('empty-main.conf', b''), ('empty-trusted.gpg', b''), ('empty-status', b'')] + sorted(trust_files)
     template = _CONFIG_TEMPLATE.replace('@STAGING@', CACHE_ROOT+'/staging-@TOKEN@').encode()
-    schema = _frame((('version', b'1'), ('apt_config_path', APT_CONFIG_PATH.encode()),
+    schema = _frame((('version', b'2'), ('apt_config_path', APT_CONFIG_PATH.encode()),
                      ('policy_root', POLICY_ROOT.encode()), ('cache_root', CACHE_ROOT.encode()),
                      ('runtime_root', RUNTIME_ROOT.encode()), ('state_root', STATE_ROOT.encode()),
-                     ('refresh_account', REFRESH_ACCOUNT.encode()), ('config_template', template)))
+                     ('refresh_account', REFRESH_ACCOUNT.encode()), ('config_template', template),
+                     ('reader_template', _READER_CONFIG_TEMPLATE.encode()),('reader_directory',_READER_DIRECTORY.encode())))
     sections = (('schema', schema), ('sources', source_bytes),
                 ('trust', _frame(sorted(trust_files))), ('pins', pin_bytes),
                 ('architectures', arch_config), ('proxy', proxy_bytes), ('auth', auth_bytes))
     _require(all(len(data) <= MAX_TRUST for _, data in sections) and sum(len(data) for _, data in sections) <= MAX_POLICY)
-    return TrustedAptPolicy(tuple(files), arch_config, proxy_bytes, sections, template)
+    return TrustedAptPolicy(tuple(files), arch_config, proxy_bytes, sections, template, _READER_CONFIG_TEMPLATE.encode())
 
 
 def render_policy(policy, staging_token):
@@ -423,3 +466,18 @@ def policy_generation(key, policy):
         return policy_commitment(key, dict(policy._sections))
     except ValueError:
         raise PolicyError() from None
+
+
+def render_reader_policy(policy,generation,commitment):
+    """Noncredential immutable projection; root PolicyGuard supplies commitment."""
+    from inventory_refresh_storage import ReaderProjection,READER_DIRECTORY
+    _require(type(policy) is TrustedAptPolicy and type(generation) is str and
+             re.fullmatch('[0-9a-f]{32}',generation) is not None and type(commitment) is str and
+             re.fullmatch('[0-9a-f]{64}',commitment) is not None)
+    _require(READER_DIRECTORY==_READER_DIRECTORY)
+    root=CACHE_ROOT+'/generation-'+generation;reader=root+'/'+_READER_DIRECTORY
+    config=policy._reader_template.replace(b'@ROOT@',root.encode()).replace(b'@READER@',reader.encode())+policy._architectures
+    selected=dict(policy._files)
+    return ReaderProjection._from_policy(generation,commitment,(
+        ('apt.conf',config),('sources.sources',selected['sources.sources']),('preferences',selected['preferences']),
+        ('empty-main.conf',b''),('empty-trusted.gpg',b''),('empty-auth.conf',b'')))

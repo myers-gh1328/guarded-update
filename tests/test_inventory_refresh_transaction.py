@@ -86,8 +86,8 @@ class RefreshTransactionTests(unittest.TestCase):
 
     def test_visible_cache_pointer_without_durable_success_is_not_rolled_back_or_confirmed(self):
         original=self.store.publish
-        def uncertain(*args):
-            original(*args)
+        def uncertain(*args,**kwargs):
+            original(*args,**kwargs)
             raise OSError('synthetic post-promotion uncertainty')
         self.store.publish=uncertain
         with self.assertRaises(ValueError) as error:self.transaction.refresh(self.nonce)

@@ -93,5 +93,59 @@ class DispatchTests(unittest.TestCase):
         self.request('observation',f.nonce);self.request('refresh','0000000000000002'+'a'*16)
         self.assertEqual(self.dispatch.step()['observation'],'existing');self.refresh.refresh.assert_called_once()
 
+    def test_drain_latches_and_never_admits_new_inboxes(self):
+        f=self.fixture;self.request('observation',f.nonce);self.request('refresh','0000000000000002'+'a'*16)
+        self.assertEqual(self.dispatch.drain()['state'],'drained')
+        self.assertEqual(self.dispatch.step()['state'],'drained')
+        f.service.launch.assert_not_called();self.refresh.refresh.assert_not_called()
+
+    def test_drain_allows_only_owned_release_then_finishes_without_refresh(self):
+        f=self.fixture;self.request('observation',f.nonce)
+        self.assertEqual(self.dispatch.step()['observation'],'dispatched')
+        lease=f.opened();self.request('refresh','0000000000000002'+'a'*16)
+        self.request('release','0000000000000009'+'a'*16)
+        self.assertEqual(self.dispatch.drain()['state'],'draining')
+        self.assertIsNone(f.transaction._grant);self.refresh.refresh.assert_not_called()
+        self.request('release',f.nonce)
+        self.assertEqual(self.dispatch.drain()['release'],'releasing')
+        f.released(lease)
+        self.assertEqual(self.dispatch.step()['state'],'drained')
+        self.refresh.refresh.assert_not_called()
+
+    def test_drain_never_reports_drained_for_malformed_inbox_or_active_journal(self):
+        f=self.fixture;self.request('refresh','bad')
+        self.assertEqual(self.dispatch.drain()['state'],'draining')
+        self.assertFalse(f.journal.snapshot()['unconfirmed'])
+        (f.root/'inboxes/refresh/request').unlink()
+        f.journal.receive('refresh','0000000000000002'+'a'*16,f.boot,200,f.policy.generation)
+        self.assertEqual(self.dispatch.drain()['state'],'draining')
+        self.refresh.refresh.assert_not_called();f.service.launch.assert_not_called()
+
+    def test_drain_fences_unavailable_input_and_never_resumes(self):
+        self.inboxes['release'].read=Mock(side_effect=IOErrorState('cleanup_unconfirmed'))
+        with self.assertRaises(ValueError):self.dispatch.drain()
+        self.assertTrue(self.fixture.journal.snapshot()['unconfirmed'])
+        self.inboxes['release'].read.reset_mock()
+        self.assertEqual(self.dispatch.step()['state'],'closed')
+        self.inboxes['release'].read.assert_not_called();self.refresh.refresh.assert_not_called()
+
+    def test_idle_drain_never_reports_drained_with_stale_policy(self):
+        self.fixture.policy.recheck=Mock(side_effect=ValueError('stale'))
+        with self.assertRaises(ValueError):self.dispatch.drain()
+        self.assertTrue(self.fixture.journal.snapshot()['unconfirmed'])
+        self.refresh.refresh.assert_not_called();self.fixture.service.launch.assert_not_called()
+
+    def test_drain_rechecks_policy_after_inbox_reads(self):
+        original=self.fixture.policy.recheck;calls=[]
+        def changed():
+            calls.append(1)
+            if len(calls)>1:raise ValueError('changed')
+            return original()
+        self.fixture.policy.recheck=Mock(side_effect=changed)
+        with self.assertRaises(ValueError):self.dispatch.drain()
+        self.assertGreaterEqual(len(calls),2)
+        self.assertTrue(self.fixture.journal.snapshot()['unconfirmed'])
+        self.refresh.refresh.assert_not_called();self.fixture.service.launch.assert_not_called()
+
 
 if __name__=='__main__':unittest.main()

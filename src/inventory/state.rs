@@ -280,6 +280,8 @@ fn nofollow(options: &mut OpenOptions) {
 }
 pub struct Lock {
     _file: File,
+    directory: PathBuf,
+    poisoned: std::sync::atomic::AtomicBool,
 }
 impl Drop for Lock {
     fn drop(&mut self) {
@@ -291,6 +293,13 @@ impl Drop for Lock {
 }
 impl Lock {
     pub fn acquire(dir: &Path) -> Result<Self, String> {
+        Self::acquire_with(dir, |_| {}, |_, _| {})
+    }
+    fn acquire_with(
+        dir: &Path,
+        after_open: impl FnOnce(&Path),
+        after_lock: impl FnOnce(&Path, &File),
+    ) -> Result<Self, String> {
         protected(dir, true)?;
         let path = dir.join("running.lock");
         let mut options = OpenOptions::new();
@@ -304,10 +313,76 @@ impl Lock {
         let file = options
             .open(&path)
             .map_err(|_| "Inventory lock unavailable")?;
+        after_open(&path);
         protected(&path, false)?;
+        Self::check_identity(&file, &path)?;
         file.try_lock()
             .map_err(|_| "Inventory agent already running")?;
-        Ok(Self { _file: file })
+        // Construct the guard before the second check so failure explicitly
+        // unlocks even if another descriptor inherited this open description.
+        let guard = Self {
+            _file: file,
+            directory: dir.to_owned(),
+            poisoned: std::sync::atomic::AtomicBool::new(false),
+        };
+        after_lock(&path, &guard._file);
+        protected(&path, false)?;
+        Self::check_identity(&guard._file, &path)?;
+        Ok(guard)
+    }
+    /// Sample the original held/named lock identity; not a kernel lock witness.
+    pub(super) fn verify_for(&self, dir: &Path) -> Result<(), String> {
+        use std::sync::atomic::Ordering;
+        if self.poisoned.load(Ordering::SeqCst) {
+            return Err("Inventory lock state uncertain".into());
+        }
+        let valid = dir == self.directory
+            && protected(dir, true).is_ok()
+            && protected(&self.directory.join("running.lock"), false).is_ok()
+            && Self::check_identity(&self._file, &self.directory.join("running.lock")).is_ok();
+        if !valid {
+            self.poisoned.store(true, Ordering::SeqCst);
+            return Err("Inventory lock state uncertain".into());
+        }
+        if self.poisoned.load(Ordering::SeqCst) {
+            return Err("Inventory lock state uncertain".into());
+        }
+        Ok(())
+    }
+    fn check_identity(file: &File, path: &Path) -> Result<(), String> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            unsafe extern "C" {
+                fn geteuid() -> u32;
+            }
+            let held = file.metadata().map_err(|_| "Inventory lock unavailable")?;
+            let named = fs::symlink_metadata(path).map_err(|_| "Inventory lock unavailable")?;
+            let identity = |value: &fs::Metadata| {
+                (
+                    value.dev(),
+                    value.ino(),
+                    value.uid(),
+                    value.mode(),
+                    value.nlink(),
+                )
+            };
+            // SAFETY: geteuid reads the current process identity and takes no arguments.
+            let uid = unsafe { geteuid() };
+            if !held.is_file()
+                || !named.is_file()
+                || named.file_type().is_symlink()
+                || held.uid() != uid
+                || held.mode() & 0o077 != 0
+                || held.nlink() != 1
+                || identity(&held) != identity(&named)
+            {
+                return Err("Inventory lock changed during admission".into());
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = (file, path);
+        Ok(())
     }
 }
 
@@ -413,6 +488,80 @@ pub(super) mod tests {
         assert_eq!(fs::read_dir(&temp.0).unwrap().count(), 2);
         assert!(Store::initialize(&temp.0, "epoch").is_err());
         assert!(Store::load(&temp.0, "other-epoch").is_err());
+    }
+    #[test]
+    #[cfg(unix)]
+    fn lock_rejects_replacement_between_open_and_named_admission() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = TestDir::new();
+        let result = Lock::acquire_with(
+            &temp.0,
+            |path| {
+                fs::rename(path, temp.0.join("old.lock")).unwrap();
+                fs::write(path, b"").unwrap();
+                fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+            },
+            |_, _| {},
+        );
+        assert!(result.is_err());
+        // The rejected old inode must not retain the advisory lock.
+        let old = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(temp.0.join("old.lock"))
+            .unwrap();
+        assert!(old.try_lock().is_ok());
+        assert!(Lock::acquire(&temp.0).is_ok());
+    }
+    #[test]
+    #[cfg(unix)]
+    fn lock_rejects_replacement_after_flock_and_unlocks_inherited_description() {
+        use std::cell::RefCell;
+        use std::os::unix::fs::PermissionsExt;
+        let temp = TestDir::new();
+        let inherited = RefCell::new(None);
+        let result = Lock::acquire_with(
+            &temp.0,
+            |_| {},
+            |path, file| {
+                *inherited.borrow_mut() = Some(file.try_clone().unwrap());
+                fs::rename(path, temp.0.join("old.lock")).unwrap();
+                fs::write(path, b"").unwrap();
+                fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+            },
+        );
+        assert!(result.is_err());
+        let old = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(temp.0.join("old.lock"))
+            .unwrap();
+        assert!(old.try_lock().is_ok());
+        assert!(Lock::acquire(&temp.0).is_ok());
+        drop(inherited);
+    }
+    #[test]
+    #[cfg(unix)]
+    fn lock_rejects_hardlinked_lock_file() {
+        let temp = TestDir::new();
+        drop(Lock::acquire(&temp.0).unwrap());
+        fs::hard_link(temp.0.join("running.lock"), temp.0.join("alias.lock")).unwrap();
+        assert!(Lock::acquire(&temp.0).is_err());
+    }
+    #[test]
+    #[cfg(unix)]
+    fn lock_replacement_poison_is_absorbing_even_if_original_is_restored() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = TestDir::new();
+        let lock = Lock::acquire(&temp.0).unwrap();
+        let path = temp.0.join("running.lock");
+        fs::rename(&path, temp.0.join("old.lock")).unwrap();
+        fs::write(&path, b"").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(lock.verify_for(&temp.0).is_err());
+        fs::remove_file(&path).unwrap();
+        fs::rename(temp.0.join("old.lock"), &path).unwrap();
+        assert!(lock.verify_for(&temp.0).is_err());
     }
     #[test]
     fn advisory_lock_releases_without_removing_lock_file() {

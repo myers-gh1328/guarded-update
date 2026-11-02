@@ -75,6 +75,85 @@ def _identity(info):
     return info.st_dev, info.st_ino
 
 
+def installed_fingerprint(directory,owner,deadline_ms,now):
+    """Bounded data hash only; no lock ownership, freshness or attestation.
+
+    Borrowed directory remains caller-owned. Eligibility additionally requires
+    the actual root observation/lease/clock and matching final root receipt.
+    """
+    _deadline(deadline_ms, now)
+    before = _directory(directory, owner)
+    digest = hashlib.sha256(b'command-center-native-dpkg-state-v1\x00')
+    remaining = [MAX_STATE_BYTES]
+    try:
+        _fingerprint_file(directory, 'status', 'status', digest, remaining, deadline_ms, now, owner)
+        try:
+            os.stat('arch', dir_fd=directory, follow_symlinks=False)
+        except FileNotFoundError:
+            _frame(digest, b'arch')
+            _frame(digest, b'absent')
+        else:
+            _fingerprint_file(directory, 'arch', 'arch', digest, remaining, deadline_ms, now, owner)
+        updates = os.open('updates', os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW|os.O_NONBLOCK, dir_fd=directory)
+        try:
+            updates_before = _directory(updates, owner)
+            entries = []
+            with os.scandir(updates) as iterator:
+                for entry in iterator:
+                    _deadline(deadline_ms, now)
+                    if len(entries) >= MAX_STATE_FILES:
+                        raise ObservationError('resource_limit')
+                    if re.fullmatch('[0-9]{4}', entry.name) is None:
+                        raise ObservationError('state_inconsistent')
+                    entries.append(entry.name)
+            entries.sort()
+            _frame(digest, b'updates')
+            _frame(digest, b'directory')
+            _frame(digest, len(entries).to_bytes(8, 'big'))
+            for name in entries:
+                _deadline(deadline_ms, now)
+                _fingerprint_file(updates, name, 'updates/'+name, digest, remaining, deadline_ms, now, owner)
+            if (_stable(updates_before)!=_stable(os.fstat(updates)) or
+                    _identity(os.stat('updates',dir_fd=directory,follow_symlinks=False))!=_identity(updates_before)):
+                raise ObservationError('state_inconsistent')
+        finally:
+            os.close(updates)
+        if _stable(before)!=_stable(os.fstat(directory)):
+            raise ObservationError('state_inconsistent')
+        _deadline(deadline_ms, now)
+        return digest.hexdigest()
+    except OSError:
+        raise ObservationError('state_inconsistent') from None
+
+def _fingerprint_file(directory,name,relative,digest,remaining,deadline,now,owner):
+    _deadline(deadline, now)
+    fd=os.open(name,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK,dir_fd=directory)
+    try:
+        before=_file(fd,owner)
+        if before.st_size>remaining[0]:
+            raise ObservationError('resource_limit')
+        _frame(digest,relative.encode('ascii'))
+        _frame(digest,b'regular')
+        digest.update(before.st_size.to_bytes(8,'big'))
+        count=0
+        while True:
+            _deadline(deadline, now)
+            chunk=os.read(fd,min(65536,remaining[0]+1))
+            if not chunk:
+                break
+            remaining[0]-=len(chunk)
+            if remaining[0]<0:
+                raise ObservationError('resource_limit')
+            count+=len(chunk)
+            digest.update(chunk)
+        if (count!=before.st_size or _stable(before)!=_stable(os.fstat(fd)) or
+                _identity(before)!=_identity(os.stat(name,dir_fd=directory,follow_symlinks=False))):
+            raise ObservationError('state_inconsistent')
+    finally:
+        os.close(fd)
+
+
+
 class NativeReadLocks:
     """Own actual POSIX dpkg locks and the real executor's flock guard.
 
@@ -158,80 +237,10 @@ class NativeReadLocks:
             raise
 
     def fingerprint(self, deadline_ms, now):
-        """Hash only fixed installed-state entries under already-held read locks."""
-        _deadline(deadline_ms, now)
-        self.verify()
-        directory = self._directories[0]
-        before = _directory(directory, self.owner)
-        digest = hashlib.sha256(b'command-center-native-dpkg-state-v1\x00')
-        remaining = [MAX_STATE_BYTES]
-        try:
-            self._fingerprint_file(directory, 'status', 'status', digest, remaining, deadline_ms, now)
-            try:
-                os.stat('arch', dir_fd=directory, follow_symlinks=False)
-            except FileNotFoundError:
-                _frame(digest, b'arch')
-                _frame(digest, b'absent')
-            else:
-                self._fingerprint_file(directory, 'arch', 'arch', digest, remaining, deadline_ms, now)
-            updates = os.open('updates', os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW|os.O_NONBLOCK, dir_fd=directory)
-            try:
-                updates_before = _directory(updates, self.owner)
-                entries = []
-                with os.scandir(updates) as iterator:
-                    for entry in iterator:
-                        _deadline(deadline_ms, now)
-                        if len(entries) >= MAX_STATE_FILES:
-                            raise ObservationError('resource_limit')
-                        if re.fullmatch('[0-9]{4}', entry.name) is None:
-                            raise ObservationError('state_inconsistent')
-                        entries.append(entry.name)
-                entries.sort()
-                _frame(digest, b'updates')
-                _frame(digest, b'directory')
-                _frame(digest, len(entries).to_bytes(8, 'big'))
-                for name in entries:
-                    _deadline(deadline_ms, now)
-                    self._fingerprint_file(updates, name, 'updates/'+name, digest, remaining, deadline_ms, now)
-                if (_stable(updates_before)!=_stable(os.fstat(updates)) or
-                        _identity(os.stat('updates',dir_fd=directory,follow_symlinks=False))!=_identity(updates_before)):
-                    raise ObservationError('state_inconsistent')
-            finally:
-                os.close(updates)
-            if _stable(before)!=_stable(os.fstat(directory)):
-                raise ObservationError('state_inconsistent')
-            self.verify()
-            _deadline(deadline_ms, now)
-            return digest.hexdigest()
-        except OSError:
-            raise ObservationError('state_inconsistent') from None
-
-    def _fingerprint_file(self, directory, name, relative, digest, remaining, deadline, now):
-        _deadline(deadline, now)
-        fd=os.open(name,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK,dir_fd=directory)
-        try:
-            before=_file(fd,self.owner)
-            if before.st_size>remaining[0]:
-                raise ObservationError('resource_limit')
-            _frame(digest,relative.encode('ascii'))
-            _frame(digest,b'regular')
-            digest.update(before.st_size.to_bytes(8,'big'))
-            count=0
-            while True:
-                _deadline(deadline, now)
-                chunk=os.read(fd,min(65536,remaining[0]+1))
-                if not chunk:
-                    break
-                remaining[0]-=len(chunk)
-                if remaining[0]<0:
-                    raise ObservationError('resource_limit')
-                count+=len(chunk)
-                digest.update(chunk)
-            if (count!=before.st_size or _stable(before)!=_stable(os.fstat(fd)) or
-                    _identity(before)!=_identity(os.stat(name,dir_fd=directory,follow_symlinks=False))):
-                raise ObservationError('state_inconsistent')
-        finally:
-            os.close(fd)
+        """Actual owned guard verification surrounds the shared data-only hash."""
+        _deadline(deadline_ms,now);self.verify()
+        digest=installed_fingerprint(self._directories[0],self.owner,deadline_ms,now)
+        self.verify();_deadline(deadline_ms,now);return digest
 
     def verify(self):
         try:

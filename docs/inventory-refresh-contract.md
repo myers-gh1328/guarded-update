@@ -1063,18 +1063,33 @@ or complete provisioning/startup-allocation/target-fit readiness claim.
 
 ### Inactive helper source artifact
 
-`scripts/package-inventory-helper.py OUTPUT_PARENT` builds a separate helper
-archive without installing or enabling anything. It pins one full Git commit,
-reads every regular source/doc/builder blob by that commit, rejects relevant dirty
-files, and derives the exact known root module closure from a strict literal AST
-without executing project code. Unrelated worktree changes are excluded.
+`python3 -I -B -S scripts/package-inventory-helper.py OUTPUT_PARENT` builds a separate helper
+archive without installing or enabling anything. CLI isolation is checked before
+non-built-in imports, so local files cannot shadow its standard library. It pins
+one full Git commit with replacement objects disabled for every Git read, admits
+every regular source/doc/builder/generator/template blob by that commit and
+directly compares bounded nofollow worktree bytes with those blobs before and
+after generation. Index hints cannot hide relevant dirt; unrelated worktree
+changes are excluded.
 
-The archive contains fixed relative readonly regular files: root modules, the
-coordinator, worker, identical native/guardian observation entry copies and this
-public contract. It contains no account, service, policy, key, runtime state or
+Strict AST checks select the 28-module Root mapping and fixed 18-module
+reporter mapping. Only the selected trusted build-time generator is executed;
+it parses/extracts/compiles runtime source without running that runtime code.
+This is a trusted build boundary, not an arbitrary-Python sandbox. A private
+execution namespace alone does not establish isolation.
+
+The archive contains fixed relative readonly regular files: the union of Root
+and reporter modules, coordinator, worker, identical native/guardian observation
+entry copies, generated `reporter.py` and this public contract. Build-only
+generator/template inputs are hashed rather than installed as runtime choices.
+It contains no account, service, policy, key, runtime state or
 installation hook. Sorted USTAR metadata and gzip filename/mtime are fixed;
 `manifest.json` records source commit, builder digest, file hashes/sizes/modes and
-literal install destinations. The Python 3.10 language floor is not proof of
+literal install destinations. Its `reporter_bootstrap` recipe independently binds
+loader source, template, generator, fixed closure and generated-entry hashes;
+the generated source's closure is checked separately from those hash claims.
+Root and reporter source sums each stay within512KiB, generated entry64KiB and
+all archive source data2MiB. The Python 3.10 language floor is not proof of
 systemd, kernel, python-apt, architecture or real-device repository compatibility.
 
 Archive and SHA sidecar are fully staged before exclusive generation publication.
@@ -1091,3 +1106,179 @@ disabled provisioning workflow. Initial namespaces/unit provenance, reserved
 identities, complete startup resource charging, real repository/headroom fit,
 client/helper integration, enrollment/pilot and explicit source handoff remain
 activation gates. Building this archive does not satisfy them.
+
+### Generation-bound noncredential reader policy
+
+A refreshed index alone is insufficient for trustworthy candidate comparison.
+The reader must also use the admitted architectures, source definitions and pins,
+rather than host APT defaults. The root policy guard renders an immutable
+noncredential projection for exactly one chosen cache generation and opaque policy
+commitment. Storage rejects cross-generation/policy substitution before sealing.
+Worker-created `_inventory-reader` entries are rejected; only root adds the fixed
+readonly reader files/empty directory, counted inside existing byte/inode limits
+and hashed into the completed generation before pointer publication.
+
+The fixed reader APT_CONFIG redirects both config parts and main before normal
+loading, clears binary overrides, selects that generation's lists/source/pins and
+actual native installed status, and disables binary cache/log writes. Source and
+pin definitions are reporting operational metadata; auth, proxies, commitment key
+and private credentials are omitted. No update/install command is added.
+
+The internal framed policy-commitment schema now includes the static reader
+template and reserved namespace (schema 2). Expanded random generation paths are
+not part of policy identity. Template/namespace changes therefore invalidate prior
+policy generations; old cache evidence cannot silently adopt new semantics. Public
+status and private journal schemas remain unchanged. Projectionless legacy/test
+generations are unsupported by the new reader, with Unknown candidate reliability.
+
+Pure/descriptor tests cover exact bytes, credential exclusion, immutable bindings,
+worker collision and resource bounds. Native candidate/pin and config-loading
+behavior must pass under the restricted reader identity before any freshness claim.
+The executable reporting client remains disconnected from this projection until
+its native scan/receipt and durable lifecycle integration passes.
+
+### Shared installed-state data fingerprint
+
+`installed_fingerprint` exposes the unchanged bounded v1 dpkg status/arch/updates
+hash for a borrowed admitted directory. It acquires no package/executor lock,
+changes no mutex and never closes the borrowed directory. A standalone hash can be
+computed without owning native locks; it is neither attestation nor coherence or
+freshness authority. The root `NativeReadLocks` wrapper still verifies its actual
+held descriptors before and after hashing and rechecks its deadline after final
+verification. Existing native lock ownership and exact digest framing remain
+unchanged.
+
+A future unprivileged collector must bracket the entire scan and both hashes with
+native boot-relative time, pin the exact generation, and require both hashes to
+match both final root receipt hashes with the entire interval inside confirmed
+lock coverage. No receipt, mismatch or uncertainty can become fresh evidence.
+This data seam alone does not enable a reporting capability.
+
+The native restricted-reader proof now admits the actual fixed shared hash module
+from root-owned stable source descriptors without a project search path. It
+brackets both fingerprint computations and the isolated candidate query with the
+same kernel boot/BOOTTIME clock, retains its own generation lease, and returns
+only a bounded internal hash/timing envelope. The parent requires exact context,
+all four reporter/root hashes equal, and the entire interval within the final
+root-held endpoint before recording success. This is a native proof prerequisite
+for the still-disconnected production collector/adapter, not device activation.
+
+### Inactive reporter reader-session library
+
+`ReaderSession` pins and verifies the exact current generation, including all six
+manifest-bound reader files and the same-filesystem, read-only empty config-parts
+directory, **before** the caller requests a root observation. After an exact opened
+lease is admitted, a one-use callback must durably record the actual scan start
+before the first installed-state read. Both bounded data fingerprints bracket all
+collector reads. Evidence is returned only after an exact released root receipt
+matches the frozen context, all four hashes and the entire scan interval, and the
+session has successfully closed its own generation pin. Receipt release cannot
+be in the future relative to the current same-boot clock.
+
+Invalid state, clock rewind/change, expiry, callback failure, changed data, missing
+receipt or close failure consumes the session. None authorizes replay, reports
+refresh success, or proves clean failure of possibly submitted root work. Cache
+and dpkg directory descriptors remain borrowed; the session never accesses package
+lock files, submits inbox requests, executes commands or publishes reports.
+
+This library is not an executable adapter or part of the installed root source
+closure. A fixed adapter must still authenticate root status/ancestry and the
+native clock, persist observation intent, supervise the reader and use the existing
+Rust collector inside the admitted interval. Request capabilities remain disabled
+until that adapter and durable publication/recovery integration are verified.
+
+The request journal also has a two-phase native collection admission seam. It
+atomically persists `submitted=true`, `Running`, `scan=null` and a reserved root
+observation nonce before returning a private, non-cloneable intent. Report ID,
+sequence, source, request, boot and negotiation identity are frozen in that
+same-run intent. Only consuming that intent on the original journal epoch can
+persist the actual later scan start; the fixed adapter must first admit the
+opened root lease. Every mutation/recovery attempt revokes outstanding intents,
+and reopening an identical journal cannot recover them. A dropped intent or a
+crash leaves submitted work unresolved, never permission to resubmit. Failed
+persistence returns no authority and poisons the journal handle.
+
+The private **client** request journal now uses schema 2. Native admission also
+persists the immutable observation nonce, boot ID and admission BOOTTIME in a
+required nullable `native_attempt` field; ordinary/manual entries use explicit
+null. The observation nonce and submission fence commit together. This exact
+scope survives restart and canonical source failure for future cleanup-only
+correlation, while reopening still cannot recreate an execution token or resume
+a scan. Root observation sequence prefixes are unique across retained native
+and manual observations and cannot exceed the reserved observation high-water.
+
+Schema 1 is rejected without migration, reset or counter reseeding. Explicit
+provisioning remains gated on trusted counter handoff; no client journals or
+capabilities are activated by this change. Root journal schema 3, public helper
+status schema 1 and reporting schemas are unchanged. The mapping alone cannot
+submit release, prove NoWork, clear physical uncertainty or supply coherent or
+report-ready evidence. A separate durable release intent and verified cleanup
+witness remain necessary.
+
+`StatusReader` supplies the inactive reporter's bounded protected-file input. It
+holds its own duplicate of an admitted status-directory descriptor and checks the
+root publication's exact owner, reader group, modes, single-link regular-file
+shape and same-filesystem identity. It keeps the opened file through strict JSON
+and schema parsing, then compares descriptor and named metadata. Concurrent root
+replacement or in-place modification rejects that read; a fresh poll can observe
+the new publication. Missing status returns no status after rechecking directory
+protection. Previous content is never substituted, and absence proves neither
+root termination nor clean native cleanup. Close failures prevent output.
+
+The borrowed-directory constructor does not establish full named ancestry or
+process provenance. Its fixed factory and source bootstrap remain deferred until
+the restricted managed bridge is implemented and natively verified. It writes
+no inbox, starts no process and changes no reporting capability or artifact.
+
+Protected atomic replacement has a narrowly typed `publication_changed` result:
+the old opened file retains its protected metadata/content shape (allowing only
+unlink's link-count/ctime changes), while the final named file is a different,
+independently protected root inode. No old status is returned. A bounded poll may
+read a new file without re-pinning or replaying any native request. Malformed
+bytes, unsafe metadata, in-place changes and cleanup errors remain fatal.
+
+The additional disposable Linux roundtrip uses the actual status/session
+libraries in one persistent restricted reader. Its pinned-context phase precedes
+root observation submission; scan completion precedes root release. The final
+phase follows receipt matching and every reader-owned close, with bounded phase
+output, EOF and successful exit required by the parent. Its eight-module source
+subset and admission callback are trusted test fixtures, not a production
+bootstrap or durable reporting-journal proof. Native pipeline execution is
+required before treating this roundtrip as verified; broader activation gates
+remain unchanged.
+
+The inactive reporter request writer reuses the fixed inbox descriptor checks.
+Its only payload is one canonical nonce, written to an exclusive owned temporary
+file, fsynced and atomically promoted to the literal `request` name. It rechecks
+the previous request's exact metadata/content, rejects equal or higher counters,
+verifies its own temporary identity before promotion, and checks the resulting
+published inode before returning. Visibility becomes uncertain before any rename
+attempt; failure never rolls back a possibly visible request. Cleanup removes
+only the exact temporary inode created by that call and attempts every owned
+close, preserving foreign replacements.
+
+These checks are point-in-time, not atomic compare-and-swap or Root acceptance.
+The caller must retain the existing process lock and durably validate its current
+intent before publishing. Neither publication success nor its error flags prove
+NoWork, cancellation, cleanup, replay permission or report readiness. No fixed
+factory, executable route or capability is enabled. The disposable native actor
+loads the actual writer from a nine-module admitted fixture closure for the
+observation/release roundtrip; synthetic authorization does not verify production
+Control ownership or durable client intent.
+
+Before observation publication, the request journal now consumes the admitted
+intent and rechecks its original epoch, current negotiation, native clock,
+protected disk snapshot, acknowledged active request and exact saved native
+mapping. The existing global journal mutex and process lock remain held through
+a bounded fixed callback that ends at fsynced nonce-publication acknowledgment.
+A second snapshot check rejects out-of-band changes after that callback. No
+journal operation, other handle, recovery, report/transport callback or Root
+lease/scan/receipt wait may reenter this critical section.
+
+Only a successful callback produces the distinct, non-cloneable published token
+bound to the new epoch. Scan attachment consumes that type and rechecks the exact
+mapping after the adapter admits the opened Root lease. Errors, possible visible
+writes, or callback panic yield no published token, retain durable submitted
+uncertainty, and grant no retry or scan-resumption permission. This gate remains
+an inactive library seam; fixed Control/bridge integration must supply the actual
+native clock, current negotiation and protected sender implementation.
