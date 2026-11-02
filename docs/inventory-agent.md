@@ -26,6 +26,10 @@ restarts, SSH, sudo or macOS system-update installation. Metadata refresh is
 explicitly `deferred/not_configured`; cached metadata may miss newer updates.
 Only an explicit installed-version match in Homebrew outdated data establishes
 an available update. Every other latest-version comparison remains unknown.
+Multiple installed Homebrew versions are retained together in one package row;
+the active version and latest-version comparison remain Unknown. Malformed or
+duplicate Homebrew installed-package evidence makes the scan partial instead
+of silently dropping rows or publishing duplicate identities.
 System Information failure preserves independently readable Homebrew inventory
 as partial. Manual/portable applications and other users' inaccessible apps
 remain coverage gaps. System updates, CVEs, service telemetry and logs are not
@@ -180,3 +184,29 @@ upload. That advertised exact-byte digest is already the final line of the
 unchanged signed canonical message; the server verifies the header signature
 first and the uploaded bytes afterward. Older clients without this header must
 not activate against the reporting API that requires it.
+
+## Staged request timing
+
+Request journals and native timing remain disconnected from runtime capability
+advertisement until lifecycle and native observation integration pass. No request
+capability is enabled by installing this source.
+
+macOS samples its boot-session UUID and
+[CLOCK_MONOTONIC_RAW](https://github.com/apple-oss-distributions/Libc/blob/main/include/_time.h)
+through the fixed native nanosecond API. Apple documents this as continuous timing
+including sleep. Linux uses the approved helper profile's system Python3 in
+isolated mode to sample the kernel boot ID and native CLOCK_BOOTTIME, avoiding
+32-bit libc time_t/time64 ABI assumptions in static ARM builds. The fixed probe
+has a five-second timeout and 256-byte output bound. Neither platform derives
+proof timing from wall-clock subtraction or logs actual clock/boot values.
+Linux-native clock execution must also pass hosted Linux CI before activation.
+
+The reporting transport admits only the fixed inventory check-in/report and
+manual/collection status paths. Controls are bounded at 64KiB, reports at 8MiB,
+and responses at 64KiB before interpretation. Exact response bytes and an
+unambiguous JSON content type are retained for strict request negotiation and
+canonical parsing; HTML and duplicate-field normalization cannot authorize
+legacy fallback. Existing signed package report bytes remain unchanged.
+
+See [the staged request client contract](inventory-requests.md) for journal,
+canonical acknowledgement and exact report publication invariants.

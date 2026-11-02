@@ -1,10 +1,17 @@
+// Disconnected request foundation; runtime integration is separately gated.
 #[cfg(any(target_os = "macos", test))]
 mod brew;
+#[cfg(test)]
+mod clock;
+#[cfg(test)]
+mod lifecycle;
 #[cfg(any(target_os = "linux", test))]
 mod linux;
 #[cfg(any(target_os = "macos", test))]
 mod macos;
 mod process;
+#[cfg(test)]
+mod requests;
 mod state;
 mod transport;
 use process::{SystemTools, Tools};
@@ -92,6 +99,8 @@ fn pass(
     };
     if let Some(response) = &response
         && (response.status != 200
+            || !response.json_content_type
+            || response.raw_body.len() > 65_536
             || response.body["schema_version"] != 1
             || response.body["reporting_enabled"] != true)
     {
@@ -188,6 +197,8 @@ fn pass(
     match result {
         Ok(response)
             if matches!(response.status, 200 | 201)
+                && response.json_content_type
+                && response.raw_body.len() <= 65_536
                 && state::matches_receipt(&report, &digest, &response.body) =>
         {
             store.schedule.acknowledged_sha256 = Some(digest);
@@ -459,6 +470,8 @@ mod tests {
                 status: 200,
                 body: json!({"schema_version":1,"reporting_enabled":true,"source_revision":1,"receipt":null}),
                 retry_after: 0,
+                raw_body: Vec::new(),
+                json_content_type: true,
             })
         }
     }
@@ -517,6 +530,8 @@ mod tests {
                 };
                 Ok(Response {
                     status: 200,
+                    raw_body: serde_json::to_vec(&body).unwrap(),
+                    json_content_type: true,
                     body,
                     retry_after: 0,
                 })
@@ -584,10 +599,13 @@ mod tests {
             fn post(&self, _: &Config, path: &str, _: &str, _: u64) -> Result<Response, String> {
                 assert!(path.ends_with("check-ins"));
                 *self.1.borrow_mut() += 1;
+                let body = json!({"schema_version":1,"reporting_enabled":true,"source_revision":1,"receipt":self.0});
                 Ok(Response {
                     status: 200,
                     retry_after: 0,
-                    body: json!({"schema_version":1,"reporting_enabled":true,"source_revision":1,"receipt":self.0}),
+                    raw_body: serde_json::to_vec(&body).unwrap(),
+                    json_content_type: true,
+                    body,
                 })
             }
         }

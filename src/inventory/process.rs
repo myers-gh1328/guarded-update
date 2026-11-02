@@ -19,7 +19,7 @@ impl SystemTools {
     ) -> Result<Vec<u8>, String> {
         self.run_with_timeout(program, args, input, limit, Duration::from_secs(120))
     }
-    fn run_with_timeout(
+    pub(super) fn run_with_timeout(
         &self,
         program: &str,
         args: &[&str],
