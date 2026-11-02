@@ -19,7 +19,7 @@ class InventoryPackagingTests(unittest.TestCase):
                 binary=root/'build'/target/'release'/'command-center-inventory';binary.parent.mkdir(parents=True);binary.write_bytes(b'synthetic-build-artifact')
                 # GNU tar can still be listing when a successful grep exits.
                 for index in range(700):
-                    extra=root/'dist'/('command-center-inventory-v0.1.9-'+target)/'examples'/f'padding-{index:04}.txt'
+                    extra=root/'dist'/('command-center-inventory-v0.1.10-'+target)/'examples'/f'padding-{index:04}.txt'
                     extra.parent.mkdir(parents=True, exist_ok=True); extra.write_text('synthetic')
                 env={**os.environ,'PATH':str(tools)+os.pathsep+os.environ['PATH'],'CARGO_TARGET_DIR':str(root/'build')}
                 result=subprocess.run(['bash','scripts/package-inventory.sh',target,str(root/'dist')],cwd=ROOT,env=env,capture_output=True,text=True,timeout=15)

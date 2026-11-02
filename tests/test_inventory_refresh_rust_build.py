@@ -36,7 +36,7 @@ class RustBuildTests(unittest.TestCase):
             def fake_cargo(cwd,target,env,deadline):
                 self.assertNotIn('RUSTC_WRAPPER',env);self.assertNotIn('GITHUB_TOKEN',env)
                 deps=target/'debug'/'deps';deps.mkdir(parents=True);binary=deps/'command_center_inventory-0123456789abcdef';binary.write_bytes(b'compiler fixture');binary.chmod(0o555)
-                event={'reason':'compiler-artifact','package_id':'path+'+cwd.as_uri()+'#guarded-update@0.1.9','manifest_path':str(cwd/'Cargo.toml'),
+                event={'reason':'compiler-artifact','package_id':'path+'+cwd.as_uri()+'#guarded-update@0.1.10','manifest_path':str(cwd/'Cargo.toml'),
                     'target':{'name':'command-center-inventory','kind':['bin'],'src_path':str(cwd/'src/inventory_main.rs')},
                     'profile':{'test':True},'features':['inventory-agent'],'executable':str(binary),'fresh':False}
                 return (json.dumps(event)+'\n'+json.dumps({'reason':'build-finished','success':True})+'\n').encode()
