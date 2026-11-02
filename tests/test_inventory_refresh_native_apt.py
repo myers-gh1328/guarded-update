@@ -1,0 +1,82 @@
+"""Regression for sequential negative cases in the disposable native proof."""
+import importlib.util
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from types import SimpleNamespace
+import unittest
+from unittest.mock import patch, Mock
+
+ROOT = Path(__file__).resolve().parents[1]
+SPEC = importlib.util.spec_from_file_location('native_refresh_apt', ROOT/'tests/native_inventory_refresh_apt.py')
+native = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(native)
+
+
+class NativeRefreshFixtureTests(unittest.TestCase):
+    def test_shared_runtime_remains_traversable_without_exposing_worker_config_or_private_channel(self):
+        with TemporaryDirectory() as directory:
+            root=Path(directory);runtime=root/'runtime';policy=root/'policy'
+            runtime.mkdir();policy.mkdir()
+            private=runtime/'observation-private';private.mkdir(mode=0o700)
+            with patch.multiple(native,RUNTIME_ROOT=str(runtime),POLICY_ROOT=str(policy)),patch.object(native.os,'chown'):
+                native.write_root(runtime/'job.json',b'synthetic worker metadata')
+                native.write_root(policy/'apt/config',b'synthetic policy')
+            self.assertEqual(runtime.stat().st_mode&0o777,0o755)
+            self.assertEqual((runtime/'job.json').stat().st_mode&0o777,0o640)
+            self.assertEqual(private.stat().st_mode&0o777,0o700)
+            self.assertEqual(policy.stat().st_mode&0o777,0o750)
+
+    def test_fault_probe_requires_a_live_matching_nonroot_kernel_identity(self):
+        valid=('Uid:\t60001\t60001\t60001\t60001\n'
+               'Gid:\t60001\t60001\t60001\t60001\nGroups:\t\n'
+               'CapInh:\t0000000000000000\nCapPrm:\t0000000000000000\n'
+               'CapEff:\t0000000000000000\nCapBnd:\t0000000000000000\n'
+               'CapAmb:\t0000000000000000\nNoNewPrivs:\t1\nState:\tS (sleeping)\nPPid:\t1234\n').encode()
+        self.assertTrue(native.is_live_worker(valid))
+        self.assertTrue(native.is_live_worker(valid,parent=1234))
+        self.assertFalse(native.is_live_worker(valid,parent=5678))
+        self.assertFalse(native.is_live_worker(valid.replace(b'60001\n',b'0\n',1)))
+        self.assertFalse(native.is_live_worker(valid.replace(b'S (sleeping)',b'Z (zombie)')))
+        self.assertFalse(native.is_live_worker(b'Uid: 60001'))
+
+    def test_stopping_exited_child_never_falls_back_to_recycled_numeric_pid(self):
+        with patch.object(native.os,'pidfd_open',return_value=42,create=True), \
+             patch.object(native.signal,'pidfd_send_signal',side_effect=ProcessLookupError,create=True) as send, \
+             patch.object(native.os,'close') as close, \
+             patch.object(native.os,'kill') as numeric:
+            with self.assertRaises(ProcessLookupError):
+                native.stop_owned_child(123,Mock(return_value=True))
+            send.assert_called_once_with(42,native.signal.SIGSTOP)
+            numeric.assert_not_called()
+            close.assert_called_once_with(42)
+
+    def test_multiple_rejected_workers_do_not_reuse_a_retained_failed_unit(self):
+        # systemd retains failed transient units by default. Stopping the unit and
+        # proving an empty cgroup does not grant reuse of that retained name.
+        retained = False
+        def launch(arguments, **_):
+            nonlocal retained
+            if retained:
+                return SimpleNamespace(returncode=1, stderr=b'Unit fixed.service already exists.')
+            retained = '--collect' not in arguments or 'CollectMode=inactive' in arguments
+            return SimpleNamespace(returncode=75, stderr=b'')
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            cache, policy, runtime = root/'cache', root/'policy', root/'runtime'
+            cache.mkdir(); (policy/'apt').mkdir(parents=True); runtime.mkdir()
+            with patch.multiple(native, CACHE_ROOT=str(cache), POLICY_ROOT=str(policy), RUNTIME_ROOT=str(runtime)), \
+                 patch.object(native, 'empty_worker') as empty, \
+                 patch.object(native, 'render_policy', return_value={'apt.conf': b'synthetic'}), \
+                 patch.object(native, 'policy_generation', return_value='a'*64), \
+                 patch.object(native, 'write_root'), patch.object(native.os, 'chown'), \
+                 patch.object(native.time, 'CLOCK_BOOTTIME', 7, create=True), \
+                 patch.object(native.time, 'clock_gettime_ns', return_value=1000000000), \
+                 patch.object(native.Path, 'read_text', return_value='00000000-0000-4000-8000-000000000001'), \
+                 patch.object(native.subprocess, 'run', side_effect=launch):
+                self.assertEqual(native.run_worker(object(), 2)[0], 75)
+                self.assertEqual(native.run_worker(object(), 3)[0], 75)
+                self.assertEqual(empty.call_count, 4)
+
+
+if __name__ == '__main__':
+    unittest.main()
