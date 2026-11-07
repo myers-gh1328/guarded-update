@@ -264,7 +264,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: armv7-unknown-linux-gnueabihf
+          targets: armv7-unknown-linux-gnueabihf,aarch64-unknown-linux-gnu,x86_64-unknown-linux-gnu
       - uses: Swatinem/rust-cache@v2
         with:
           key: armv7-apt-remote
@@ -301,7 +301,7 @@ jobs:
             -o 'APT::Update::Error-Mode=any'
           )
           sudo apt-get "${ci_apt_options[@]}" update
-          sudo apt-get "${ci_apt_options[@]}" install --yes --no-install-recommends gcc-arm-linux-gnueabihf libc6-dev-armhf-cross qemu-user
+          sudo apt-get "${ci_apt_options[@]}" install --yes --no-install-recommends gcc-arm-linux-gnueabihf libc6-dev-armhf-cross gcc-aarch64-linux-gnu libc6-dev-arm64-cross qemu-user
       - name: Build Linux-only ARMv7 packages
         env:
           CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER: arm-linux-gnueabihf-gcc
@@ -333,6 +333,27 @@ jobs:
           qemu-arm -cpu arm1176 "$binary" --version
           cargo test --locked --target arm-unknown-linux-musleabihf --no-default-features --features apt-executor execution_gate::tests
           cargo test --locked --target arm-unknown-linux-musleabihf --no-default-features --features apt-executor execution_claim::tests
+      - name: Build and verify arm64 and amd64 executors
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+        run: |
+          python3 -m unittest discover -s tests -p test_executor_multiarch_pipeline.py -v
+          bash scripts/package-apt.sh apt-executor aarch64-unknown-linux-gnu multiarch-dist
+          bash scripts/package-apt.sh apt-executor x86_64-unknown-linux-gnu multiarch-dist
+          bash scripts/test-executor-multiarch.sh multiarch-dist arm64
+          bash scripts/test-executor-multiarch.sh multiarch-dist amd64
+      - name: Preserve arm64 executor package
+        uses: actions/upload-artifact@v4
+        with:
+          name: guarded-update-arm64-executor
+          path: multiarch-dist/*_arm64.deb
+          if-no-files-found: error
+      - name: Preserve amd64 executor package
+        uses: actions/upload-artifact@v4
+        with:
+          name: guarded-update-amd64-executor
+          path: multiarch-dist/*_amd64.deb
+          if-no-files-found: error
       - name: Preserve opt-in ARMv6 executor package
         uses: actions/upload-artifact@v4
         with:
