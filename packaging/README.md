@@ -16,7 +16,11 @@ Windows, AI tools, private keys, maintainer scripts or automatic activation are
 included. `dpkg -i` does not resolve missing prerequisites; inspect dependencies
 before installation. CI builds against Ubuntu 24.04's glibc 2.39 baseline; target
 systems must meet that baseline (Debian 13 does). ARMv7 packages are hard-float
-`armhf`; confirm the device architecture before choosing an artifact.
+`armhf`; confirm the device architecture before choosing an artifact. The CI
+Linux job also builds separate arm64 and amd64 executor artifacts and checks
+their package metadata and executable architecture. These are CI artifacts,
+not releases: bind the artifact digest to the reviewed successful run and
+verify its actual ABI and dependencies on the intended target before use.
 
 Polling remains read-only until separately provisioned execution authorization.
 The package never starts an executor or enables a timer. Provisioning must create
